@@ -1,6 +1,6 @@
 # Wicket Shaders
 
-Custom GLSL shaders for [mpv](https://mpv.io/) video player. Designed for reference-grade image quality on both SDR and HDR displays.
+Custom GLSL shaders for [mpv](https://mpv.io/) video player. 
 
 Requires **mpv** with `vo=gpu-next` (libplacebo backend).
 
@@ -13,13 +13,12 @@ Requires **mpv** with `vo=gpu-next` (libplacebo backend).
 Analyzes each frame's brightness, contrast, and highlight distribution to classify the scene (dark/moody, bright/specular, high contrast, etc.) and applies a tailored expansion curve. Highlights are expanded to ~195-290 nits peak while preserving the original artistic intent of the scene.
 
 Features:
-- 7 scene types with smooth blending (no hard jumps)
+- 7 scene types with smooth blending
+- Scene cut detection with fast adaptation lockout
 - Grain stabilization via bilateral log-luma filter (prevents grain from flickering in expanded regions)
 - Perceptual saturation boost in Oklab color space (counters the silvery look from luminance-only expansion)
-- Hue correction to prevent yellow-to-green shift on fires and sunsets
 - PQ-aware temporal dither to mask 8-bit banding in expanded highlights
 - Direct PQ BT.2020 output bypasses libplacebo's SDR peak clipping
-- Scene cut detection with fast adaptation lockout
 - Multiple debug visualizations for tuning
 
 **Requirements:** mpv v0.41.0+ with `vo=gpu-next`
@@ -35,14 +34,50 @@ profile-restore=copy
 target-trc=pq
 target-prim=bt.2020
 target-peak=10000
-hdr-reference-white=116          # Match your Windows SDR brightness (nits)
-tone-mapping=clip
-gamut-mapping-mode=clip
-vf-append=format:gamma=pq:primaries=bt.2020
+hdr-reference-white=110          # Match your Windows SDR brightness (nits)
+sub-hdr-peak=110
+image-subs-hdr-peak=110
+vf-append=format:gamma=pq:primaries=bt.2020 		#Has to be set
 glsl-shaders-append=~~/shaders/CelFlare.glsl
 ```
 
 Set `REFERENCE_WHITE` inside the shader to match your `hdr-reference-white` value.
+
+#### Finding your SDR white level
+
+Both values must match your Windows **SDR content brightness** slider (Settings → Display → HDR). Windows maps this slider linearly to nits:
+
+```
+nits = 80 + (slider% × 4)
+```
+
+```
+Nits  480 ┤                                                          ●
+      440 ┤                                                    ●
+      400 ┤                                              ●
+      360 ┤                                        ●
+      320 ┤                                  ●
+      280 ┤                            ●
+      240 ┤                      ●
+      200 ┤                ●
+      160 ┤          ●
+      120 ┤    ●
+       80 ●
+          └────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬──
+               10   20   30   40   50   60   70   80   90  100
+                          SDR content brightness (%)
+```
+
+| Slider | Nits | Slider | Nits |
+|--------|------|--------|------|
+| 0%     | 80   | 30%    | 200  |
+| 5%     | 100  | 40%    | 240  |
+| 8%     | 112  | 50%    | 280  |
+| 10%    | 120  | 60%    | 320  |
+| 15%    | 140  | 75%    | 380  |
+| 20%    | 160  | 100%   | 480  |
+
+Source: [DISPLAYCONFIG_SDR_WHITE_LEVEL (Microsoft)](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-displayconfig_sdr_white_level) — the slider maps `SDRWhiteLevel` from 1000 (80 nits) to 6000 (480 nits).
 
 ---
 
@@ -50,7 +85,7 @@ Set `REFERENCE_WHITE` inside the shader to match your `hdr-reference-white` valu
 
 **Subtle texture sharpening** that enhances fine detail without edge artifacts or grain amplification.
 
-Operates on the luma channel only. Uses a 5x5 neighborhood with variance-based texture/grain discrimination and Sobel edge detection to selectively sharpen real texture while leaving edges, grain, and flat areas untouched. Includes a cinematic low-detail boost that subtly enhances large smooth surfaces.
+Operates on the luma channel only. Uses a 5x5 neighborhood with variance-based texture/grain discrimination and Sobel edge detection to selectively sharpen real texture while leaving edges, grain, and flat areas untouched. Works best when it's barely noticeable. This is meant to restore subtle sharpening lost in encoding.
 
 **Usage:**
 
@@ -73,12 +108,12 @@ Technical approach:
 
 #### SDR Variants
 
-For standard dynamic range content. Hook at `OUTPUT` stage.
+For standard dynamic range content. Hooks at `OUTPUT` stage to always present the grain at native resolution.
 
 | Variant | Intensity | Character |
 |---------|-----------|-----------|
-| **SDR Light** | 0.05 | Barely visible. Adds subtle texture to digital content without drawing attention. |
-| **SDR Medium** | 0.12 | Noticeable film-like grain. Good for a cinematic look on clean digital sources. |
+| **SDR Light** | 0.05 | Barely visible. Safe for any content. |
+| **SDR Medium** | 0.12 | Noticeable film-like grain. Made to match grainy footage. |
 | **SDR Heavy** | 0.20 | Strong, visible grain. Emulates high-ISO film stock. |
 
 #### HDR Variants

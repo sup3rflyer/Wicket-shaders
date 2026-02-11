@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Ágúst Ari
+// Licensed under GPL-3.0 — see LICENSE
+
 //!HOOK OUTPUT
 //!BIND HOOKED
 //!DESC Film Grain (SDR Medium)

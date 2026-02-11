@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Ágúst Ari
+// Licensed under GPL-3.0 — see LICENSE
+
 //!BUFFER SCENE_STATE
 //!VAR float smoothed_avg
 //!VAR float smoothed_max

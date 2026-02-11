@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Ágúst Ari
+// Licensed under GPL-3.0 — see LICENSE
+
 //!DESC Texture Clarity
 //!HOOK LUMA
 //!BIND HOOKED

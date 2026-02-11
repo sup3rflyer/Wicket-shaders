@@ -71,6 +71,14 @@ Source: [DISPLAYCONFIG_SDR_WHITE_LEVEL (Microsoft)](https://learn.microsoft.com/
 
 ---
 
+### CelFlare Lite
+
+**Static SDR-to-HDR highlight expansion** — lightweight variant of CelFlare using the same processing pipeline (PQ BT.2020 output, Oklab sat boost + hue correction, bilateral grain stabilization, PQ-aware dither) but with fixed expansion parameters instead of scene-adaptive analysis.
+
+Uses the same mpv profile and `REFERENCE_WHITE` setup as CelFlare. Tune with `INTENSITY`, `CURVE_STEEPNESS`, `HIGHLIGHT_PEAK`, and `KNEE_END`.
+
+---
+
 ### TextureClarity
 
 **Subtle texture sharpening** that enhances fine detail without edge artifacts or grain amplification.

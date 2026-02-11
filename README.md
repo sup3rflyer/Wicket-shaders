@@ -4,13 +4,22 @@ Custom GLSL shaders for [mpv](https://mpv.io/) video player.
 
 Requires **mpv** with `vo=gpu-next` (libplacebo backend).
 
+My personal setup: TextureClarity, Film Grain Light (SDR/HDR detection) on everything. CelFlare for anime.
+
+F5: Clear Shaders
+F6: Scroll through Film Grain SDR variants
+F7: Scroll through Film Grain HDR variants
+F8: Activate CelFlare and sdr-to-hdr profile
+
 ## Shaders
 
 ### CelFlare
 
 **Scene-adaptive SDR-to-HDR highlight expansion** with PQ BT.2020 output.
 
-Analyzes each frame's brightness, contrast, and highlight distribution to classify the scene (dark/moody, bright/specular, high contrast, etc.) and applies a tailored expansion curve. Highlights are expanded to ~195-290 nits peak while preserving the original artistic intent of the scene.
+Analyzes each frame's brightness, contrast, and highlight distribution to classify the scene and applies a tailored expansion curve. Highlights are expanded to a ~200-300 nits range while trying to stay mostly faithful to the SDR grade. Does not touch low-mid range and shadows. Shader has been tuned for classic anime but works fine for various content.
+
+Use INTENSITY and CURVE_STEEPNESS for tuning. Other tweaks are at your own peril.
 
 Features:
 - 7 scene types with smooth blending
@@ -33,7 +42,7 @@ Add an mpv profile that re-tags source metadata for PQ BT.2020 output:
 profile-restore=copy
 target-trc=pq
 target-prim=bt.2020
-target-peak=10000
+target-peak=1000
 hdr-reference-white=110          # Match your Windows SDR brightness (nits)
 sub-hdr-peak=110
 image-subs-hdr-peak=110
@@ -46,27 +55,6 @@ Set `REFERENCE_WHITE` inside the shader to match your `hdr-reference-white` valu
 #### Finding your SDR white level
 
 Both values must match your Windows **SDR content brightness** slider (Settings → Display → HDR). Windows maps this slider linearly to nits:
-
-```
-nits = 80 + (slider% × 4)
-```
-
-```
-Nits  480 ┤                                                          ●
-      440 ┤                                                    ●
-      400 ┤                                              ●
-      360 ┤                                        ●
-      320 ┤                                  ●
-      280 ┤                            ●
-      240 ┤                      ●
-      200 ┤                ●
-      160 ┤          ●
-      120 ┤    ●
-       80 ●
-          └────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬──
-               10   20   30   40   50   60   70   80   90  100
-                          SDR content brightness (%)
-```
 
 | Slider | Nits | Slider | Nits |
 |--------|------|--------|------|
@@ -85,7 +73,7 @@ Source: [DISPLAYCONFIG_SDR_WHITE_LEVEL (Microsoft)](https://learn.microsoft.com/
 
 **Subtle texture sharpening** that enhances fine detail without edge artifacts or grain amplification.
 
-Operates on the luma channel only. Uses a 5x5 neighborhood with variance-based texture/grain discrimination and Sobel edge detection to selectively sharpen real texture while leaving edges, grain, and flat areas untouched. Works best when it's barely noticeable. This is meant to restore subtle sharpening lost in encoding.
+Operates on the luma channel only. Uses a 5x5 neighborhood with variance-based texture/grain discrimination and Sobel edge detection to selectively sharpen real texture while leaving edges, grain, and flat areas untouched. Works best when it's barely noticeable. This is meant to restore subtle texture detail affected by encoding.
 
 **Usage:**
 
@@ -98,7 +86,7 @@ glsl-shaders-append=~~/shaders/TextureClarity.glsl
 
 ### Film Grain
 
-**Professional film grain simulation** using GPU compute shaders. Adds photographic grain with per-channel control over size, intensity, and luminance response.
+**Professional film grain simulation** using GPU compute shaders. Adds photographic-like grain with per-channel control over size, intensity, and luminance response.
 
 Technical approach:
 - PCG hash PRNG (stateless, pattern-free)

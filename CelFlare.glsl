@@ -1,0 +1,1040 @@
+//!BUFFER SCENE_STATE
+//!VAR float smoothed_avg
+//!VAR float smoothed_max
+//!VAR float smoothed_min
+//!VAR float smoothed_log_avg
+//!VAR float smoothed_contrast
+//!VAR float smoothed_highlight_pop
+//!VAR float scene_cut_lockout
+//!VAR float prev_luma[144]
+//!VAR float prev_cb[144]
+//!VAR float prev_cr[144]
+//!VAR float scene_highlight_peak
+//!VAR float scene_exp_steepness
+//!VAR float scene_knee_end
+//!VAR float scene_master_knee
+//!VAR float scene_type_val
+//!VAR float smoothed_avg_chroma
+//!VAR float scene_B_highlight_peak
+//!VAR float scene_B_exp_steepness
+//!VAR float scene_B_knee_end
+//!VAR float scene_B_master_knee
+//!VAR float scene_B_type_val
+//!STORAGE
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!BIND SCENE_STATE
+//!DESC CelFlare v2.1 (PQ BT.2020 Output, Scene-Adaptive SDR→HDR)
+
+// =============================================================================
+// CELFLARE v2.1 - Scene-Adaptive SDR→HDR Highlight Expansion (PQ BT.2020 Output)
+// =============================================================================
+//
+// WORKFLOW:
+//   1. Grain stabilization operates in gamma space (perceptually uniform)
+//   2. Linearize with BT.1886 EOTF for expansion math
+//   3. Apply expansion in linear space (nit-proportional)
+//   4. Convert BT.709 → BT.2020 gamut (3×3 matrix)
+//   5. Encode to PQ (ST.2084) for HDR output
+//   6. libplacebo sees PQ BT.2020 source, passes through without clipping
+//
+// REQUIREMENTS:
+//   - mpv v0.41.0+ (for --hdr-reference-white support)
+//   - vo=gpu-next with libplacebo
+//
+// CRITICAL SETTINGS:
+//   Set hdr-reference-white to match your Windows SDR brightness (nits).
+//   Set REFERENCE_WHITE below to match hdr-reference-white.
+//   The vf-append line re-tags source metadata so libplacebo interprets
+//   the shader's PQ BT.2020 output correctly (no pixel conversion).
+//
+//   Example mpv.conf profile:
+//     [sdr-to-hdr]
+//     profile-restore=copy
+//     target-trc=pq
+//     target-prim=bt.2020
+//     target-peak=10000
+//     hdr-reference-white=116    # Match your Windows SDR brightness
+//     tone-mapping=clip
+//     gamut-mapping-mode=clip
+//     vf-append=format:gamma=pq:primaries=bt.2020
+//     glsl-shaders-append=~~/shaders/CelFlare.glsl
+//
+// =============================================================================
+
+// =============================================================================
+// USER CONTROLS
+// =============================================================================
+
+// --- Core Expansion ---
+#define INTENSITY 1.4              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
+#define CURVE_STEEPNESS 0.4        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy
+
+// --- Saturation Boost (Oklab) ---
+// Counters the "silvery" desaturated look from expanding luminance without chroma.
+// Uses Oklab color space for perceptually uniform chroma scaling with perfect hue preservation.
+// Based on Weber-Fechner law: chroma scales with sqrt(expansion) for constant colorfulness.
+#define ENABLE_SAT_BOOST 1
+#define SAT_BOOST_STRENGTH 1.15    // Boost for low-sat colors
+#define SAT_BOOST_MAX 1.2          // Saturated enough to counter silvery expansion
+#define SAT_HIGHLIGHT_ROLLOFF 0.8  // Normalized threshold for highlight desaturation
+#define SAT_HIGHLIGHT_DESAT 0.8    // Target sat multiplier at peak (only for low-sat sources)
+
+// --- Hue Correction (Oklab) ---
+// Corrects hue shifts from saturation boost gamut clipping (e.g. yellow→green on fires).
+// Blends post-expansion hue toward original in Oklab, preserving expanded chroma magnitude.
+// Technique from renodx and PumboAutoHDR.
+#define ENABLE_HUE_CORRECTION 1
+#define HUE_CORRECTION_STRENGTH 0.90  // 0.0 = none, 1.0 = full (0.75 recommended)
+
+// --- Grain Stabilization ---
+// Stabilizes expansion decision for grainy content by averaging similar neighbors.
+// Operates in gamma space for perceptual uniformity.
+#define ENABLE_GRAIN_STABLE 1
+#define GRAIN_QUALITY 1            // 0 = 6 samples (fast), 1 = 12 samples (quality)
+
+// --- Dither ---
+// Masks 8-bit quantization artifacts that get amplified by expansion.
+// Applied in PQ space (perceptually uniform).
+#define ENABLE_DITHER 1
+#define DITHER_STRENGTH 0.7        // Reduced (correct expansion needs less dither)
+#define DITHER_TEMPORAL 1          // Animate noise per frame (integrates temporally)
+
+// --- EOTF ---
+// Gamma used for linearization. BT.1886 = 2.4 (broadcast standard), sRGB ≈ 2.2.
+// If skin/orange appears darker with the shader than without, try lowering toward 2.2.
+#define EOTF_GAMMA 2.3
+
+// --- PQ Output ---
+// Shader encodes to PQ BT.2020 directly to bypass libplacebo's SDR peak clipping.
+// Must match hdr-reference-white in mpv.conf and Windows SDR brightness.
+#define REFERENCE_WHITE 116.0
+
+// =============================================================================
+// ADVANCED TUNING
+// =============================================================================
+// These parameters are pre-tuned. Modify only if you understand their effects.
+
+// --- Grain Stabilization Tuning (Gamma-Space Thresholds) ---
+#define GRAIN_THRESHOLD 0.12       // Bilateral similarity threshold (tighter = edge-preserving)
+#define GRAIN_RADIUS 14.0          // Sample distance in pixels
+#define GRAIN_RANGE_MIN 0.25       // Fixed lower limit (gamma space, covers all scene types)
+#define GRAIN_RANGE_MAX 0.95       // Upper limit (gamma space)
+#define EARLY_EXIT_GAMMA 0.10      // Skip very dark pixels (gamma) - below any possible knee
+
+// --- Saturation Rolloff (Oklab chroma-based, separate from sat boost) ---
+// Reduces expansion on already-saturated colors to prevent clipping.
+#define ENABLE_SAT_ROLLOFF 1
+#define SAT_THRESHOLD 0.4          // HSV saturation threshold to start rolloff
+#define SAT_POWER 10.0             // Rolloff curve steepness
+#define SAT_ROLLOFF 0.80           // Reduces expansion on saturated colors
+
+// =============================================================================
+// INTERNAL PARAMETERS
+// =============================================================================
+// Scene analysis and expansion curve parameters.
+
+// --- Temporal Smoothing ---
+#define TEMPORAL_ALPHA 0.03        // Normal smoothing (lower = slower adaptation)
+#define TEMPORAL_ALPHA_FAST 0.6    // Fast adaptation after scene cuts
+
+// --- Scene Cut Detection (Gamma-Space Perceptual) ---
+// Block-based: requires majority of samples to change in BOTH luma AND chroma.
+#define BLOCK_LUMA_THRESH 0.09
+#define BLOCK_CHROMA_THRESH 0.04
+#define BLOCK_CHROMA_THRESH_SQ (BLOCK_CHROMA_THRESH * BLOCK_CHROMA_THRESH)
+#define BLOCK_CHANGE_PCT 0.55      // Percentage of samples that must change (stricter to reduce false positives from fast camera motion)
+#define LOCKOUT_FRAMES 6.0         // Frames to wait before detecting another cut
+
+// --- Scene Sampling ---
+#define SAMPLE_COLS 16             // 16x9 = 144 samples (matches common aspect ratio)
+#define SAMPLE_ROWS 9
+
+// --- Brightness Classification (log-average / key) ---
+#define KEY_DARK 0.022
+#define KEY_MID 0.05
+#define KEY_BRIGHT 0.08
+#define KEY_VERY_BRIGHT 0.45             // Was 0.21 - only truly overexposed/washed scenes
+
+// --- Contrast Classification (stops, cascading based on brightness) ---
+#define CONTRAST_LOW_DARK 2.0
+#define CONTRAST_LOW_BRIGHT 2.0
+#define CONTRAST_HIGH_DARK 3.5
+#define CONTRAST_HIGH_BRIGHT 4.0
+
+// --- Specular Detection (cascading based on brightness) ---
+#define HIGHLIGHT_ZONE_DARK 0.25         // Was 0.3 - catch highlights earlier
+#define HIGHLIGHT_ZONE_BRIGHT 0.40       // Was 0.5 - speculars start lower in bright scenes
+#define SPECULAR_THRESH_DARK 0.08        // Was 0.25 - 8% highlight population (realistic)
+#define SPECULAR_THRESH_BRIGHT 0.25      // Was 0.40 - 15% for bright scenes (was way too high)
+#define SPECULAR_RELATIVE_FACTOR 2.0     // Also require Nx scene mean for highlight candidacy
+
+// --- Expansion Curves by Scene Type ---
+// Target: ~195-290 nits peak (1.8-2.7x at 108 nit reference white, with INTENSITY 1.2)
+
+// Dark + Specular: Brightest highlights (candles, stars)
+#define PEAK_DARK_SPECULAR 2.2
+#define STEEP_DARK_SPECULAR 4.0
+#define KNEE_DARK_SPECULAR 0.35
+
+// Dark + Moody: Preserve mood, subtle pop
+#define PEAK_DARK_MOODY 1.8
+#define STEEP_DARK_MOODY 2.8
+#define KNEE_DARK_MOODY 0.30
+
+// Bright + Specular: Modest pop on already-bright content
+#define PEAK_BRIGHT_SPECULAR 2.1
+#define STEEP_BRIGHT_SPECULAR 6.0
+#define KNEE_BRIGHT_SPECULAR 0.45
+
+// Bright + Flat: Moderate (uniformly bright scenes, bright anime palettes)
+#define PEAK_BRIGHT_FLAT 1.9
+#define STEEP_BRIGHT_FLAT 7.0
+#define KNEE_BRIGHT_FLAT 0.45
+
+// High Contrast: Punchy but controlled
+#define PEAK_HIGH_CONTRAST 2.2
+#define STEEP_HIGH_CONTRAST 3.8
+#define KNEE_HIGH_CONTRAST 0.35
+
+// Default: Balanced middle ground
+#define PEAK_DEFAULT 2.0
+#define STEEP_DEFAULT 3.2
+#define KNEE_DEFAULT 0.45
+
+// Very Bright: Near passthrough
+#define PEAK_VERY_BRIGHT 1.6
+#define STEEP_VERY_BRIGHT 7.0
+#define KNEE_VERY_BRIGHT 0.50
+
+
+// =============================================================================
+// DEBUG
+// =============================================================================
+// Enable one at a time to visualize different stages of the pipeline.
+
+#define DEBUG_BYPASS 0             // Skip all processing, output original (gamma)
+#define DEBUG_SHOW_STATS 0         // Show scene analysis bar graphs (top-left)
+#define DEBUG_SHOW_SCENE_TYPE 0    // Show scene type color (top-right corner)
+#define DEBUG_SHOW_EXPANSION 0     // Show expansion parameters (bottom-right)
+#define DEBUG_SHOW_MASK 0          // Show expansion amount as grayscale
+#define DEBUG_SHOW_SAT 0           // Show saturation rolloff factor
+#define DEBUG_SHOW_GRAIN 0         // Show grain stabilization effect
+#define DEBUG_SHOW_SAT_BOOST 0     // Show saturation boost amount
+#define DEBUG_SHOW_DITHER 0        // Show dither magnitude and pattern
+#define DEBUG_SHOW_HUE_SHIFT 0     // Show hue angle difference pre-correction
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+// BT.709 luma coefficients (standard for SDR content)
+float get_luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// EOTF (gamma decode): gamma -> linear
+vec3 eotf_gamma(vec3 v) {
+    return pow(max(v, 0.0), vec3(EOTF_GAMMA));
+}
+
+float eotf_gamma(float v) {
+    return pow(max(v, 0.0), EOTF_GAMMA);
+}
+
+// Inverse EOTF (gamma encode): linear -> gamma
+vec3 oetf_gamma(vec3 v) {
+    return pow(max(v, 0.0), vec3(1.0 / EOTF_GAMMA));
+}
+
+float oetf_gamma(float v) {
+    return pow(max(v, 0.0), 1.0 / EOTF_GAMMA);
+}
+
+// BT.709 to BT.2020 color space conversion (linear domain)
+vec3 bt709_to_bt2020(vec3 rgb) {
+    return vec3(
+        0.6274040 * rgb.r + 0.3292820 * rgb.g + 0.0433136 * rgb.b,
+        0.0690970 * rgb.r + 0.9195400 * rgb.g + 0.0113612 * rgb.b,
+        0.0163916 * rgb.r + 0.0880132 * rgb.g + 0.8955950 * rgb.b
+    );
+}
+
+// PQ (SMPTE ST 2084) OETF: linear light → perceptual code value
+// Input: linear RGB normalized to 10000 nits (1.0 = 10000 nits)
+vec3 pq_oetf(vec3 L) {
+    const float m1 = 0.1593017578125;  // 2610/16384
+    const float m2 = 78.84375;          // 2523/4096 * 128
+    const float c1 = 0.8359375;         // 3424/4096
+    const float c2 = 18.8515625;        // 2413/128
+    const float c3 = 18.6875;           // 2392/128
+    vec3 Lm1 = pow(max(L, 0.0), vec3(m1));
+    return pow((c1 + c2 * Lm1) / (1.0 + c3 * Lm1), vec3(m2));
+}
+
+// Gamma BT.709 → PQ BT.2020 (for passthrough/early-exit pixels)
+vec3 gamma709_to_pq2020(vec3 rgb_gamma) {
+    vec3 linear = eotf_gamma(rgb_gamma);
+    vec3 bt2020 = bt709_to_bt2020(linear);
+    return pq_oetf(bt2020 * (REFERENCE_WHITE / 10000.0));
+}
+
+// Linear BT.709 → PQ BT.2020 (for expanded pixels, values can exceed 1.0)
+vec3 linear709_to_pq2020(vec3 rgb_linear) {
+    vec3 bt2020 = bt709_to_bt2020(rgb_linear);
+    return pq_oetf(bt2020 * (REFERENCE_WHITE / 10000.0));
+}
+
+// Hash without Sine (Dave Hoskins - https://www.shadertoy.com/view/4djSRW)
+// Portable across GPUs, no visible pattern
+float hashNoise(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Triangular PDF noise for dithering
+// Sum of two uniform [0,1] distributions = triangular on [0,2], shifted to [-1,1]
+float triangularNoise(vec2 p) {
+    float r1 = hashNoise(p);
+    float r2 = hashNoise(p + vec2(1.7, 3.1));
+    return r1 + r2 - 1.0;
+}
+
+// =============================================================================
+// OKLAB COLOR SPACE (Björn Ottosson, 2020)
+// =============================================================================
+// Perceptually uniform color space with excellent hue linearity.
+// Saturation adjustments in Oklab preserve hue by design.
+
+// Fast cube root via bit manipulation + Newton-Raphson (~4× faster than pow)
+// Error: ~0.1% after one iteration - imperceptible for color conversion
+float fast_cbrt(float x) {
+    if (x <= 0.0) return 0.0;
+    uint i = floatBitsToUint(x);
+    i = i / 3u + 0x2a514067u;  // Initial approximation via exponent division
+    float y = uintBitsToFloat(i);
+    y = y * 0.666666667 + x / (3.0 * y * y);  // One Newton-Raphson iteration
+    return y;
+}
+
+// Linear sRGB to Oklab
+vec3 rgb_to_oklab(vec3 rgb) {
+    // RGB to LMS (using sRGB primaries)
+    float l = 0.4122214708 * rgb.r + 0.5363325363 * rgb.g + 0.0514459929 * rgb.b;
+    float m = 0.2119034982 * rgb.r + 0.6806995451 * rgb.g + 0.1073969566 * rgb.b;
+    float s = 0.0883024619 * rgb.r + 0.2817188376 * rgb.g + 0.6299787005 * rgb.b;
+
+    // Cube root (perceptual nonlinearity) - using fast approximation
+    float l_ = fast_cbrt(l);
+    float m_ = fast_cbrt(m);
+    float s_ = fast_cbrt(s);
+
+    // LMS to Oklab
+    return vec3(
+        0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,  // L
+        1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,  // a
+        0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_   // b
+    );
+}
+
+// Oklab to linear sRGB
+vec3 oklab_to_rgb(vec3 lab) {
+    // Oklab to LMS (cube root space)
+    float l_ = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+    float m_ = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+    float s_ = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+
+    // Cube to undo perceptual nonlinearity
+    float l = l_ * l_ * l_;
+    float m = m_ * m_ * m_;
+    float s = s_ * s_ * s_;
+
+    // LMS to RGB
+    return vec3(
+        +4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
+    );
+}
+
+// Scene type constants (for debug display only)
+#define SCENE_DARK_SPECULAR 0
+#define SCENE_DARK_MOODY 1
+#define SCENE_BRIGHT_SPECULAR 2
+#define SCENE_BRIGHT_FLAT 3
+#define SCENE_HIGH_CONTRAST 4
+#define SCENE_DEFAULT 5
+#define SCENE_VERY_BRIGHT 6
+
+// =============================================================================
+// MAIN PROCESSING
+// =============================================================================
+
+vec4 hook() {
+    vec4 color = HOOKED_texOff(0);
+    vec3 rgb_gamma = color.rgb;
+
+    // -------------------------------------------------------------------------
+    // SCENE STATISTICS (first pixel only for performance)
+    // -------------------------------------------------------------------------
+    vec2 pixel_pos = HOOKED_pos * HOOKED_size;
+    bool is_first_pixel = (pixel_pos.x < 1.0 && pixel_pos.y < 1.0);
+
+    if (is_first_pixel) {
+        float Y_sum = 0.0;
+        float Y_log_sum = 0.0;
+        float Y_min = 1.0;
+        float Y_max = 0.0;
+        float highlight_count = 0.0;
+        float valid_samples = 0.0;
+        float chroma_sum = 0.0;
+        float luma_changed_count = 0.0;
+        float chroma_changed_count = 0.0;
+
+        // Use smoothed log_avg for adaptive thresholds (linearized for consistency)
+        float key_factor = smoothstep(KEY_DARK, KEY_BRIGHT, smoothed_log_avg);
+        float adaptive_highlight_zone = mix(HIGHLIGHT_ZONE_DARK, HIGHLIGHT_ZONE_BRIGHT, key_factor);
+        // Relative threshold: pixel must also exceed Nx scene mean to count as highlight.
+        // Prevents inflated specular counts in uniformly bright scenes (e.g. bright anime palettes).
+        // Uses arithmetic mean (more sensitive to bright outliers than geometric mean).
+        float relative_highlight = smoothed_avg * SPECULAR_RELATIVE_FACTOR;
+
+        float total_samples = float(SAMPLE_COLS * SAMPLE_ROWS);
+
+        // Sample and compare to previous frame
+        for (int y = 0; y < SAMPLE_ROWS; y++) {
+            for (int x = 0; x < SAMPLE_COLS; x++) {
+                int idx = y * SAMPLE_COLS + x;
+                vec2 spos = vec2((float(x) + 0.5) / float(SAMPLE_COLS),
+                                 (float(y) + 0.5) / float(SAMPLE_ROWS));
+
+                // Sample in gamma space
+                vec3 rgb_sample_gamma = HOOKED_tex(spos).rgb;
+                float Y_gamma = get_luma(rgb_sample_gamma);
+
+                // Compute chroma BEFORE black bar skip (needed for scene cut on all samples)
+                float cb_gamma = rgb_sample_gamma.b - Y_gamma;
+                float cr_gamma = rgb_sample_gamma.r - Y_gamma;
+
+                // Scene cut detection runs on ALL 144 samples (including black bars)
+                if (frame > 0) {
+                    float luma_diff = abs(Y_gamma - prev_luma[idx]);
+                    float cb_diff = cb_gamma - prev_cb[idx];
+                    float cr_diff = cr_gamma - prev_cr[idx];
+                    float chroma_diff_sq = cb_diff * cb_diff + cr_diff * cr_diff;
+
+                    if (luma_diff > BLOCK_LUMA_THRESH) {
+                        luma_changed_count += 1.0;
+                    }
+                    if (chroma_diff_sq > BLOCK_CHROMA_THRESH_SQ) {
+                        chroma_changed_count += 1.0;
+                    }
+                }
+
+                // Store gamma values for next frame (perceptual comparison)
+                prev_luma[idx] = Y_gamma;
+                prev_cb[idx] = cb_gamma;
+                prev_cr[idx] = cr_gamma;
+
+                // Linearize for statistics
+                vec3 rgb_sample_linear = eotf_gamma(rgb_sample_gamma);
+                float Y_linear = get_luma(rgb_sample_linear);
+
+                // Accumulate chroma for B&W detection (all samples)
+                chroma_sum += sqrt(cb_gamma * cb_gamma + cr_gamma * cr_gamma);
+
+                // Black bar exclusion: skip near-black samples for scene statistics
+                if (Y_linear < 0.001) continue;
+
+                // Statistics in linear space (valid samples only)
+                valid_samples += 1.0;
+                Y_sum += Y_linear;
+                Y_log_sum += log(max(Y_linear, 0.0001));
+                Y_min = min(Y_min, Y_linear);
+                Y_max = max(Y_max, Y_linear);
+
+                if (Y_linear >= adaptive_highlight_zone && Y_linear > relative_highlight) {
+                    highlight_count += 1.0;
+                }
+            }
+        }
+
+        // If too few valid samples (>75% black bars), keep previous frame's smoothed stats
+        bool stats_valid = valid_samples >= 36.0;
+
+        float current_avg = stats_valid ? Y_sum / valid_samples : smoothed_avg;
+        float current_log_avg = stats_valid ? exp(Y_log_sum / valid_samples) : smoothed_log_avg;
+        float current_highlight_pop = stats_valid ? highlight_count / valid_samples : smoothed_highlight_pop;
+        float current_contrast = stats_valid ? log2(max(Y_max, 0.001) / max(Y_min, 0.001)) : smoothed_contrast;
+        float current_Y_max = stats_valid ? Y_max : smoothed_max;
+        float current_Y_min = stats_valid ? Y_min : smoothed_min;
+        float current_avg_chroma = chroma_sum / total_samples;
+
+        // Block-based scene cut detection (uses all 144 samples, not just valid)
+        float luma_change_pct = luma_changed_count / total_samples;
+        float chroma_change_pct = chroma_changed_count / total_samples;
+
+        scene_cut_lockout = max(scene_cut_lockout - 1.0, 0.0);
+
+        // B&W scene cut fallback: when avg chroma is very low, drop the chroma
+        // requirement. Uses temporally smoothed value to prevent single-frame false triggers.
+        bool is_bw = smoothed_avg_chroma < 0.02;
+        bool scene_cut = is_bw
+            ? (luma_change_pct > BLOCK_CHANGE_PCT) && (scene_cut_lockout <= 0.0)
+            : (luma_change_pct > BLOCK_CHANGE_PCT) &&
+              (chroma_change_pct > BLOCK_CHANGE_PCT) &&
+              (scene_cut_lockout <= 0.0);
+
+        if (scene_cut) {
+            scene_cut_lockout = LOCKOUT_FRAMES;
+        }
+
+        // Fast adaptation during scene cut AND lockout period (6 frames = 99.6% converged)
+        float alpha = (scene_cut || scene_cut_lockout > 0.0) ? TEMPORAL_ALPHA_FAST : TEMPORAL_ALPHA;
+
+        if (frame == 0) {
+            smoothed_avg = current_avg;
+            smoothed_max = current_Y_max;
+            smoothed_min = current_Y_min;
+            smoothed_log_avg = current_log_avg;
+            smoothed_contrast = current_contrast;
+            smoothed_highlight_pop = current_highlight_pop;
+            smoothed_avg_chroma = current_avg_chroma;
+            scene_cut_lockout = 0.0;
+        } else {
+            smoothed_avg = mix(smoothed_avg, current_avg, alpha);
+            smoothed_max = mix(smoothed_max, current_Y_max, alpha);
+            smoothed_min = mix(smoothed_min, current_Y_min, alpha);
+            smoothed_log_avg = mix(smoothed_log_avg, current_log_avg, alpha);
+            smoothed_contrast = mix(smoothed_contrast, current_contrast, alpha);
+            smoothed_highlight_pop = mix(smoothed_highlight_pop, current_highlight_pop, alpha);
+            smoothed_avg_chroma = mix(smoothed_avg_chroma, current_avg_chroma, alpha);
+        }
+
+        // ---------------------------------------------------------------------
+        // SCENE CLASSIFICATION (computed once per frame, stored in buffer)
+        // ---------------------------------------------------------------------
+        float key = smoothed_log_avg;
+        float contrast = smoothed_contrast;
+
+        // Cascading specular threshold
+        float key_factor_spec = smoothstep(KEY_DARK, KEY_BRIGHT, key);
+        float adaptive_spec_threshold = mix(SPECULAR_THRESH_DARK, SPECULAR_THRESH_BRIGHT, key_factor_spec);
+
+        // Soft specular factor
+        float spec_blend_width = adaptive_spec_threshold * 0.5;
+        float specular_factor = smoothstep(
+            adaptive_spec_threshold - spec_blend_width,
+            adaptive_spec_threshold + spec_blend_width,
+            smoothed_highlight_pop
+        );
+
+        // Blend factors
+        float brightness_factor = smoothstep(KEY_DARK, KEY_BRIGHT, key);
+        float very_bright_factor = smoothstep(KEY_BRIGHT, KEY_VERY_BRIGHT, key);
+
+        float adaptive_contrast_low = mix(CONTRAST_LOW_DARK, CONTRAST_LOW_BRIGHT, brightness_factor);
+        float adaptive_contrast_high = mix(CONTRAST_HIGH_DARK, CONTRAST_HIGH_BRIGHT, brightness_factor);
+
+        float contrast_factor = smoothstep(adaptive_contrast_low - 1.0, adaptive_contrast_low + 1.0, contrast);
+        float high_contrast_factor = smoothstep(adaptive_contrast_high - 1.0, adaptive_contrast_high + 1.0, contrast);
+
+        // Dark treatment
+        float dark_peak = mix(PEAK_DARK_MOODY, PEAK_DARK_SPECULAR, specular_factor);
+        float dark_steep = mix(STEEP_DARK_MOODY, STEEP_DARK_SPECULAR, specular_factor);
+        float dark_knee = mix(KNEE_DARK_MOODY, KNEE_DARK_SPECULAR, specular_factor);
+
+        // Bright treatment
+        float bright_base_peak = mix(PEAK_BRIGHT_FLAT, PEAK_DEFAULT, contrast_factor);
+        float bright_base_steep = mix(STEEP_BRIGHT_FLAT, STEEP_DEFAULT, contrast_factor);
+        float bright_base_knee = mix(KNEE_BRIGHT_FLAT, KNEE_DEFAULT, contrast_factor);
+
+        float bright_peak = mix(bright_base_peak, PEAK_BRIGHT_SPECULAR, specular_factor);
+        float bright_steep = mix(bright_base_steep, STEEP_BRIGHT_SPECULAR, specular_factor);
+        float bright_knee = mix(bright_base_knee, KNEE_BRIGHT_SPECULAR, specular_factor);
+
+        // Dark <-> Bright blend
+        float base_peak = mix(dark_peak, bright_peak, brightness_factor);
+        float base_steep = mix(dark_steep, bright_steep, brightness_factor);
+        float base_knee = mix(dark_knee, bright_knee, brightness_factor);
+
+        // High contrast blend
+        float pre_vb_peak = mix(base_peak, PEAK_HIGH_CONTRAST, high_contrast_factor);
+        float pre_vb_steep = mix(base_steep, STEEP_HIGH_CONTRAST, high_contrast_factor);
+        float pre_vb_knee = mix(base_knee, KNEE_HIGH_CONTRAST, high_contrast_factor);
+
+        // Very bright blend
+        float computed_peak = mix(pre_vb_peak, PEAK_VERY_BRIGHT, very_bright_factor);
+        float computed_steep = mix(pre_vb_steep, STEEP_VERY_BRIGHT, very_bright_factor);
+        float computed_knee = mix(pre_vb_knee, KNEE_VERY_BRIGHT, very_bright_factor);
+        float master_knee_offset = 0.15;
+        float computed_master = max(computed_knee - master_knee_offset, 0.05);
+
+        // Compute scene type for debug visualization
+        float st = float(SCENE_DEFAULT);
+        if (very_bright_factor > 0.5) {
+            st = float(SCENE_VERY_BRIGHT);
+        } else if (brightness_factor < 0.3) {
+            st = (specular_factor > 0.5) ? float(SCENE_DARK_SPECULAR) : float(SCENE_DARK_MOODY);
+        } else if (brightness_factor > 0.7) {
+            if (specular_factor > 0.5) st = float(SCENE_BRIGHT_SPECULAR);
+            else if (contrast_factor < 0.5) st = float(SCENE_BRIGHT_FLAT);
+        } else if (high_contrast_factor > 0.5) {
+            st = float(SCENE_HIGH_CONTRAST);
+        }
+
+        // Double-buffer scene parameters: write to current frame's slot.
+        // Other pixels read the OPPOSITE slot (previous frame's values),
+        // eliminating the GPU race condition that causes grid artifacts on scene cuts.
+        if (frame % 2 == 0) {
+            scene_highlight_peak = computed_peak;
+            scene_exp_steepness = computed_steep;
+            scene_knee_end = computed_knee;
+            scene_master_knee = computed_master;
+            scene_type_val = st;
+        } else {
+            scene_B_highlight_peak = computed_peak;
+            scene_B_exp_steepness = computed_steep;
+            scene_B_knee_end = computed_knee;
+            scene_B_master_knee = computed_master;
+            scene_B_type_val = st;
+        }
+
+        // First pixel outputs original color after computing stats
+        // This prevents visual artifacts from heavy computation on this pixel
+        return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    }
+
+    // Double-buffer: read from PREVIOUS frame's slot (opposite parity).
+    // Eliminates GPU race where some warps see first-pixel's buffer write
+    // and others don't, causing visible grid pattern on scene cuts.
+    float highlight_peak, exp_steepness, knee_end, master_knee;
+    int scene_type;
+    if (frame % 2 == 0) {
+        // Even frames: first pixel writes A, read from B (previous odd frame)
+        highlight_peak = scene_B_highlight_peak;
+        exp_steepness = scene_B_exp_steepness;
+        knee_end = scene_B_knee_end;
+        master_knee = scene_B_master_knee;
+        scene_type = int(scene_B_type_val);
+    } else {
+        // Odd frames: first pixel writes B, read from A (previous even frame)
+        highlight_peak = scene_highlight_peak;
+        exp_steepness = scene_exp_steepness;
+        knee_end = scene_knee_end;
+        master_knee = scene_master_knee;
+        scene_type = int(scene_type_val);
+    }
+
+    // Fallback defaults for frame 0 (opposite slot uninitialized)
+    if (frame == 0) {
+        highlight_peak = max(highlight_peak, 1.8);
+        exp_steepness = max(exp_steepness, 3.0);
+        knee_end = (knee_end < 0.1) ? 0.40 : knee_end;
+        master_knee = max(master_knee, 0.25);
+    }
+
+    // -------------------------------------------------------------------------
+    // DEBUG OVERLAYS (Scene Analysis)
+    // -------------------------------------------------------------------------
+    #if DEBUG_SHOW_STATS
+        vec2 pos = HOOKED_pos;
+        float bar_width = 0.25;
+        float bar_height = 0.015;
+        float bar_gap = 0.005;
+        float start_y = 0.0;
+
+        // Recompute debug-only variables (only when debug enabled)
+        float dbg_key = smoothed_log_avg;
+        float dbg_brightness_factor = smoothstep(KEY_DARK, KEY_BRIGHT, dbg_key);
+        float dbg_adaptive_contrast_low = mix(CONTRAST_LOW_DARK, CONTRAST_LOW_BRIGHT, dbg_brightness_factor);
+        float dbg_adaptive_contrast_high = mix(CONTRAST_HIGH_DARK, CONTRAST_HIGH_BRIGHT, dbg_brightness_factor);
+        float dbg_key_factor_spec = smoothstep(KEY_DARK, KEY_BRIGHT, dbg_key);
+        float dbg_adaptive_spec_threshold = mix(SPECULAR_THRESH_DARK, SPECULAR_THRESH_BRIGHT, dbg_key_factor_spec);
+
+        // Bar 1: Log-average (Key) - Green
+        if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
+            float norm_x = pos.x / bar_width;
+            float display_max = 0.45;  // Was 0.25 - accommodate KEY_VERY_BRIGHT=0.35
+            float val = clamp(smoothed_log_avg / display_max, 0.0, 1.0);
+            vec3 bg = (norm_x < val) ? vec3(0.0, 0.5, 0.0) : vec3(0.1);
+
+            float dark_mark = KEY_DARK / display_max;
+            float bright_mark = KEY_BRIGHT / display_max;
+            float very_bright_mark = KEY_VERY_BRIGHT / display_max;
+            if (abs(norm_x - dark_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.0, 0.3, 0.6)), 1.0);
+            if (abs(norm_x - bright_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.6, 0.4, 0.0)), 1.0);
+            if (abs(norm_x - very_bright_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.6, 0.0, 0.0)), 1.0);
+            if (abs(norm_x - val) < 0.008) return vec4(gamma709_to_pq2020(vec3(0.6, 0.6, 0.6)), 1.0);
+            return vec4(gamma709_to_pq2020(bg), 1.0);
+        }
+        start_y += bar_height + bar_gap;
+
+        // Bar 2: Contrast - Yellow
+        if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
+            float norm_x = pos.x / bar_width;
+            float contrast_display_max = 8.0;  // Was 12.0 - adjusted for new thresholds
+            float val = clamp(smoothed_contrast / contrast_display_max, 0.0, 1.0);
+            vec3 bg = (norm_x < val) ? vec3(0.5, 0.5, 0.0) : vec3(0.1);
+
+            float low_mark = dbg_adaptive_contrast_low / contrast_display_max;
+            float high_mark = dbg_adaptive_contrast_high / contrast_display_max;
+            if (abs(norm_x - low_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.3, 0.3, 0.6)), 1.0);
+            if (abs(norm_x - high_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.6, 0.3, 0.3)), 1.0);
+            if (abs(norm_x - val) < 0.008) return vec4(gamma709_to_pq2020(vec3(0.6, 0.6, 0.6)), 1.0);
+            return vec4(gamma709_to_pq2020(bg), 1.0);
+        }
+        start_y += bar_height + bar_gap;
+
+        // Bar 3: Max luminance - Red
+        if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
+            float norm_x = pos.x / bar_width;
+            float val = clamp(smoothed_max, 0.0, 1.0);
+            vec3 bg = (norm_x < val) ? vec3(0.5, 0.0, 0.0) : vec3(0.1);
+
+            float zone_mark = mix(HIGHLIGHT_ZONE_DARK, HIGHLIGHT_ZONE_BRIGHT, dbg_brightness_factor);
+            if (abs(norm_x - zone_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.6, 0.6, 0.0)), 1.0);
+            if (abs(norm_x - val) < 0.008) return vec4(gamma709_to_pq2020(vec3(0.6, 0.6, 0.6)), 1.0);
+            return vec4(gamma709_to_pq2020(bg), 1.0);
+        }
+        start_y += bar_height + bar_gap;
+
+        // Bar 4: Highlight population - Magenta
+        if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
+            float norm_x = pos.x / bar_width;
+            float highlight_display_max = 0.30;  // Was 0.5 - adjusted for new thresholds (8-15%)
+            float val = clamp(smoothed_highlight_pop / highlight_display_max, 0.0, 1.0);
+            vec3 bg = (norm_x < val) ? vec3(0.5, 0.0, 0.5) : vec3(0.1);
+
+            float spec_mark = dbg_adaptive_spec_threshold / highlight_display_max;
+            if (abs(norm_x - spec_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.0, 0.6, 0.0)), 1.0);
+            if (abs(norm_x - val) < 0.008) return vec4(gamma709_to_pq2020(vec3(0.6, 0.6, 0.6)), 1.0);
+            return vec4(gamma709_to_pq2020(bg), 1.0);
+        }
+        start_y += bar_height + bar_gap;
+
+        // Bar 5: Scene type indicator
+        if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
+            float norm_x = pos.x / bar_width;
+            vec3 type_color;
+            if (scene_type == SCENE_DARK_SPECULAR) type_color = vec3(0.6, 0.4, 0.0);       // Orange
+            else if (scene_type == SCENE_DARK_MOODY) type_color = vec3(0.3, 0.0, 0.5);    // Purple
+            else if (scene_type == SCENE_BRIGHT_SPECULAR) type_color = vec3(0.6, 0.6, 0.0); // Yellow
+            else if (scene_type == SCENE_BRIGHT_FLAT) type_color = vec3(0.4, 0.4, 0.4);   // Gray
+            else if (scene_type == SCENE_HIGH_CONTRAST) type_color = vec3(0.0, 0.5, 0.5); // Cyan
+            else if (scene_type == SCENE_VERY_BRIGHT) type_color = vec3(0.9, 0.9, 0.9);   // White (passthrough)
+            else type_color = vec3(0.0, 0.5, 0.0);                                         // Green (default)
+
+            float peak_norm = (highlight_peak - 1.5) / 2.0;  // Adjusted for new peak range
+            if (norm_x < peak_norm) return vec4(gamma709_to_pq2020(type_color), 1.0);
+            return vec4(gamma709_to_pq2020(vec3(0.1)), 1.0);
+        }
+    #endif
+
+    #if DEBUG_SHOW_SCENE_TYPE
+        if (HOOKED_pos.x > 0.9 && HOOKED_pos.y < 0.1) {
+            vec3 type_color;
+            if (scene_type == SCENE_DARK_SPECULAR) type_color = vec3(0.6, 0.4, 0.0);       // Orange
+            else if (scene_type == SCENE_DARK_MOODY) type_color = vec3(0.3, 0.0, 0.5);    // Purple
+            else if (scene_type == SCENE_BRIGHT_SPECULAR) type_color = vec3(0.6, 0.6, 0.0); // Yellow
+            else if (scene_type == SCENE_BRIGHT_FLAT) type_color = vec3(0.4, 0.4, 0.4);   // Gray
+            else if (scene_type == SCENE_HIGH_CONTRAST) type_color = vec3(0.0, 0.5, 0.5); // Cyan
+            else if (scene_type == SCENE_VERY_BRIGHT) type_color = vec3(0.9, 0.9, 0.9);   // White (passthrough)
+            else type_color = vec3(0.0, 0.5, 0.0);                                         // Green (default)
+            return vec4(gamma709_to_pq2020(type_color), 1.0);
+        }
+    #endif
+
+    #if DEBUG_BYPASS
+        return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    #endif
+
+    // -------------------------------------------------------------------------
+    // PIXEL PROCESSING (Gamma Space)
+    // -------------------------------------------------------------------------
+    float Y_gamma = get_luma(rgb_gamma);
+
+    // Early exit for very dark pixels (below any possible expansion knee)
+    // 0.10 gamma ≈ 0.006 linear, well below any knee
+    // Saves all grain sampling, linearization, and expansion math.
+    #if !DEBUG_SHOW_MASK && !DEBUG_SHOW_SAT && !DEBUG_SHOW_GRAIN
+        if (Y_gamma < EARLY_EXIT_GAMMA) return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    #else
+        if (Y_gamma < 0.0001) return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    #endif
+
+    float Y_decision_gamma = Y_gamma;
+
+    // -------------------------------------------------------------------------
+    // GRAIN STABILIZATION (Gamma Space)
+    // -------------------------------------------------------------------------
+    // Log-luma bilateral filter: geometric mean handles multiplicative grain
+    // naturally without edge artifacts. Operates in gamma space for perceptual uniformity.
+    #if ENABLE_GRAIN_STABLE
+        // Fixed grain range: 0.25-0.95 gamma covers all scene types
+        // (adaptive range varied 0.262-0.534 across scenes — fixed 0.25 covers all)
+        float range_mask = smoothstep(GRAIN_RANGE_MIN - 0.05, GRAIN_RANGE_MIN, Y_gamma)
+                         * (1.0 - smoothstep(GRAIN_RANGE_MAX, GRAIN_RANGE_MAX + 0.05, Y_gamma));
+
+        if (range_mask > 0.01) {
+            float r = GRAIN_RADIUS;
+            float grain_thresh = GRAIN_THRESHOLD;
+
+            // Accumulator - luma in log space for geometric mean
+            float logY_sum = log(max(Y_gamma, 1e-4));
+            float Y_count = 1.0;
+
+            // Rotated sampling to break up visible patterns
+            float rot_angle = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) * 6.28318;
+            float rot_cos = cos(rot_angle);
+            float rot_sin = sin(rot_angle);
+            #define ROTATE(v) vec2(v.x * rot_cos - v.y * rot_sin, v.x * rot_sin + v.y * rot_cos)
+
+            // Bilateral filter with dual-ring spatial weighting
+            // Welch window: (1 - t²)² approximates Gaussian shape at ~1/5th the cost
+            // dist_w: inner ring (r×0.5) gets 1.0, outer ring (r) gets 0.5
+            #define ACCUM_Y(Ys, dist_w) { \
+                float diff = abs(Ys - Y_gamma); \
+                float t_y = diff / grain_thresh; \
+                float w_y = max(1.0 - t_y * t_y, 0.0); w_y *= w_y * dist_w; \
+                logY_sum += log(max(Ys, 1e-4)) * w_y; \
+                Y_count += w_y; \
+            }
+
+            // Sample luma only (efficient)
+            #if GRAIN_QUALITY == 0
+                // Fast mode: 6 samples in hexagonal ring (outer weight)
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r, 0.0))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.5, r * 0.866))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, r * 0.866))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r, 0.0))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, -r * 0.866))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.5, -r * 0.866))).rgb), 0.5);
+            #else
+                // Quality mode: 12 samples in dual hexagonal rings
+                float r1 = r * 0.5;
+                // Inner ring (r×0.5): weight 1.0
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r1, 0.0))).rgb), 1.0);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r1 * 0.5, r1 * 0.866))).rgb), 1.0);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r1 * 0.5, r1 * 0.866))).rgb), 1.0);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r1, 0.0))).rgb), 1.0);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r1 * 0.5, -r1 * 0.866))).rgb), 1.0);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r1 * 0.5, -r1 * 0.866))).rgb), 1.0);
+                // Outer ring (r): weight 0.5
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.866, r * 0.5))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(0.0, r))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.866, r * 0.5))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.866, -r * 0.5))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(0.0, -r))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.866, -r * 0.5))).rgb), 0.5);
+            #endif
+            #undef ACCUM_Y
+            #undef ROTATE
+
+            // Apply grain stabilization (geometric mean from log space)
+            float Y_stabilized = exp(logY_sum / Y_count);
+            Y_decision_gamma = mix(Y_gamma, Y_stabilized, range_mask);
+        }
+
+        #if DEBUG_SHOW_GRAIN
+            float grain_diff = abs(Y_gamma - Y_decision_gamma) * 20.0;
+            return vec4(gamma709_to_pq2020(vec3(grain_diff, 0.0, 0.0)), 1.0);
+        #endif
+    #endif
+
+    // -------------------------------------------------------------------------
+    // LINEARIZE FOR EXPANSION
+    // -------------------------------------------------------------------------
+    // Convert from gamma to linear for expansion math
+    float Y_decision = eotf_gamma(Y_decision_gamma);
+    vec3 rgb_linear = eotf_gamma(rgb_gamma);
+
+    // -------------------------------------------------------------------------
+    // SATURATION (Oklab chroma - perceptually uniform)
+    // -------------------------------------------------------------------------
+    // Oklab chroma = sqrt(a² + b²), typically 0-0.35 for sRGB content
+    vec3 oklab_orig = rgb_to_oklab(rgb_linear);
+    float chroma_orig = sqrt(oklab_orig.y * oklab_orig.y + oklab_orig.z * oklab_orig.z);
+    // Normalize to 0-1 range (0.35 ≈ max sRGB chroma) for threshold compatibility
+    float sat_raw = chroma_orig / 0.35;
+    float sat = pow(smoothstep(SAT_THRESHOLD, 1.0, sat_raw), SAT_POWER);
+
+    #if DEBUG_SHOW_SAT
+        return vec4(gamma709_to_pq2020(vec3(sat, chroma_orig * 3.0, 0.0)), 1.0);
+    #endif
+
+    // -------------------------------------------------------------------------
+    // EXPANSION CURVE (Linear Space)
+    // -------------------------------------------------------------------------
+    // master_knee is pre-computed in first-pixel block and read from buffer
+
+    float final_steepness = min(exp_steepness * CURVE_STEEPNESS, 20.0);  // Cap prevents exp() overflow
+
+    float master_knee_t = step(master_knee, Y_decision);
+    float master_expand_t = smoothstep(master_knee, 1.0, Y_decision);
+
+    // Normalized exponential with L'Hôpital guard
+    float master_curve = (final_steepness > 0.001)
+        ? (exp(final_steepness * master_expand_t) - 1.0) / (exp(final_steepness) - 1.0)
+        : master_expand_t;
+
+    float expansion = mix(1.0, mix(1.0, highlight_peak, master_curve), master_knee_t);
+
+    // Saturation rolloff
+    #if ENABLE_SAT_ROLLOFF
+        expansion = mix(expansion, 1.0, sat * SAT_ROLLOFF);
+    #endif
+
+    // Intensity multiplier
+    expansion = 1.0 + (expansion - 1.0) * INTENSITY;
+
+    // -------------------------------------------------------------------------
+    // EARLY EXIT: Skip remaining processing for non-expanded pixels
+    // -------------------------------------------------------------------------
+    // Saves ALU on dark/mid-tone pixels that don't receive expansion.
+    // Threshold slightly above 1.0 to catch edge cases from sat rolloff.
+    if (expansion < 1.001) {
+        return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    }
+
+    #if DEBUG_SHOW_MASK
+        float exp_amount = (expansion - 1.0) / 2.5;  // Adjusted for new range
+        return vec4(gamma709_to_pq2020(vec3(exp_amount, exp_amount * 0.3, 0.0)), 1.0);
+    #endif
+
+    #if DEBUG_SHOW_EXPANSION
+        if (HOOKED_pos.x > 0.75 && HOOKED_pos.y > 0.9) {
+            float peak_norm = (highlight_peak - 1.5) / 2.0;
+            float steep_norm = (exp_steepness - 1.5) / 2.5;
+            return vec4(gamma709_to_pq2020(vec3(peak_norm, steep_norm, knee_end)), 1.0);
+        }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // APPLY EXPANSION (Linear Space)
+    // -------------------------------------------------------------------------
+    vec3 rgb_expanded = rgb_linear * expansion;
+
+    // -------------------------------------------------------------------------
+    // SATURATION BOOST + HUE CORRECTION (Merged Single Oklab Pass)
+    // -------------------------------------------------------------------------
+    // Merged into one Oklab round-trip to save ~45 ALU and eliminate the
+    // intermediate gamut clip that was distorting hue before correction could fix it.
+    #if ENABLE_SAT_BOOST || ENABLE_HUE_CORRECTION
+    {
+        vec3 oklab_exp = rgb_to_oklab(rgb_expanded);
+
+        #if ENABLE_SAT_BOOST
+            float base_boost = sqrt(max(expansion, 0.0));
+            float sat_boost = mix(1.0, base_boost, SAT_BOOST_STRENGTH);
+            sat_boost = min(sat_boost, SAT_BOOST_MAX);
+            sat_boost = mix(sat_boost, 1.0, sat);  // Don't boost already-saturated colors
+
+            // Highlight rolloff using linear luminance (threshold tuned for this)
+            float Y_expanded = get_luma(rgb_expanded);
+            float Y_original = Y_expanded / max(expansion, 1.0);
+            float highlight_t = smoothstep(SAT_HIGHLIGHT_ROLLOFF, 1.0, Y_original);
+            float rolloff_strength = 1.0 - sat;
+            sat_boost = mix(sat_boost, SAT_HIGHLIGHT_DESAT, highlight_t * rolloff_strength);
+
+            // Scale a/b (chroma) while preserving L (lightness) and hue angle
+            oklab_exp.y *= sat_boost;
+            oklab_exp.z *= sat_boost;
+
+            #if DEBUG_SHOW_SAT_BOOST
+                float boost_viz = (sat_boost - 1.0) / (SAT_BOOST_MAX - 1.0);
+                float chroma_out = sqrt(oklab_exp.y * oklab_exp.y + oklab_exp.z * oklab_exp.z);
+                return vec4(gamma709_to_pq2020(vec3(boost_viz, chroma_out * 3.0, sat * 0.5)), 1.0);
+            #endif
+        #endif
+
+        #if ENABLE_HUE_CORRECTION
+        {
+            float chroma_post = length(oklab_exp.yz);
+            float chroma_ref = length(oklab_orig.yz);
+
+            if (chroma_post > 0.001 && chroma_ref > 0.001) {
+                #if DEBUG_SHOW_HUE_SHIFT
+                    vec2 dir_pre = oklab_exp.yz / chroma_post;
+                    vec2 dir_ref = oklab_orig.yz / chroma_ref;
+                    float angle_diff = acos(clamp(dot(dir_pre, dir_ref), -1.0, 1.0));
+                    return vec4(gamma709_to_pq2020(vec3(angle_diff * 5.0, 0.0, 0.0)), 1.0);
+                #endif
+
+                // Blend hue direction toward original (pre-expansion) hue
+                oklab_exp.yz = mix(oklab_exp.yz, oklab_orig.yz, HUE_CORRECTION_STRENGTH);
+
+                // Restore expanded chroma magnitude (only hue angle changed)
+                float chroma_corrected = length(oklab_exp.yz);
+                if (chroma_corrected > 0.001) {
+                    oklab_exp.yz *= chroma_post / chroma_corrected;
+                }
+            }
+        }
+        #endif
+
+        // Single conversion back to linear RGB (one gamut clip instead of two)
+        rgb_expanded = max(oklab_to_rgb(oklab_exp), 0.0);
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // ENCODE PQ BT.2020 OUTPUT
+    // -------------------------------------------------------------------------
+    vec3 rgb_pq = linear709_to_pq2020(max(rgb_expanded, 0.0));
+
+    // -------------------------------------------------------------------------
+    // DITHER (PQ Space)
+    // -------------------------------------------------------------------------
+    #if ENABLE_DITHER
+        float expansion_amount = expansion - 1.0;
+
+        if (expansion_amount > 0.001) {
+            float dither_magnitude = (1.0 / 1023.0) * sqrt(expansion_amount) * DITHER_STRENGTH;
+
+            // PQ-level-aware dither: scale magnitude by cubic approximation of PQ derivative.
+            // More dither at brighter PQ levels where banding from expanded 8-bit source is
+            // more visible. Baseline unchanged at PQ ~0.5. Cost: 3 multiplies.
+            float pq_scale = max(rgb_pq.g, 0.45) / 0.5;
+            float pq_correction = pq_scale * pq_scale * pq_scale;
+            dither_magnitude *= pq_correction;
+
+            vec2 noise_coord = gl_FragCoord.xy;
+
+            #if DITHER_TEMPORAL
+                // Different irrationals for x and y break diagonal correlation
+                noise_coord += vec2(float(frame) * 0.7548776662,
+                                    float(frame) * 0.5698402917) * 100.0;
+            #endif
+
+            float noise = triangularNoise(noise_coord) * 0.5;
+            rgb_pq += dither_magnitude * noise;
+
+            #if DEBUG_SHOW_DITHER
+                float mag_viz = dither_magnitude * 100.0;
+                return vec4(gamma709_to_pq2020(vec3(mag_viz, mag_viz * 0.5 + noise * 0.5 + 0.25, 0.0)), 1.0);
+            #endif
+        }
+    #endif
+
+    return vec4(rgb_pq, color.a);
+}
+
+// =============================================================================
+// PQ BT.2020 OUTPUT REFERENCE
+// =============================================================================
+// Input at MAIN: gamma-encoded BT.709 (BT.1886, gamma ~2.4)
+// Output: PQ-encoded BT.2020 (libplacebo applies PQ EOTF to recover linear)
+//
+// | SDR Gamma | Linear | Nits (@100) | PQ Output |
+// |-----------|--------|-------------|-----------|
+// | 1.00      | 1.00   | 100         | ~0.501    |
+// | 0.78      | 0.57   | 57          | ~0.433    |
+// | 0.50      | 0.19   | 19          | ~0.328    |
+// | 0.25      | 0.04   | 4.0         | ~0.191    |
+// | Expanded (linear BT.709 > 1.0):              |
+// | -         | 2.00   | 200         | ~0.558    |
+// | -         | 2.70   | 270         | ~0.590    |
+// =============================================================================

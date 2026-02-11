@@ -4,12 +4,14 @@ Custom GLSL shaders for [mpv](https://mpv.io/) video player.
 
 Requires **mpv** with `vo=gpu-next` (libplacebo backend).
 
-My personal setup: TextureClarity, Film Grain Light (SDR/HDR detection) on everything. CelFlare for anime.
+**My personal setup:** TextureClarity + Film Grain Light (auto SDR/HDR) on everything. CelFlare for anime.
 
-F5: Clear Shaders
-F6: Scroll through Film Grain SDR variants
-F7: Scroll through Film Grain HDR variants
-F8: Activate CelFlare and sdr-to-hdr profile
+| Key | Action |
+|-----|--------|
+| F5  | Clear all shaders |
+| F6  | Cycle Film Grain SDR (None → Light → Medium → Heavy) |
+| F7  | Cycle Film Grain HDR (None → Light → Medium → Heavy) |
+| F8  | Toggle CelFlare + sdr-to-hdr profile |
 
 ## Shaders
 

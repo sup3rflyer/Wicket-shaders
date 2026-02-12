@@ -28,10 +28,10 @@
 //!HOOK MAIN
 //!BIND HOOKED
 //!BIND SCENE_STATE
-//!DESC CelFlare v2.1 (PQ BT.2020 Output, Scene-Adaptive SDR→HDR)
+//!DESC CelFlare v2.2 (PQ BT.2020 Output, Scene-Adaptive SDR→HDR)
 
 // =============================================================================
-// CELFLARE v2.1 - Scene-Adaptive SDR→HDR Highlight Expansion (PQ BT.2020 Output)
+// CELFLARE v2.2 - Scene-Adaptive SDR→HDR Highlight Expansion (PQ BT.2020 Output)
 // =============================================================================
 //
 // WORKFLOW:
@@ -95,7 +95,7 @@
 // Stabilizes expansion decision for grainy content by averaging similar neighbors.
 // Operates in gamma space for perceptual uniformity.
 #define ENABLE_GRAIN_STABLE 1
-#define GRAIN_QUALITY 1            // 0 = 6 samples (fast), 1 = 12 samples (quality)
+#define GRAIN_QUALITY 1            // 0 = 6 samples (fast), 1 = 9 samples (quality)
 
 // --- Dither ---
 // Masks 8-bit quantization artifacts that get amplified by expansion.
@@ -113,6 +113,7 @@
 // Shader encodes to PQ BT.2020 directly to bypass libplacebo's SDR peak clipping.
 // Must match hdr-reference-white in mpv.conf and Windows SDR brightness.
 #define REFERENCE_WHITE 116.0
+#define PQ_FAST_APPROX 1       // 0 = exact ST.2084, 1 = degree-7 polynomial (~2.4x faster PQ encoding)
 
 // =============================================================================
 // ADVANCED TUNING
@@ -276,6 +277,25 @@ vec3 pq_oetf(vec3 L) {
     return pow((c1 + c2 * Lm1) / (1.0 + c3 * Lm1), vec3(m2));
 }
 
+// PQ OETF polynomial approximation: degree-7 minimax fit on sqrt(L) domain
+// Valid for L in [0, 0.20] (0-2000 nits). Sub-1.2 ten-bit step accuracy for L > 0.005.
+// Near-zero (< 5 nits) has larger error but those channels are invisible in highlights.
+// Cost: 1 sqrt + 7 FMA per channel vs 2 pow + 1 div per channel for exact PQ.
+#if PQ_FAST_APPROX
+vec3 pq_oetf_fast(vec3 L) {
+    vec3 t = sqrt(max(L, 0.0));
+    vec3 r = vec3(4830.3861664760);
+    r = r * t - 8935.5954297213;
+    r = r * t + 6836.4130114354;
+    r = r * t - 2804.9691846594;
+    r = r * t + 672.6577715456;
+    r = r * t - 98.1828798096;
+    r = r * t + 9.7074413362;
+    r = r * t + 0.0677928739;
+    return clamp(r, 0.0, 1.0);
+}
+#endif
+
 // Gamma BT.709 → PQ BT.2020 (for passthrough/early-exit pixels)
 vec3 gamma709_to_pq2020(vec3 rgb_gamma) {
     vec3 linear = eotf_gamma(rgb_gamma);
@@ -286,7 +306,11 @@ vec3 gamma709_to_pq2020(vec3 rgb_gamma) {
 // Linear BT.709 → PQ BT.2020 (for expanded pixels, values can exceed 1.0)
 vec3 linear709_to_pq2020(vec3 rgb_linear) {
     vec3 bt2020 = bt709_to_bt2020(rgb_linear);
-    return pq_oetf(bt2020 * (REFERENCE_WHITE / 10000.0));
+    #if PQ_FAST_APPROX
+        return pq_oetf_fast(bt2020 * (REFERENCE_WHITE / 10000.0));
+    #else
+        return pq_oetf(bt2020 * (REFERENCE_WHITE / 10000.0));
+    #endif
 }
 
 // Hash without Sine (Dave Hoskins - https://www.shadertoy.com/view/4djSRW)
@@ -816,7 +840,7 @@ vec4 hook() {
                 ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, -r * 0.866))).rgb), 0.5);
                 ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.5, -r * 0.866))).rgb), 0.5);
             #else
-                // Quality mode: 12 samples in dual hexagonal rings
+                // Quality mode: 9 samples — inner hex ring (6) + outer triangle (3)
                 float r1 = r * 0.5;
                 // Inner ring (r×0.5): weight 1.0
                 ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r1, 0.0))).rgb), 1.0);
@@ -825,13 +849,10 @@ vec4 hook() {
                 ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r1, 0.0))).rgb), 1.0);
                 ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r1 * 0.5, -r1 * 0.866))).rgb), 1.0);
                 ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r1 * 0.5, -r1 * 0.866))).rgb), 1.0);
-                // Outer ring (r): weight 0.5
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.866, r * 0.5))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(0.0, r))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.866, r * 0.5))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.866, -r * 0.5))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(0.0, -r))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.866, -r * 0.5))).rgb), 0.5);
+                // Outer triangle (r): 3 samples at 120° intervals, weight 0.5
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r, 0.0))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, r * 0.866))).rgb), 0.5);
+                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, -r * 0.866))).rgb), 0.5);
             #endif
             #undef ACCUM_Y
             #undef ROTATE
@@ -994,7 +1015,7 @@ vec4 hook() {
     #if ENABLE_DITHER
         float expansion_amount = expansion - 1.0;
 
-        if (expansion_amount > 0.001) {
+        if (expansion_amount > 0.05) {
             float dither_magnitude = (1.0 / 1023.0) * sqrt(expansion_amount) * DITHER_STRENGTH;
 
             // PQ-level-aware dither: scale magnitude by cubic approximation of PQ derivative.

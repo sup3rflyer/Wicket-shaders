@@ -28,10 +28,10 @@
 //!HOOK MAIN
 //!BIND HOOKED
 //!BIND SCENE_STATE
-//!DESC CelFlare v2.2 (PQ BT.2020 Output, Scene-Adaptive SDR→HDR)
+//!DESC CelFlare v2.3 (Scene-Adaptive SDR→HDR)
 
 // =============================================================================
-// CELFLARE v2.2 - Scene-Adaptive SDR→HDR Highlight Expansion (PQ BT.2020 Output)
+// CELFLARE v2.3 - Scene-Adaptive SDR→HDR Highlight Expansion (PQ BT.2020 Output)
 // =============================================================================
 //
 // WORKFLOW:
@@ -95,7 +95,6 @@
 // Stabilizes expansion decision for grainy content by averaging similar neighbors.
 // Operates in gamma space for perceptual uniformity.
 #define ENABLE_GRAIN_STABLE 1
-#define GRAIN_QUALITY 1            // 0 = 6 samples (fast), 1 = 9 samples (quality)
 
 // --- Dither ---
 // Masks 8-bit quantization artifacts that get amplified by expansion.
@@ -122,8 +121,10 @@
 
 // --- Grain Stabilization Tuning (Gamma-Space Thresholds) ---
 #define GRAIN_THRESHOLD 0.12       // Bilateral similarity threshold (tighter = edge-preserving)
-#define GRAIN_RADIUS 14.0          // Sample distance in pixels
-#define GRAIN_RANGE_MIN 0.25       // Fixed lower limit (gamma space, covers all scene types)
+#define GRAIN_BLUR_RADIUS 7.0      // Sample distance in blur pass (half-res pixels ≈ 14px original)
+#define GRAIN_EDGE_LOW 0.06        // Edge gradient below this: fully blurred (grain area)
+#define GRAIN_EDGE_HIGH 0.15       // Edge gradient above this: fully original (edge area)
+#define GRAIN_RANGE_MIN 0.25       // Fixed lower limit (gamma space)
 #define GRAIN_RANGE_MAX 0.95       // Upper limit (gamma space)
 #define EARLY_EXIT_GAMMA 0.10      // Skip very dark pixels (gamma) - below any possible knee
 
@@ -178,12 +179,12 @@
 // Target: ~195-290 nits peak (1.8-2.7x at 108 nit reference white, with INTENSITY 1.2)
 
 // Dark + Specular: Brightest highlights (candles, stars)
-#define PEAK_DARK_SPECULAR 2.2
+#define PEAK_DARK_SPECULAR 2.3
 #define STEEP_DARK_SPECULAR 4.0
 #define KNEE_DARK_SPECULAR 0.35
 
 // Dark + Moody: Preserve mood, subtle pop
-#define PEAK_DARK_MOODY 1.8
+#define PEAK_DARK_MOODY 1.9
 #define STEEP_DARK_MOODY 2.8
 #define KNEE_DARK_MOODY 0.30
 
@@ -193,8 +194,8 @@
 #define KNEE_BRIGHT_SPECULAR 0.45
 
 // Bright + Flat: Moderate (uniformly bright scenes, bright anime palettes)
-#define PEAK_BRIGHT_FLAT 1.9
-#define STEEP_BRIGHT_FLAT 7.0
+#define PEAK_BRIGHT_FLAT 2.1
+#define STEEP_BRIGHT_FLAT 8.0
 #define KNEE_BRIGHT_FLAT 0.45
 
 // High Contrast: Punchy but controlled
@@ -208,8 +209,8 @@
 #define KNEE_DEFAULT 0.45
 
 // Very Bright: Near passthrough
-#define PEAK_VERY_BRIGHT 1.6
-#define STEEP_VERY_BRIGHT 7.0
+#define PEAK_VERY_BRIGHT 1.9
+#define STEEP_VERY_BRIGHT 10.0
 #define KNEE_VERY_BRIGHT 0.50
 
 
@@ -795,72 +796,12 @@ vec4 hook() {
     float Y_decision_gamma = Y_gamma;
 
     // -------------------------------------------------------------------------
-    // GRAIN STABILIZATION (Gamma Space)
+    // GRAIN STABILIZATION (Pre-filter Alpha Read)
     // -------------------------------------------------------------------------
-    // Log-luma bilateral filter: geometric mean handles multiplicative grain
-    // naturally without edge artifacts. Operates in gamma space for perceptual uniformity.
+    // CelFlare-blur.glsl pre-computes stabilized gamma luma and packs it into
+    // MAIN's alpha channel. We just read it here — zero extra texture fetches.
     #if ENABLE_GRAIN_STABLE
-        // Fixed grain range: 0.25-0.95 gamma covers all scene types
-        // (adaptive range varied 0.262-0.534 across scenes — fixed 0.25 covers all)
-        float range_mask = smoothstep(GRAIN_RANGE_MIN - 0.05, GRAIN_RANGE_MIN, Y_gamma)
-                         * (1.0 - smoothstep(GRAIN_RANGE_MAX, GRAIN_RANGE_MAX + 0.05, Y_gamma));
-
-        if (range_mask > 0.01) {
-            float r = GRAIN_RADIUS;
-            float grain_thresh = GRAIN_THRESHOLD;
-
-            // Accumulator - luma in log space for geometric mean
-            float logY_sum = log(max(Y_gamma, 1e-4));
-            float Y_count = 1.0;
-
-            // Rotated sampling to break up visible patterns
-            float rot_angle = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) * 6.28318;
-            float rot_cos = cos(rot_angle);
-            float rot_sin = sin(rot_angle);
-            #define ROTATE(v) vec2(v.x * rot_cos - v.y * rot_sin, v.x * rot_sin + v.y * rot_cos)
-
-            // Bilateral filter with dual-ring spatial weighting
-            // Welch window: (1 - t²)² approximates Gaussian shape at ~1/5th the cost
-            // dist_w: inner ring (r×0.5) gets 1.0, outer ring (r) gets 0.5
-            #define ACCUM_Y(Ys, dist_w) { \
-                float diff = abs(Ys - Y_gamma); \
-                float t_y = diff / grain_thresh; \
-                float w_y = max(1.0 - t_y * t_y, 0.0); w_y *= w_y * dist_w; \
-                logY_sum += log(max(Ys, 1e-4)) * w_y; \
-                Y_count += w_y; \
-            }
-
-            // Sample luma only (efficient)
-            #if GRAIN_QUALITY == 0
-                // Fast mode: 6 samples in hexagonal ring (outer weight)
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r, 0.0))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.5, r * 0.866))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, r * 0.866))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r, 0.0))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, -r * 0.866))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.5, -r * 0.866))).rgb), 0.5);
-            #else
-                // Quality mode: 9 samples — inner hex ring (6) + outer triangle (3)
-                float r1 = r * 0.5;
-                // Inner ring (r×0.5): weight 1.0
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r1, 0.0))).rgb), 1.0);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r1 * 0.5, r1 * 0.866))).rgb), 1.0);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r1 * 0.5, r1 * 0.866))).rgb), 1.0);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r1, 0.0))).rgb), 1.0);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r1 * 0.5, -r1 * 0.866))).rgb), 1.0);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r1 * 0.5, -r1 * 0.866))).rgb), 1.0);
-                // Outer triangle (r): 3 samples at 120° intervals, weight 0.5
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r, 0.0))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, r * 0.866))).rgb), 0.5);
-                ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, -r * 0.866))).rgb), 0.5);
-            #endif
-            #undef ACCUM_Y
-            #undef ROTATE
-
-            // Apply grain stabilization (geometric mean from log space)
-            float Y_stabilized = exp(logY_sum / Y_count);
-            Y_decision_gamma = mix(Y_gamma, Y_stabilized, range_mask);
-        }
+        Y_decision_gamma = color.a;
 
         #if DEBUG_SHOW_GRAIN
             float grain_diff = abs(Y_gamma - Y_decision_gamma) * 20.0;

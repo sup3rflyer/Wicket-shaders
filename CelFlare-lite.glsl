@@ -3,19 +3,19 @@
 
 //!HOOK MAIN
 //!BIND HOOKED
-//!DESC CelFlare Lite v2.2 (PQ BT.2020 Output, Static SDR→HDR)
+//!DESC CelFlare Lite v2.3 (Static SDR→HDR)
 
 // =============================================================================
-// CELFLARE LITE v2.2 - Static SDR→HDR Highlight Expansion (PQ BT.2020 Output)
+// CELFLARE LITE v2.3 - Static SDR→HDR Highlight Expansion (PQ BT.2020 Output)
 // =============================================================================
 //
-// Lightweight variant of CelFlare v2.2. Uses the same processing pipeline
+// Lightweight variant of CelFlare v2.3. Uses the same processing pipeline
 // (grain stabilization, Oklab sat boost + hue correction, PQ BT.2020 output)
 // but with static expansion parameters instead of scene-adaptive analysis.
 // No persistent buffers, no temporal state, no scene detection.
 //
 // WORKFLOW:
-//   1. Grain stabilization in gamma space (6-sample bilateral log-luma)
+//   1. Read pre-filtered grain luma from alpha (CelFlare-blur.glsl pre-pass)
 //   2. Linearize with BT.1886 EOTF for expansion math
 //   3. Apply static expansion curve in linear space
 //   4. Merged Oklab sat boost + hue correction
@@ -43,6 +43,7 @@
 //     tone-mapping=clip
 //     gamut-mapping-mode=clip
 //     vf-append=format:gamma=pq:primaries=bt.2020
+//     glsl-shaders-append=~~/shaders/CelFlare-blur.glsl
 //     glsl-shaders-append=~~/shaders/CelFlare-lite.glsl
 //
 // =============================================================================
@@ -74,7 +75,7 @@
 
 // --- Grain Stabilization ---
 // Stabilizes expansion decision for grainy content by averaging similar neighbors.
-// Operates in gamma space for perceptual uniformity. 6 samples (fast mode).
+// Reads pre-filtered luma from CelFlare-blur.glsl (alpha channel).
 #define ENABLE_GRAIN_STABLE 1
 
 // --- Dither ---
@@ -100,7 +101,9 @@
 
 // --- Grain Stabilization Tuning (Gamma-Space Thresholds) ---
 #define GRAIN_THRESHOLD 0.12       // Bilateral similarity threshold (tighter = edge-preserving)
-#define GRAIN_RADIUS 14.0          // Sample distance in pixels
+#define GRAIN_BLUR_RADIUS 7.0      // Sample distance in blur pass (half-res pixels ≈ 14px original)
+#define GRAIN_EDGE_LOW 0.06        // Edge gradient below this: fully blurred (grain area)
+#define GRAIN_EDGE_HIGH 0.15       // Edge gradient above this: fully original (edge area)
 #define GRAIN_RANGE_MIN 0.25       // Fixed lower limit (gamma space)
 #define GRAIN_RANGE_MAX 0.95       // Upper limit (gamma space)
 #define EARLY_EXIT_GAMMA 0.10      // Skip very dark pixels (gamma) - below any possible knee
@@ -291,53 +294,12 @@ vec4 hook() {
     float Y_decision_gamma = Y_gamma;
 
     // -------------------------------------------------------------------------
-    // GRAIN STABILIZATION (Gamma Space)
+    // GRAIN STABILIZATION (Pre-filter Alpha Read)
     // -------------------------------------------------------------------------
-    // Log-luma bilateral filter: geometric mean handles multiplicative grain
-    // naturally without edge artifacts. 6-sample hexagonal ring with rotated sampling.
+    // CelFlare-blur.glsl pre-computes stabilized gamma luma and packs it into
+    // MAIN's alpha channel. We just read it here — zero extra texture fetches.
     #if ENABLE_GRAIN_STABLE
-        float range_mask = smoothstep(GRAIN_RANGE_MIN - 0.05, GRAIN_RANGE_MIN, Y_gamma)
-                         * (1.0 - smoothstep(GRAIN_RANGE_MAX, GRAIN_RANGE_MAX + 0.05, Y_gamma));
-
-        if (range_mask > 0.01) {
-            float r = GRAIN_RADIUS;
-            float grain_thresh = GRAIN_THRESHOLD;
-
-            // Accumulator - luma in log space for geometric mean
-            float logY_sum = log(max(Y_gamma, 1e-4));
-            float Y_count = 1.0;
-
-            // Rotated sampling to break up visible patterns
-            float rot_angle = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) * 6.28318;
-            float rot_cos = cos(rot_angle);
-            float rot_sin = sin(rot_angle);
-            #define ROTATE(v) vec2(v.x * rot_cos - v.y * rot_sin, v.x * rot_sin + v.y * rot_cos)
-
-            // Bilateral filter with Welch window weighting
-            // dist_w: spatial weight (0.5 for single outer ring)
-            #define ACCUM_Y(Ys, dist_w) { \
-                float diff = abs(Ys - Y_gamma); \
-                float t_y = diff / grain_thresh; \
-                float w_y = max(1.0 - t_y * t_y, 0.0); w_y *= w_y * dist_w; \
-                logY_sum += log(max(Ys, 1e-4)) * w_y; \
-                Y_count += w_y; \
-            }
-
-            // 6 samples in hexagonal ring (outer weight 0.5)
-            ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r, 0.0))).rgb), 0.5);
-            ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.5, r * 0.866))).rgb), 0.5);
-            ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, r * 0.866))).rgb), 0.5);
-            ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r, 0.0))).rgb), 0.5);
-            ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(-r * 0.5, -r * 0.866))).rgb), 0.5);
-            ACCUM_Y(get_luma(HOOKED_texOff(ROTATE(vec2(r * 0.5, -r * 0.866))).rgb), 0.5);
-
-            #undef ACCUM_Y
-            #undef ROTATE
-
-            // Apply grain stabilization (geometric mean from log space)
-            float Y_stabilized = exp(logY_sum / Y_count);
-            Y_decision_gamma = mix(Y_gamma, Y_stabilized, range_mask);
-        }
+        Y_decision_gamma = color.a;
 
         #if DEBUG_SHOW_GRAIN
             float grain_diff = abs(Y_gamma - Y_decision_gamma) * 20.0;

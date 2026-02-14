@@ -1,5 +1,8 @@
+// Copyright (C) 2026 Ágúst Ari
+// Licensed under GPL-3.0 — see LICENSE
+//
 // CelFlare Grain Pre-filter — Bilateral luma stabilization packed into alpha
-// Load BEFORE CelFlare.glsl in shader list.
+// Load BEFORE CelFlare.glsl or CelFlare-lite.glsl in shader list.
 // Writes stabilized gamma luma to alpha channel for CelFlare's expansion decision.
 // Pixels outside grain range get original luma in alpha (no extra fetches).
 
@@ -7,8 +10,9 @@
 //!BIND HOOKED
 //!DESC CelFlare Grain Pre-filter (bilateral luma → alpha)
 
-// Must match CelFlare.glsl defines
+// Grain pre-filter parameters (authoritative — CelFlare/Lite read the result only)
 #define GRAIN_THRESHOLD 0.22
+#define GRAIN_BLUR_RADIUS 7.0
 #define GRAIN_RANGE_MIN 0.55
 #define GRAIN_RANGE_MAX 0.95
 #define GRAIN_EDGE_LOW 0.07
@@ -17,7 +21,7 @@
 
 vec4 hook() {
     vec4 original = HOOKED_tex(HOOKED_pos);
-    vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
+    const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
     float Y_gamma = dot(original.rgb, luma_coeff);
 
     // Early exit: very dark pixels don't need stabilization
@@ -42,7 +46,7 @@ vec4 hook() {
     //   Outer ring (6 samples, radius): hex at 0°/60°/120°/180°/240°/300°
     //   Inner ring (6 samples, radius×0.5): hex at 30°/90°/150°/210°/270°/330°
     // Two interlocking rings give finer spatial coverage, preserving grain texture.
-    float radius = 7.0;
+    float radius = GRAIN_BLUR_RADIUS;
 
     // Outer hex ring: 0°, 60°, 120°, 180°, 240°, 300°
     const vec2 outer[6] = vec2[6](
@@ -82,7 +86,7 @@ vec4 hook() {
         gy += s * rotated.y;
     }
 
-    // Inner ring (half radius, weight 0.7 — closer samples less influential)
+    // Inner ring (half radius, same bilateral weight as outer)
     for (int i = 0; i < 6; i++) {
         vec2 h = inner[i];
         vec2 rotated = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
@@ -95,7 +99,7 @@ vec4 hook() {
 
     blurred /= total_w;
 
-    // Edge magnitude from outer hex gradient (normalized)
+    // Edge magnitude from outer hex gradient (scaled by 1/3 for threshold compatibility)
     float edge = sqrt(gx * gx + gy * gy) / 3.0;
 
     // Edge-aware mixing: at edges, prefer original to avoid halos

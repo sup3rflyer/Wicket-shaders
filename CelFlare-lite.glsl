@@ -99,19 +99,15 @@
 // ADVANCED TUNING
 // =============================================================================
 
-// --- Grain Stabilization Tuning (Gamma-Space Thresholds) ---
-#define GRAIN_THRESHOLD 0.12       // Bilateral similarity threshold (tighter = edge-preserving)
-#define GRAIN_BLUR_RADIUS 7.0      // Sample distance in blur pass (half-res pixels ≈ 14px original)
-#define GRAIN_EDGE_LOW 0.06        // Edge gradient below this: fully blurred (grain area)
-#define GRAIN_EDGE_HIGH 0.15       // Edge gradient above this: fully original (edge area)
-#define GRAIN_RANGE_MIN 0.25       // Fixed lower limit (gamma space)
-#define GRAIN_RANGE_MAX 0.95       // Upper limit (gamma space)
+// --- Grain Stabilization ---
+// Grain bilateral filter runs in CelFlare-blur.glsl (pre-pass).
+// See that file for tuning parameters (threshold, radius, edge detection, range).
 #define EARLY_EXIT_GAMMA 0.10      // Skip very dark pixels (gamma) - below any possible knee
 
 // --- Saturation Rolloff (Oklab chroma-based, separate from sat boost) ---
 // Reduces expansion on already-saturated colors to prevent clipping.
 #define ENABLE_SAT_ROLLOFF 1
-#define SAT_THRESHOLD 0.4          // HSV saturation threshold to start rolloff
+#define SAT_THRESHOLD 0.4          // Normalized Oklab chroma threshold to start rolloff
 #define SAT_POWER 10.0             // Rolloff curve steepness
 #define SAT_ROLLOFF 0.80           // Reduces expansion on saturated colors
 
@@ -142,11 +138,6 @@ vec3 eotf_gamma(vec3 v) {
 
 float eotf_gamma(float v) {
     return pow(max(v, 0.0), EOTF_GAMMA);
-}
-
-// Inverse EOTF (gamma encode): linear -> gamma
-vec3 oetf_gamma(vec3 v) {
-    return pow(max(v, 0.0), vec3(1.0 / EOTF_GAMMA));
 }
 
 // BT.709 to BT.2020 color space conversion (linear domain)
@@ -298,8 +289,9 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // CelFlare-blur.glsl pre-computes stabilized gamma luma and packs it into
     // MAIN's alpha channel. We just read it here — zero extra texture fetches.
+    // If blur shader is not loaded, alpha = 1.0 (opaque video) — fall back to raw luma.
     #if ENABLE_GRAIN_STABLE
-        Y_decision_gamma = color.a;
+        Y_decision_gamma = (color.a > 0.99) ? Y_gamma : color.a;
 
         #if DEBUG_SHOW_GRAIN
             float grain_diff = abs(Y_gamma - Y_decision_gamma) * 20.0;

@@ -119,19 +119,15 @@
 // =============================================================================
 // These parameters are pre-tuned. Modify only if you understand their effects.
 
-// --- Grain Stabilization Tuning (Gamma-Space Thresholds) ---
-#define GRAIN_THRESHOLD 0.12       // Bilateral similarity threshold (tighter = edge-preserving)
-#define GRAIN_BLUR_RADIUS 7.0      // Sample distance in blur pass (half-res pixels ≈ 14px original)
-#define GRAIN_EDGE_LOW 0.06        // Edge gradient below this: fully blurred (grain area)
-#define GRAIN_EDGE_HIGH 0.15       // Edge gradient above this: fully original (edge area)
-#define GRAIN_RANGE_MIN 0.25       // Fixed lower limit (gamma space)
-#define GRAIN_RANGE_MAX 0.95       // Upper limit (gamma space)
+// --- Grain Stabilization ---
+// Grain bilateral filter runs in CelFlare-blur.glsl (pre-pass).
+// See that file for tuning parameters (threshold, radius, edge detection, range).
 #define EARLY_EXIT_GAMMA 0.10      // Skip very dark pixels (gamma) - below any possible knee
 
 // --- Saturation Rolloff (Oklab chroma-based, separate from sat boost) ---
 // Reduces expansion on already-saturated colors to prevent clipping.
 #define ENABLE_SAT_ROLLOFF 1
-#define SAT_THRESHOLD 0.4          // HSV saturation threshold to start rolloff
+#define SAT_THRESHOLD 0.4          // Normalized Oklab chroma threshold to start rolloff
 #define SAT_POWER 10.0             // Rolloff curve steepness
 #define SAT_ROLLOFF 0.80           // Reduces expansion on saturated colors
 
@@ -172,7 +168,7 @@
 #define HIGHLIGHT_ZONE_DARK 0.25         // Was 0.3 - catch highlights earlier
 #define HIGHLIGHT_ZONE_BRIGHT 0.40       // Was 0.5 - speculars start lower in bright scenes
 #define SPECULAR_THRESH_DARK 0.08        // Was 0.25 - 8% highlight population (realistic)
-#define SPECULAR_THRESH_BRIGHT 0.25      // Was 0.40 - 15% for bright scenes (was way too high)
+#define SPECULAR_THRESH_BRIGHT 0.25      // Was 0.40 - 25% for bright scenes
 #define SPECULAR_RELATIVE_FACTOR 2.0     // Also require Nx scene mean for highlight candidacy
 
 // --- Expansion Curves by Scene Type ---
@@ -246,15 +242,6 @@ vec3 eotf_gamma(vec3 v) {
 
 float eotf_gamma(float v) {
     return pow(max(v, 0.0), EOTF_GAMMA);
-}
-
-// Inverse EOTF (gamma encode): linear -> gamma
-vec3 oetf_gamma(vec3 v) {
-    return pow(max(v, 0.0), vec3(1.0 / EOTF_GAMMA));
-}
-
-float oetf_gamma(float v) {
-    return pow(max(v, 0.0), 1.0 / EOTF_GAMMA);
 }
 
 // BT.709 to BT.2020 color space conversion (linear domain)
@@ -506,9 +493,10 @@ vec4 hook() {
 
         scene_cut_lockout = max(scene_cut_lockout - 1.0, 0.0);
 
-        // B&W scene cut fallback: when avg chroma is very low, drop the chroma
-        // requirement. Uses temporally smoothed value to prevent single-frame false triggers.
-        bool is_bw = smoothed_avg_chroma < 0.02;
+        // B&W scene cut fallback: when current frame's avg chroma is very low, drop
+        // the chroma requirement. Uses current frame (not smoothed) so color-to-B&W
+        // hard cuts are detected immediately instead of waiting for smoothing to converge.
+        bool is_bw = current_avg_chroma < 0.02;
         bool scene_cut = is_bw
             ? (luma_change_pct > BLOCK_CHANGE_PCT) && (scene_cut_lockout <= 0.0)
             : (luma_change_pct > BLOCK_CHANGE_PCT) &&
@@ -662,6 +650,7 @@ vec4 hook() {
         exp_steepness = max(exp_steepness, 3.0);
         knee_end = (knee_end < 0.1) ? 0.40 : knee_end;
         master_knee = max(master_knee, 0.25);
+        scene_type = SCENE_DEFAULT;
     }
 
     // -------------------------------------------------------------------------
@@ -800,8 +789,9 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // CelFlare-blur.glsl pre-computes stabilized gamma luma and packs it into
     // MAIN's alpha channel. We just read it here — zero extra texture fetches.
+    // If blur shader is not loaded, alpha = 1.0 (opaque video) — fall back to raw luma.
     #if ENABLE_GRAIN_STABLE
-        Y_decision_gamma = color.a;
+        Y_decision_gamma = (color.a > 0.99) ? Y_gamma : color.a;
 
         #if DEBUG_SHOW_GRAIN
             float grain_diff = abs(Y_gamma - Y_decision_gamma) * 20.0;

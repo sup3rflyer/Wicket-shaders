@@ -11,13 +11,18 @@
 //!DESC CelFlare Grain Pre-filter (bilateral luma → alpha)
 
 // Grain pre-filter parameters (authoritative — CelFlare/Lite read the result only)
-#define GRAIN_THRESHOLD 0.22
-#define GRAIN_BLUR_RADIUS 7.0
-#define GRAIN_RANGE_MIN 0.55
+#define GRAIN_THRESHOLD 0.32
+#define GRAIN_BLUR_RADIUS 20.0
+#define GRAIN_RANGE_MIN 0.35
 #define GRAIN_RANGE_MAX 0.95
-#define GRAIN_EDGE_LOW 0.07
+#define GRAIN_EDGE_LOW 0.22
 #define GRAIN_EDGE_HIGH 0.60
 #define EARLY_EXIT_GAMMA 0.10
+
+// Gaussian bilateral sharpness: higher = tighter acceptance, lower = wider.
+// 2.0 ≈ similar effective width to the old linear 0.22 threshold.
+// Try 1.5 for more averaging, 3.0 for tighter edge preservation.
+#define BILATERAL_SHARPNESS 8.0
 
 vec4 hook() {
     vec4 original = HOOKED_tex(HOOKED_pos);
@@ -43,9 +48,9 @@ vec4 hook() {
     float sa = sin(angle);
 
     // 12-tap dual-ring bilateral blur:
-    //   Outer ring (6 samples, radius): hex at 0°/60°/120°/180°/240°/300°
-    //   Inner ring (6 samples, radius×0.5): hex at 30°/90°/150°/210°/270°/330°
-    // Two interlocking rings give finer spatial coverage, preserving grain texture.
+    //   Outer ring (6 samples, radius):       hex at 0°/60°/120°/180°/240°/300°
+    //   Inner ring (6 samples, radius×0.5):   hex at 30°/90°/150°/210°/270°/330°
+    // Two offset rings give good spatial coverage while preserving structure.
     float radius = GRAIN_BLUR_RADIUS;
 
     // Outer hex ring: 0°, 60°, 120°, 180°, 240°, 300°
@@ -67,39 +72,59 @@ vec4 hook() {
         vec2( 0.866, -0.500)
     );
 
+    // Asymmetric rejection scale — computed once, applied per-sample
+    // In upper luma range, darker samples are penalized up to 2× to protect highlights
+    float asym_scale = mix(1.0, 2.0, smoothstep(0.75, 0.95, Y_gamma));
+
     float total_w = 1.0;
     float blurred = Y_gamma;
-    // Edge gradient from outer ring only (longer baseline = better estimate)
+    // Bilateral-weighted edge gradient from outer ring (longest baseline = best estimate)
     float gx = 0.0;
     float gy = 0.0;
+    float grad_w = 0.0;
 
-    // Outer ring (full radius, weight 1.0)
+    float raw_diff, asym, diff, w, s;
+    vec2 rotated, offset;
+
+    // Outer ring (full radius, base spatial weight)
     for (int i = 0; i < 6; i++) {
         vec2 h = outer[i];
-        vec2 rotated = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
-        vec2 offset = HOOKED_pt * radius * rotated;
-        float s = dot(HOOKED_tex(HOOKED_pos + offset).rgb, luma_coeff);
-        float w = max(1.0 - abs(s - Y_gamma) / GRAIN_THRESHOLD, 0.0);
+        rotated = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
+        offset = HOOKED_pt * radius * rotated;
+        s = dot(HOOKED_tex(HOOKED_pos + offset).rgb, luma_coeff);
+        raw_diff = s - Y_gamma;
+        asym = raw_diff < 0.0 ? asym_scale : 1.0;
+        diff = (raw_diff * asym) / GRAIN_THRESHOLD;
+        w = exp(-BILATERAL_SHARPNESS * diff * diff);
         blurred += s * w;
         total_w += w;
-        gx += s * rotated.x;
-        gy += s * rotated.y;
+        gx += s * w * rotated.x;
+        gy += s * w * rotated.y;
+        grad_w += w;
     }
 
-    // Inner ring (half radius, same bilateral weight as outer)
+    // Normalize gradient by bilateral weight sum so grain outliers don't inflate it
+    float inv_grad_w = grad_w > 0.0 ? 1.0 / grad_w : 0.0;
+    gx *= inv_grad_w;
+    gy *= inv_grad_w;
+
+    // Inner ring (0.5× radius, stronger spatial boost — anchors the average)
     for (int i = 0; i < 6; i++) {
         vec2 h = inner[i];
-        vec2 rotated = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
-        vec2 offset = HOOKED_pt * radius * 0.5 * rotated;
-        float s = dot(HOOKED_tex(HOOKED_pos + offset).rgb, luma_coeff);
-        float w = max(1.0 - abs(s - Y_gamma) / GRAIN_THRESHOLD, 0.0);
+        rotated = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
+        offset = HOOKED_pt * radius * 0.5 * rotated;
+        s = dot(HOOKED_tex(HOOKED_pos + offset).rgb, luma_coeff);
+        raw_diff = s - Y_gamma;
+        asym = raw_diff < 0.0 ? asym_scale : 1.0;
+        diff = (raw_diff * asym) / GRAIN_THRESHOLD;
+        w = exp(-BILATERAL_SHARPNESS * diff * diff) * 1.4;
         blurred += s * w;
         total_w += w;
     }
 
     blurred /= total_w;
 
-    // Edge magnitude from outer hex gradient (scaled by 1/3 for threshold compatibility)
+    // Edge magnitude from bilateral-weighted outer hex gradient
     float edge = sqrt(gx * gx + gy * gy) / 3.0;
 
     // Edge-aware mixing: at edges, prefer original to avoid halos

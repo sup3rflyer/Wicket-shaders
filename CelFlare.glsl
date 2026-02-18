@@ -9,20 +9,22 @@
 //!VAR float smoothed_contrast
 //!VAR float smoothed_highlight_pop
 //!VAR float scene_cut_lockout
-//!VAR float prev_luma[144]
-//!VAR float prev_cb[144]
-//!VAR float prev_cr[144]
+//!VAR float prev_luma[96]
+//!VAR float prev_cb[96]
+//!VAR float prev_cr[96]
 //!VAR float scene_highlight_peak
 //!VAR float scene_exp_steepness
 //!VAR float scene_knee_end
 //!VAR float scene_master_knee
 //!VAR float scene_type_val
+//!VAR float scene_contrast
 //!VAR float smoothed_avg_chroma
 //!VAR float scene_B_highlight_peak
 //!VAR float scene_B_exp_steepness
 //!VAR float scene_B_knee_end
 //!VAR float scene_B_master_knee
 //!VAR float scene_B_type_val
+//!VAR float scene_B_contrast
 //!STORAGE
 
 //!HOOK MAIN
@@ -621,12 +623,14 @@ vec4 hook() {
             scene_knee_end = computed_knee;
             scene_master_knee = computed_master;
             scene_type_val = st;
+            scene_contrast = smoothed_contrast;
         } else {
             scene_B_highlight_peak = computed_peak;
             scene_B_exp_steepness = computed_steep;
             scene_B_knee_end = computed_knee;
             scene_B_master_knee = computed_master;
             scene_B_type_val = st;
+            scene_B_contrast = smoothed_contrast;
         }
 
         // First pixel outputs original color after computing stats
@@ -637,7 +641,7 @@ vec4 hook() {
     // Double-buffer: read from PREVIOUS frame's slot (opposite parity).
     // Eliminates GPU race where some warps see first-pixel's buffer write
     // and others don't, causing visible grid pattern on scene cuts.
-    float highlight_peak, exp_steepness, knee_end, master_knee;
+    float highlight_peak, exp_steepness, knee_end, master_knee, db_contrast;
     int scene_type;
     if (frame % 2 == 0) {
         // Even frames: first pixel writes A, read from B (previous odd frame)
@@ -646,6 +650,7 @@ vec4 hook() {
         knee_end = scene_B_knee_end;
         master_knee = scene_B_master_knee;
         scene_type = int(scene_B_type_val);
+        db_contrast = scene_B_contrast;
     } else {
         // Odd frames: first pixel writes B, read from A (previous even frame)
         highlight_peak = scene_highlight_peak;
@@ -653,6 +658,7 @@ vec4 hook() {
         knee_end = scene_knee_end;
         master_knee = scene_master_knee;
         scene_type = int(scene_type_val);
+        db_contrast = scene_contrast;
     }
 
     // Fallback defaults for frame 0 (opposite slot uninitialized)
@@ -855,7 +861,7 @@ vec4 hook() {
 
     // Intensity multiplier
     #if ENABLE_DYNAMIC_INTENSITY
-        float dyn_factor = smoothstep(DYN_CONTRAST_LOW, DYN_CONTRAST_HIGH, smoothed_contrast);
+        float dyn_factor = smoothstep(DYN_CONTRAST_LOW, DYN_CONTRAST_HIGH, db_contrast);
         float dyn_intensity = mix(DYN_INTENSITY_LOW, DYN_INTENSITY_HIGH, dyn_factor);
         expansion = 1.0 + (expansion - 1.0) * dyn_intensity * INTENSITY;
     #else

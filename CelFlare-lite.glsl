@@ -63,6 +63,7 @@
 // Counters the "silvery" desaturated look from expanding luminance without chroma.
 // Uses Oklab color space for perceptually uniform chroma scaling with perfect hue preservation.
 #define ENABLE_SAT_BOOST 1
+#define SAT_BOOST_EXPONENT 0.48    // Weber-Fechner: 0.5 = sqrt (constant colorfulness), lower = less aggressive on mids
 #define SAT_BOOST_STRENGTH 1.15    // Boost for low-sat colors
 #define SAT_BOOST_MAX 1.2          // Saturated enough to counter silvery expansion
 #define SAT_HIGHLIGHT_ROLLOFF 0.8  // Normalized threshold for highlight desaturation
@@ -367,7 +368,7 @@ vec4 hook() {
         vec3 oklab_exp = rgb_to_oklab(rgb_expanded);
 
         #if ENABLE_SAT_BOOST
-            float base_boost = sqrt(max(expansion, 0.0));
+            float base_boost = pow(max(expansion, 0.0), SAT_BOOST_EXPONENT);
             float sat_boost = mix(1.0, base_boost, SAT_BOOST_STRENGTH);
             sat_boost = min(sat_boost, SAT_BOOST_MAX);
             sat_boost = mix(sat_boost, 1.0, sat);  // Don't boost already-saturated colors

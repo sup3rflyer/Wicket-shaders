@@ -71,14 +71,25 @@
 // =============================================================================
 
 // --- Core Expansion ---
-#define INTENSITY 1.4              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
-#define CURVE_STEEPNESS 0.4        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy
+#define INTENSITY 1.2              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
+#define CURVE_STEEPNESS 0.6        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy highlights
+
+// --- Dynamic Intensity ---
+// Per-scene multiplier on INTENSITY based on contrast. Flat/pastel scenes get gentler
+// expansion, dramatic high-contrast scenes get more pop. Range kept tight to avoid
+// visible fluctuation between dialogue cuts.
+#define ENABLE_DYNAMIC_INTENSITY 1 // 0 = off (fixed INTENSITY), 1 = contrast-adaptive
+#define DYN_INTENSITY_LOW  0.80    // Multiplier for flat/low-contrast scenes
+#define DYN_INTENSITY_HIGH 1.15    // Multiplier for high-contrast/dramatic scenes
+#define DYN_CONTRAST_LOW   2.2     // Contrast floor (stops) — below this = DYN_INTENSITY_LOW
+#define DYN_CONTRAST_HIGH  5.5     // Contrast ceiling (stops) — above this = DYN_INTENSITY_HIGH
 
 // --- Saturation Boost (Oklab) ---
 // Counters the "silvery" desaturated look from expanding luminance without chroma.
 // Uses Oklab color space for perceptually uniform chroma scaling with perfect hue preservation.
 // Based on Weber-Fechner law: chroma scales with sqrt(expansion) for constant colorfulness.
 #define ENABLE_SAT_BOOST 1
+#define SAT_BOOST_EXPONENT 0.48    // Weber-Fechner: 0.5 = sqrt (constant colorfulness), lower = less aggressive on mids
 #define SAT_BOOST_STRENGTH 1.15    // Boost for low-sat colors
 #define SAT_BOOST_MAX 1.2          // Saturated enough to counter silvery expansion
 #define SAT_HIGHLIGHT_ROLLOFF 0.8  // Normalized threshold for highlight desaturation
@@ -127,9 +138,9 @@
 // --- Saturation Rolloff (Oklab chroma-based, separate from sat boost) ---
 // Reduces expansion on already-saturated colors to prevent clipping.
 #define ENABLE_SAT_ROLLOFF 1
-#define SAT_THRESHOLD 0.4          // Normalized Oklab chroma threshold to start rolloff
-#define SAT_POWER 10.0             // Rolloff curve steepness
-#define SAT_ROLLOFF 0.80           // Reduces expansion on saturated colors
+#define SAT_THRESHOLD 0.25         // Normalized Oklab chroma threshold to start rolloff
+#define SAT_POWER 6.0             // Rolloff curve steepness
+#define SAT_ROLLOFF 0.60           // Reduces expansion on saturated colors
 
 // =============================================================================
 // INTERNAL PARAMETERS
@@ -149,26 +160,26 @@
 #define LOCKOUT_FRAMES 6.0         // Frames to wait before detecting another cut
 
 // --- Scene Sampling ---
-#define SAMPLE_COLS 16             // 16x9 = 144 samples (matches common aspect ratio)
-#define SAMPLE_ROWS 9
+#define SAMPLE_COLS 12             // 12x8 = 96 samples (~33% fewer, imperceptible on uniform content)
+#define SAMPLE_ROWS 8
 
 // --- Brightness Classification (log-average / key) ---
 #define KEY_DARK 0.022
 #define KEY_MID 0.05
-#define KEY_BRIGHT 0.08
-#define KEY_VERY_BRIGHT 0.45             // Was 0.21 - only truly overexposed/washed scenes
+#define KEY_BRIGHT 0.065
+#define KEY_VERY_BRIGHT 0.32             // Passthrough on bright daytime anime without killing speculars
 
 // --- Contrast Classification (stops, cascading based on brightness) ---
 #define CONTRAST_LOW_DARK 2.0
 #define CONTRAST_LOW_BRIGHT 2.0
-#define CONTRAST_HIGH_DARK 3.5
-#define CONTRAST_HIGH_BRIGHT 4.0
+#define CONTRAST_HIGH_DARK 3.25
+#define CONTRAST_HIGH_BRIGHT 4.2
 
 // --- Specular Detection (cascading based on brightness) ---
-#define HIGHLIGHT_ZONE_DARK 0.25         // Was 0.3 - catch highlights earlier
+#define HIGHLIGHT_ZONE_DARK 0.22         // Cel-shaded speculars sit lower in SDR than live-action
 #define HIGHLIGHT_ZONE_BRIGHT 0.40       // Was 0.5 - speculars start lower in bright scenes
-#define SPECULAR_THRESH_DARK 0.08        // Was 0.25 - 8% highlight population (realistic)
-#define SPECULAR_THRESH_BRIGHT 0.25      // Was 0.40 - 25% for bright scenes
+#define SPECULAR_THRESH_DARK 0.065       // Anime highlight population typically 5-11%
+#define SPECULAR_THRESH_BRIGHT 0.22      // Bright anime palettes have lower relative highlight counts
 #define SPECULAR_RELATIVE_FACTOR 2.0     // Also require Nx scene mean for highlight candidacy
 
 // --- Expansion Curves by Scene Type ---
@@ -190,8 +201,8 @@
 #define KNEE_BRIGHT_SPECULAR 0.45
 
 // Bright + Flat: Moderate (uniformly bright scenes, bright anime palettes)
-#define PEAK_BRIGHT_FLAT 2.1
-#define STEEP_BRIGHT_FLAT 8.0
+#define PEAK_BRIGHT_FLAT 2.0
+#define STEEP_BRIGHT_FLAT 7.0
 #define KNEE_BRIGHT_FLAT 0.45
 
 // High Contrast: Punchy but controlled
@@ -267,7 +278,7 @@ vec3 pq_oetf(vec3 L) {
 
 // PQ OETF polynomial approximation: degree-7 minimax fit on sqrt(L) domain
 // Valid for L in [0, 0.20] (0-2000 nits). Sub-1.2 ten-bit step accuracy for L > 0.005.
-// Near-zero (< 5 nits) has larger error but those channels are invisible in highlights.
+// Near-zero (< 5 nits) has larger error but those channels are not used in this shader.
 // Cost: 1 sqrt + 7 FMA per channel vs 2 pow + 1 div per channel for exact PQ.
 #if PQ_FAST_APPROX
 vec3 pq_oetf_fast(vec3 L) {
@@ -433,7 +444,7 @@ vec4 hook() {
                 float cb_gamma = rgb_sample_gamma.b - Y_gamma;
                 float cr_gamma = rgb_sample_gamma.r - Y_gamma;
 
-                // Scene cut detection runs on ALL 144 samples (including black bars)
+                // Scene cut detection runs on ALL 96 samples (including black bars)
                 if (frame > 0) {
                     float luma_diff = abs(Y_gamma - prev_luma[idx]);
                     float cb_diff = cb_gamma - prev_cb[idx];
@@ -477,7 +488,7 @@ vec4 hook() {
         }
 
         // If too few valid samples (>75% black bars), keep previous frame's smoothed stats
-        bool stats_valid = valid_samples >= 36.0;
+        bool stats_valid = valid_samples >= 24.0;
 
         float current_avg = stats_valid ? Y_sum / valid_samples : smoothed_avg;
         float current_log_avg = stats_valid ? exp(Y_log_sum / valid_samples) : smoothed_log_avg;
@@ -487,7 +498,7 @@ vec4 hook() {
         float current_Y_min = stats_valid ? Y_min : smoothed_min;
         float current_avg_chroma = chroma_sum / total_samples;
 
-        // Block-based scene cut detection (uses all 144 samples, not just valid)
+        // Block-based scene cut detection (uses all 96 samples, not just valid)
         float luma_change_pct = luma_changed_count / total_samples;
         float chroma_change_pct = chroma_changed_count / total_samples;
 
@@ -674,7 +685,7 @@ vec4 hook() {
         // Bar 1: Log-average (Key) - Green
         if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
             float norm_x = pos.x / bar_width;
-            float display_max = 0.45;  // Was 0.25 - accommodate KEY_VERY_BRIGHT=0.35
+            float display_max = 0.40;  // Accommodate KEY_VERY_BRIGHT=0.32
             float val = clamp(smoothed_log_avg / display_max, 0.0, 1.0);
             vec3 bg = (norm_x < val) ? vec3(0.0, 0.5, 0.0) : vec3(0.1);
 
@@ -843,7 +854,13 @@ vec4 hook() {
     #endif
 
     // Intensity multiplier
-    expansion = 1.0 + (expansion - 1.0) * INTENSITY;
+    #if ENABLE_DYNAMIC_INTENSITY
+        float dyn_factor = smoothstep(DYN_CONTRAST_LOW, DYN_CONTRAST_HIGH, smoothed_contrast);
+        float dyn_intensity = mix(DYN_INTENSITY_LOW, DYN_INTENSITY_HIGH, dyn_factor);
+        expansion = 1.0 + (expansion - 1.0) * dyn_intensity * INTENSITY;
+    #else
+        expansion = 1.0 + (expansion - 1.0) * INTENSITY;
+    #endif
 
     // -------------------------------------------------------------------------
     // EARLY EXIT: Skip remaining processing for non-expanded pixels
@@ -882,7 +899,7 @@ vec4 hook() {
         vec3 oklab_exp = rgb_to_oklab(rgb_expanded);
 
         #if ENABLE_SAT_BOOST
-            float base_boost = sqrt(max(expansion, 0.0));
+            float base_boost = pow(max(expansion, 0.0), SAT_BOOST_EXPONENT);
             float sat_boost = mix(1.0, base_boost, SAT_BOOST_STRENGTH);
             sat_boost = min(sat_boost, SAT_BOOST_MAX);
             sat_boost = mix(sat_boost, 1.0, sat);  // Don't boost already-saturated colors

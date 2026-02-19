@@ -49,8 +49,11 @@ hdr-reference-white=110          # Match your Windows SDR brightness (nits)
 sub-hdr-peak=110
 image-subs-hdr-peak=110
 vf-append=format:gamma=pq:primaries=bt.2020 		#Has to be set
+glsl-shaders-append=~~/shaders/CelFlare-blur.glsl
 glsl-shaders-append=~~/shaders/CelFlare.glsl
 ```
+
+`CelFlare-blur.glsl` must load before `CelFlare.glsl` — it packs stabilized luma into the alpha channel that CelFlare reads for grain-aware expansion decisions.
 
 Set `REFERENCE_WHITE` inside the shader to match your `hdr-reference-white` value.
 
@@ -154,11 +157,12 @@ If using multiple shaders together, load them in this order:
 
 ```ini
 glsl-shaders-append=~~/shaders/TextureClarity.glsl
+glsl-shaders-append=~~/shaders/CelFlare-blur.glsl
 glsl-shaders-append=~~/shaders/CelFlare.glsl
 glsl-shaders-append=~~/shaders/filmgrain-smooth-HDR-light.glsl
 ```
 
-TextureClarity runs on LUMA before expansion. CelFlare hooks at MAIN. Film grain hooks at OUTPUT (final stage).
+TextureClarity runs on LUMA before expansion. CelFlare-blur and CelFlare both hook at MAIN (blur must precede CelFlare/Lite). Film grain hooks at OUTPUT (final stage).
 
 ## License
 

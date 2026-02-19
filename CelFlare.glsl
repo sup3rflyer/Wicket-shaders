@@ -25,6 +25,8 @@
 //!VAR float scene_B_master_knee
 //!VAR float scene_B_type_val
 //!VAR float scene_B_contrast
+//!VAR float scene_exp_denom
+//!VAR float scene_B_exp_denom
 //!STORAGE
 
 //!HOOK MAIN
@@ -74,15 +76,15 @@
 
 // --- Core Expansion ---
 #define INTENSITY 1.2              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
-#define CURVE_STEEPNESS 0.6        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy highlights
+#define CURVE_STEEPNESS 0.4        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy highlights
 
 // --- Dynamic Intensity ---
 // Per-scene multiplier on INTENSITY based on contrast. Flat/pastel scenes get gentler
 // expansion, dramatic high-contrast scenes get more pop. Range kept tight to avoid
 // visible fluctuation between dialogue cuts.
-#define ENABLE_DYNAMIC_INTENSITY 1 // 0 = off (fixed INTENSITY), 1 = contrast-adaptive
-#define DYN_INTENSITY_LOW  0.80    // Multiplier for flat/low-contrast scenes
-#define DYN_INTENSITY_HIGH 1.15    // Multiplier for high-contrast/dramatic scenes
+#define ENABLE_DYNAMIC_INTENSITY 0 // 0 = off (fixed INTENSITY), 1 = contrast-adaptive
+#define DYN_INTENSITY_LOW  0.70    // Multiplier for flat/low-contrast scenes
+#define DYN_INTENSITY_HIGH 1.20    // Multiplier for high-contrast/dramatic scenes
 #define DYN_CONTRAST_LOW   2.2     // Contrast floor (stops) — below this = DYN_INTENSITY_LOW
 #define DYN_CONTRAST_HIGH  5.5     // Contrast ceiling (stops) — above this = DYN_INTENSITY_HIGH
 
@@ -92,7 +94,7 @@
 // Based on Weber-Fechner law: chroma scales with sqrt(expansion) for constant colorfulness.
 #define ENABLE_SAT_BOOST 1
 #define SAT_BOOST_EXPONENT 0.48    // Weber-Fechner: 0.5 = sqrt (constant colorfulness), lower = less aggressive on mids
-#define SAT_BOOST_STRENGTH 1.15    // Boost for low-sat colors
+#define SAT_BOOST_STRENGTH 1.2    // Boost for low-sat colors
 #define SAT_BOOST_MAX 1.2          // Saturated enough to counter silvery expansion
 #define SAT_HIGHLIGHT_ROLLOFF 0.8  // Normalized threshold for highlight desaturation
 #define SAT_HIGHLIGHT_DESAT 0.8    // Target sat multiplier at peak (only for low-sat sources)
@@ -137,6 +139,9 @@
 // See that file for tuning parameters (threshold, radius, edge detection, range).
 #define EARLY_EXIT_GAMMA 0.10      // Skip very dark pixels (gamma) - below any possible knee
 
+// --- Expansion Knee ---
+#define MASTER_KNEE_OFFSET 0.15    // Onset is this many linear units below knee_end (see scene classification)
+
 // --- Saturation Rolloff (Oklab chroma-based, separate from sat boost) ---
 // Reduces expansion on already-saturated colors to prevent clipping.
 #define ENABLE_SAT_ROLLOFF 1
@@ -167,7 +172,6 @@
 
 // --- Brightness Classification (log-average / key) ---
 #define KEY_DARK 0.022
-#define KEY_MID 0.05
 #define KEY_BRIGHT 0.065
 #define KEY_VERY_BRIGHT 0.32             // Passthrough on bright daytime anime without killing speculars
 
@@ -598,8 +602,8 @@ vec4 hook() {
         float computed_peak = mix(pre_vb_peak, PEAK_VERY_BRIGHT, very_bright_factor);
         float computed_steep = mix(pre_vb_steep, STEEP_VERY_BRIGHT, very_bright_factor);
         float computed_knee = mix(pre_vb_knee, KNEE_VERY_BRIGHT, very_bright_factor);
-        float master_knee_offset = 0.15;
-        float computed_master = max(computed_knee - master_knee_offset, 0.05);
+        float computed_master = max(computed_knee - MASTER_KNEE_OFFSET, 0.05);
+        float computed_exp_denom = exp(min(computed_steep * CURVE_STEEPNESS, 20.0)) - 1.0;
 
         // Compute scene type for debug visualization
         float st = float(SCENE_DEFAULT);
@@ -624,6 +628,7 @@ vec4 hook() {
             scene_master_knee = computed_master;
             scene_type_val = st;
             scene_contrast = smoothed_contrast;
+            scene_exp_denom = computed_exp_denom;
         } else {
             scene_B_highlight_peak = computed_peak;
             scene_B_exp_steepness = computed_steep;
@@ -631,6 +636,7 @@ vec4 hook() {
             scene_B_master_knee = computed_master;
             scene_B_type_val = st;
             scene_B_contrast = smoothed_contrast;
+            scene_B_exp_denom = computed_exp_denom;
         }
 
         // First pixel outputs original color after computing stats
@@ -641,7 +647,7 @@ vec4 hook() {
     // Double-buffer: read from PREVIOUS frame's slot (opposite parity).
     // Eliminates GPU race where some warps see first-pixel's buffer write
     // and others don't, causing visible grid pattern on scene cuts.
-    float highlight_peak, exp_steepness, knee_end, master_knee, db_contrast;
+    float highlight_peak, exp_steepness, knee_end, master_knee, db_contrast, exp_denom;
     int scene_type;
     if (frame % 2 == 0) {
         // Even frames: first pixel writes A, read from B (previous odd frame)
@@ -651,6 +657,7 @@ vec4 hook() {
         master_knee = scene_B_master_knee;
         scene_type = int(scene_B_type_val);
         db_contrast = scene_B_contrast;
+        exp_denom = scene_B_exp_denom;
     } else {
         // Odd frames: first pixel writes B, read from A (previous even frame)
         highlight_peak = scene_highlight_peak;
@@ -659,6 +666,7 @@ vec4 hook() {
         master_knee = scene_master_knee;
         scene_type = int(scene_type_val);
         db_contrast = scene_contrast;
+        exp_denom = scene_exp_denom;
     }
 
     // Fallback defaults for frame 0 (opposite slot uninitialized)
@@ -668,6 +676,10 @@ vec4 hook() {
         knee_end = (knee_end < 0.1) ? 0.40 : knee_end;
         master_knee = max(master_knee, 0.25);
         scene_type = SCENE_DEFAULT;
+        db_contrast = (db_contrast < 0.5) ? 3.0 : db_contrast;
+        // exp_denom buffer slot is uninitialized (zero) on frame 0 — recompute from fallback steepness
+        float fs_fallback = min(exp_steepness * CURVE_STEEPNESS, 20.0);
+        exp_denom = (fs_fallback > 0.001) ? exp(fs_fallback) - 1.0 : 1.0;
     }
 
     // -------------------------------------------------------------------------
@@ -849,7 +861,7 @@ vec4 hook() {
 
     // Normalized exponential with L'Hôpital guard
     float master_curve = (final_steepness > 0.001)
-        ? (exp(final_steepness * master_expand_t) - 1.0) / (exp(final_steepness) - 1.0)
+        ? (exp(final_steepness * master_expand_t) - 1.0) / exp_denom
         : master_expand_t;
 
     float expansion = mix(1.0, mix(1.0, highlight_peak, master_curve), master_knee_t);

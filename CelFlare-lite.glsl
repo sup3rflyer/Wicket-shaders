@@ -6,49 +6,6 @@
 //!DESC CelFlare Lite v2.5 (Static SDR→HDR)
 
 // =============================================================================
-// CELFLARE LITE v2.3 - Static SDR→HDR Highlight Expansion (PQ BT.2020 Output)
-// =============================================================================
-//
-// Lightweight variant of CelFlare v2.3. Uses the same processing pipeline
-// (grain stabilization, Oklab sat boost + hue correction, PQ BT.2020 output)
-// but with static expansion parameters instead of scene-adaptive analysis.
-// No persistent buffers, no temporal state, no scene detection.
-//
-// WORKFLOW:
-//   1. Read pre-filtered grain luma from alpha (CelFlare-blur.glsl pre-pass)
-//   2. Linearize with BT.1886 EOTF for expansion math
-//   3. Apply static expansion curve in linear space
-//   4. Merged Oklab sat boost + hue correction
-//   5. Convert BT.709 → BT.2020 gamut
-//   6. Encode to PQ (ST.2084) for HDR output
-//   7. PQ-aware dither
-//
-// REQUIREMENTS:
-//   - mpv v0.41.0+ (for --hdr-reference-white support)
-//   - vo=gpu-next with libplacebo
-//
-// CRITICAL SETTINGS:
-//   Set hdr-reference-white to match your Windows SDR brightness (nits).
-//   Set REFERENCE_WHITE below to match hdr-reference-white.
-//   The vf-append line re-tags source metadata so libplacebo interprets
-//   the shader's PQ BT.2020 output correctly (no pixel conversion).
-//
-//   Example mpv.conf profile:
-//     [sdr-to-hdr]
-//     profile-restore=copy
-//     target-trc=pq
-//     target-prim=bt.2020
-//     target-peak=10000
-//     hdr-reference-white=116    # Match your Windows SDR brightness
-//     tone-mapping=clip
-//     gamut-mapping-mode=clip
-//     vf-append=format:gamma=pq:primaries=bt.2020
-//     glsl-shaders-append=~~/shaders/CelFlare-blur.glsl
-//     glsl-shaders-append=~~/shaders/CelFlare-lite.glsl
-//
-// =============================================================================
-
-// =============================================================================
 // USER CONTROLS
 // =============================================================================
 

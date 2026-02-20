@@ -35,47 +35,11 @@
 //!DESC CelFlare v2.5 (Scene-Adaptive SDR→HDR)
 
 // =============================================================================
-// CELFLARE v2.3 - Scene-Adaptive SDR→HDR Highlight Expansion (PQ BT.2020 Output)
-// =============================================================================
-//
-// WORKFLOW:
-//   1. Grain stabilization operates in gamma space (perceptually uniform)
-//   2. Linearize with BT.1886 EOTF for expansion math
-//   3. Apply expansion in linear space (nit-proportional)
-//   4. Convert BT.709 → BT.2020 gamut (3×3 matrix)
-//   5. Encode to PQ (ST.2084) for HDR output
-//   6. libplacebo sees PQ BT.2020 source, passes through without clipping
-//
-// REQUIREMENTS:
-//   - mpv v0.41.0+ (for --hdr-reference-white support)
-//   - vo=gpu-next with libplacebo
-//
-// CRITICAL SETTINGS:
-//   Set hdr-reference-white to match your Windows SDR brightness (nits).
-//   Set REFERENCE_WHITE below to match hdr-reference-white.
-//   The vf-append line re-tags source metadata so libplacebo interprets
-//   the shader's PQ BT.2020 output correctly (no pixel conversion).
-//
-//   Example mpv.conf profile:
-//     [sdr-to-hdr]
-//     profile-restore=copy
-//     target-trc=pq
-//     target-prim=bt.2020
-//     target-peak=10000
-//     hdr-reference-white=116    # Match your Windows SDR brightness
-//     tone-mapping=clip
-//     gamut-mapping-mode=clip
-//     vf-append=format:gamma=pq:primaries=bt.2020
-//     glsl-shaders-append=~~/shaders/CelFlare.glsl
-//
-// =============================================================================
-
-// =============================================================================
 // USER CONTROLS
 // =============================================================================
 
 // --- Core Expansion ---
-#define INTENSITY 1.2              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
+#define INTENSITY 1.5              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
 #define CURVE_STEEPNESS 0.4        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy highlights
 
 // --- Dynamic Intensity ---

@@ -77,7 +77,7 @@
 // --- Bezold-Brücke Warmth Compensation ---
 // See CelFlare.glsl for full description.
 // NOTE: For peaks above ~400 nits a full hue map with atan2 is needed.
-#define ENABLE_BB_WARMTH 0
+#define ENABLE_BB_WARMTH 1
 #define BB_WARMTH 0.05         // Rotation in radians (~3°); try 0.03–0.10
 
 // --- Grain Stabilization ---
@@ -120,7 +120,7 @@
 
 // --- Chroma-Adaptive Expansion (Helmholtz-Kohlrausch compensation) ---
 // See CelFlare.glsl for full description.
-#define ENABLE_CHROMA_EXPAND 0
+#define ENABLE_CHROMA_EXPAND 1
 #define CHROMA_EXPAND_STRENGTH 0.12  // Max modifier magnitude; try 0.08–0.15
 #define CHROMA_EXPAND_PIVOT 0.30     // Normalized Oklab chroma crossover (~pale skin)
 

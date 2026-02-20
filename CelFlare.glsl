@@ -114,7 +114,7 @@
 // naturally by positive-b gate). Scales with expansion as proxy for output luminance.
 // NOTE: For peaks above ~400 nits a full hue map with atan2 is needed — at high luminance
 // blues shift toward violet and reds need counter-clockwise correction.
-#define ENABLE_BB_WARMTH 0
+#define ENABLE_BB_WARMTH 1
 #define BB_WARMTH 0.20         // Rotation in radians (~3°); try 0.03–0.10
 
 // --- Grain Stabilization ---

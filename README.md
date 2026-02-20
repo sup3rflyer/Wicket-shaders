@@ -13,6 +13,8 @@ Requires **mpv** with `vo=gpu-next` (libplacebo backend).
 | F7  | Cycle Film Grain HDR (None → Light → Medium → Heavy) |
 | F8  | Toggle CelFlare + sdr-to-hdr profile |
 
+The keybindings above use a Lua script for mpv. Ask an AI assistant to write you a `shader-toggle.lua` tailored to your keybindings and shader combinations — describe what you want (mutual exclusivity, profile switching, OSD feedback) and it'll have a working script in under a minute.
+
 ## Shaders
 
 ### CelFlare
@@ -27,7 +29,10 @@ Features:
 - 7 scene types with smooth blending
 - Scene cut detection with fast adaptation lockout
 - Grain stabilization via bilateral log-luma filter (prevents grain from flickering in expanded regions)
-- Perceptual saturation boost in Oklab color space (counters the silvery look from luminance-only expansion)
+- Perceptual saturation boost in Oklab (counters the silvery look from luminance-only expansion)
+- Magnitude-preserving hue correction (prevents yellow→green shift on warm highlights and fires)
+- Bezold-Brücke warmth compensation (pre-compensates for perceptual hue shift at higher luminances)
+- Chroma-adaptive expansion (Helmholtz-Kohlrausch compensation — pale and warm skin tones expand more proportionally)
 - PQ-aware temporal dither to mask 8-bit banding in expanded highlights
 - Direct PQ BT.2020 output bypasses libplacebo's SDR peak clipping
 - Multiple debug visualizations for tuning

@@ -3,7 +3,7 @@
 
 //!HOOK MAIN
 //!BIND HOOKED
-//!DESC CelFlare Lite v2.3 (Static SDR→HDR)
+//!DESC CelFlare Lite v2.5 (Static SDR→HDR)
 
 // =============================================================================
 // CELFLARE LITE v2.3 - Static SDR→HDR Highlight Expansion (PQ BT.2020 Output)
@@ -72,7 +72,13 @@
 // --- Hue Correction (Oklab) ---
 // Corrects hue shifts from saturation boost gamut clipping (e.g. yellow→green on fires).
 #define ENABLE_HUE_CORRECTION 1
-#define HUE_CORRECTION_STRENGTH 0.90  // 0.0 = none, 1.0 = full (0.75 recommended)
+#define HUE_CORRECTION_STRENGTH 1.0  // 0.0 = none, 1.0 = full
+
+// --- Bezold-Brücke Warmth Compensation ---
+// See CelFlare.glsl for full description.
+// NOTE: For peaks above ~400 nits a full hue map with atan2 is needed.
+#define ENABLE_BB_WARMTH 0
+#define BB_WARMTH 0.05         // Rotation in radians (~3°); try 0.03–0.10
 
 // --- Grain Stabilization ---
 // Stabilizes expansion decision for grainy content by averaging similar neighbors.
@@ -111,6 +117,12 @@
 #define SAT_THRESHOLD 0.4          // Normalized Oklab chroma threshold to start rolloff
 #define SAT_POWER 10.0             // Rolloff curve steepness
 #define SAT_ROLLOFF 0.80           // Reduces expansion on saturated colors
+
+// --- Chroma-Adaptive Expansion (Helmholtz-Kohlrausch compensation) ---
+// See CelFlare.glsl for full description.
+#define ENABLE_CHROMA_EXPAND 0
+#define CHROMA_EXPAND_STRENGTH 0.12  // Max modifier magnitude; try 0.08–0.15
+#define CHROMA_EXPAND_PIVOT 0.30     // Normalized Oklab chroma crossover (~pale skin)
 
 // =============================================================================
 // DEBUG
@@ -343,6 +355,27 @@ vec4 hook() {
     // Intensity multiplier
     expansion = 1.0 + (expansion - 1.0) * INTENSITY;
 
+    // Chroma-adaptive expansion: warm low-sat (pale skin) → compress;
+    // warm mid-sat (healthy skin) → lift. Lift gated on expansion zone
+    // to prevent halos at onset. Compression: early exit handles result.
+    #if ENABLE_CHROMA_EXPAND
+    {
+        float ce_chroma_n = clamp(chroma_orig / 0.35, 0.0, 1.0);
+        float warm_ratio  = oklab_orig.z / (abs(oklab_orig.y) + chroma_orig + 0.001);
+        // Gate on BOTH hue angle AND chroma magnitude. warm_ratio alone is a pure hue
+        // direction measure — a near-neutral pixel with a tiny positive b still gets
+        // warm_ratio≈1, but has no meaningful warm chroma to compensate for. H-K effect
+        // is proportional to saturation, so correction should fade to zero at neutral.
+        float warm_t = smoothstep(0.15, 0.65, warm_ratio) * smoothstep(0.05, 0.20, ce_chroma_n);
+        float delta = CHROMA_EXPAND_STRENGTH * (ce_chroma_n - CHROMA_EXPAND_PIVOT) * warm_t;
+        if (delta > 0.0) {
+            expansion *= 1.0 + delta * smoothstep(1.001, 1.10, expansion);
+        } else {
+            expansion *= 1.0 + delta;
+        }
+    }
+    #endif
+
     // Early exit for non-expanded pixels
     if (expansion < 1.001) {
         return vec4(gamma709_to_pq2020(color.rgb), color.a);
@@ -363,7 +396,7 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // Merged into one Oklab round-trip to save ALU and eliminate the
     // intermediate gamut clip that would distort hue before correction.
-    #if ENABLE_SAT_BOOST || ENABLE_HUE_CORRECTION
+    #if ENABLE_SAT_BOOST || ENABLE_HUE_CORRECTION || ENABLE_BB_WARMTH
     {
         vec3 oklab_exp = rgb_to_oklab(rgb_expanded);
 
@@ -399,6 +432,24 @@ vec4 hook() {
                 if (chroma_corrected > 0.001) {
                     oklab_exp.yz *= chroma_post / chroma_corrected;
                 }
+            }
+        }
+        #endif
+
+        // Bezold-Brücke pre-compensation: clockwise rotation in Oklab ab plane for
+        // yellow-orange hues, proportional to expansion. Warm mask b/(|a|+chroma)
+        // gives high weight to yellow, moderate to orange, near-zero to red.
+        #if ENABLE_BB_WARMTH
+        {
+            float bb_chroma = length(oklab_exp.yz);
+            if (bb_chroma > 0.001) {
+                float warm_ratio = oklab_exp.z / (abs(oklab_exp.y) + bb_chroma);
+                float warm_t = smoothstep(0.15, 0.65, warm_ratio);
+                float exp_t  = smoothstep(0.05, 0.80, expansion - 1.0);
+                // Clockwise rotation: Δa = +b·θ, Δb = −a·θ
+                oklab_exp.yz += (BB_WARMTH * warm_t * exp_t) * vec2(oklab_exp.z, -oklab_exp.y);
+                float new_chroma = length(oklab_exp.yz);
+                if (new_chroma > 0.001) oklab_exp.yz *= bb_chroma / new_chroma;
             }
         }
         #endif

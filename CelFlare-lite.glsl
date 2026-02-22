@@ -79,7 +79,8 @@
 // See CelFlare.glsl for full description.
 #define ENABLE_CHROMA_EXPAND 1
 #define CHROMA_EXPAND_STRENGTH 0.12  // Max modifier magnitude; try 0.08–0.15
-#define CHROMA_EXPAND_PIVOT 0.30     // Normalized Oklab chroma crossover (~pale skin)
+#define CHROMA_EXPAND_PIVOT 0.20     // Normalized Oklab chroma crossover (~pale skin)
+#define CHROMA_EXPAND_RED_EXTEND 0.40 // Extend warm mask toward red/pink (0.0=yellow-orange only, 1.0=full red)
 
 // =============================================================================
 // DEBUG
@@ -318,7 +319,9 @@ vec4 hook() {
     #if ENABLE_CHROMA_EXPAND
     {
         float ce_chroma_n = clamp(chroma_orig / 0.35, 0.0, 1.0);
-        float warm_ratio  = oklab_orig.z / (abs(oklab_orig.y) + chroma_orig + 0.001);
+        // Blend red axis (a+) into warm signal so pink/blush tones are included.
+        float warm_signal = oklab_orig.z + CHROMA_EXPAND_RED_EXTEND * max(oklab_orig.y, 0.0);
+        float warm_ratio  = warm_signal / (abs(oklab_orig.y) + chroma_orig + 0.001);
         // Gate on BOTH hue angle AND chroma magnitude. warm_ratio alone is a pure hue
         // direction measure — a near-neutral pixel with a tiny positive b still gets
         // warm_ratio≈1, but has no meaningful warm chroma to compensate for. H-K effect

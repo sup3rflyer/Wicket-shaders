@@ -7,6 +7,7 @@
 //!BIND HOOKED
 //!DESC CelFlare Grain Pre-filter (detail preservation focus)
 
+#define STABILIZE_OPACITY   0.85          // 0.0 = natural grain, 1.0 = fully stabilized (default)
 #define GRAIN_THRESHOLD     0.28
 #define GRAIN_BLUR_RADIUS   14.0          // smaller kernel = less chance to average real detail
 
@@ -19,7 +20,7 @@
 #define BILATERAL_SHARPNESS 4.8           
 
 #define INNER_RING_BOOST    2.0
-#define ROTATION_BLOCK_SIZE 8.0          
+
 
 vec4 hook() {
     vec4 original = HOOKED_tex(HOOKED_pos);
@@ -37,8 +38,8 @@ vec4 hook() {
         return vec4(original.rgb, Y_gamma);
     }
 
-    vec2 block = floor(HOOKED_pos * HOOKED_size / ROTATION_BLOCK_SIZE);
-    float angle = fract(sin(dot(block, vec2(12.9898, 78.233))) * 43758.5453) * 6.2832;
+    vec2 pixel = floor(HOOKED_pos * HOOKED_size);
+    float angle = fract(sin(dot(pixel, vec2(12.9898, 78.233))) * 43758.5453) * 6.2832;
     float ca = cos(angle);
     float sa = sin(angle);
     
@@ -105,7 +106,7 @@ vec4 hook() {
 
     float Y_stabilized = mix(blurred, Y_gamma, edge_mask * 0.97);
     // even stronger edge fallback
-    float Y_decision = mix(Y_gamma, Y_stabilized, range_mask);
+    float Y_decision = mix(Y_gamma, Y_stabilized, range_mask * STABILIZE_OPACITY);
 
     return vec4(original.rgb, Y_decision);
 }

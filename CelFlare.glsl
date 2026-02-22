@@ -32,7 +32,7 @@
 //!HOOK MAIN
 //!BIND HOOKED
 //!BIND SCENE_STATE
-//!DESC CelFlare v2.5 (Scene-Adaptive SDR→HDR)
+//!DESC CelFlare v2.6 (Scene-Adaptive SDR→HDR)
 
 // =============================================================================
 // USER CONTROLS
@@ -945,7 +945,7 @@ vec4 hook() {
         vec3 oklab_exp = rgb_to_oklab(rgb_expanded);
 
         #if ENABLE_SAT_BOOST
-            // Stevens' power law: uniform chroma scaling by expansion^0.5
+            // Stevens' power law: uniform chroma scaling by expansion^exponent
             float sat_boost = min(pow(max(expansion, 0.0), SAT_BOOST_EXPONENT), SAT_BOOST_MAX);
 
             oklab_exp.y *= sat_boost;

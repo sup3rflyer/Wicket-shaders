@@ -45,7 +45,7 @@
 // --- Dynamic Intensity ---
 // Per-scene contrast-adaptive multiplier on INTENSITY.
 // Flat/pastel scenes get gentler expansion, high-contrast scenes get more pop.
-#define ENABLE_DYNAMIC_INTENSITY 0
+#define ENABLE_DYNAMIC_INTENSITY 1
 #define DYN_INTENSITY_LOW  0.75    // Flat/low-contrast scenes
 #define DYN_INTENSITY_HIGH 1.15    // High-contrast/dramatic scenes
 #define DYN_CONTRAST_LOW   2.2     // Contrast floor (stops)

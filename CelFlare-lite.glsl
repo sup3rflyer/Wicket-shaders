@@ -17,74 +17,61 @@
 #define MASTER_KNEE_OFFSET 0.15    // master_knee = KNEE_END - MASTER_KNEE_OFFSET
 
 // --- Saturation Boost (Oklab) ---
-// Counters the "silvery" desaturated look from expanding luminance without chroma.
-// Uses Oklab color space for perceptually uniform chroma scaling with perfect hue preservation.
-// Stevens' power law: perceived colorfulness ~ chroma * L^0.5, so chroma must scale by
-// expansion^0.5 to maintain constant perceived colorfulness after luminance expansion.
-// Applied uniformly across all saturation levels — multiplicative scaling naturally gives
-// the largest absolute boost to the most saturated colors (faithful to colorist intent).
+// Perceptual chroma compensation via Stevens' power law in Oklab space.
+// RGB expansion already scales chroma by cbrt(k); this adds the remaining k^(1/6) gap.
 #define ENABLE_SAT_BOOST 1
-#define SAT_BOOST_EXPONENT 0.267    // Compensates remaining gap: RGB expansion already provides cbrt(k) chroma, Stevens needs sqrt(k), so boost = k^(1/2 - 1/3) = k^(1/6)
-#define SAT_BOOST_MAX 1.25         // Safety cap for very high expansion values
-#define SAT_KNEE_OFFSET 0.10      // Extend chroma boost below luminance knee in linear luma (0 = disabled).
-                                  // mix(luma, rgb) naturally gives zero change on neutrals and tapers
-                                  // proportionally with existing chroma — no extra low-sat guard needed.
-
-// --- Hue Correction (Oklab) ---
-// Corrects hue shifts from saturation boost gamut clipping (e.g. yellow→green on fires).
-#define ENABLE_HUE_CORRECTION 1
-#define HUE_CORRECTION_STRENGTH 1.0  // 0.0 = none, 1.0 = full
+#define SAT_BOOST_EXPONENT 0.267   // k^(1/6) base + empirical offset for PQ compression / Hunt effect
+#define SAT_BOOST_MAX 1.25         // Safety cap
+#define SAT_KNEE_OFFSET 0.10       // Extend chroma boost below luminance knee (linear luma, 0 = disabled)
+#define SAT_KNEE_PEAK 0.04         // Max chroma boost at knee boundary (0.04 = 4%)
 
 // --- Bezold-Brücke Warmth Compensation ---
-// See CelFlare.glsl for full description.
-// NOTE: For peaks above ~400 nits a full hue map with atan2 is needed.
+// Pre-compensates for perceptual yellow→green hue shift at higher output luminances.
+// Clockwise rotation in Oklab ab plane; warm mask targets yellow-orange, excludes red/blue.
 #define ENABLE_BB_WARMTH 1
-#define BB_WARMTH 0.05         // Rotation in radians (~3°); try 0.03–0.10
+#define BB_WARMTH 0.03             // Rotation in radians; try 0.03–0.10
 
 // --- Grain Stabilization ---
-// Stabilizes expansion decision for grainy content by averaging similar neighbors.
 // Reads pre-filtered luma from CelFlare-blur.glsl (alpha channel).
 #define ENABLE_GRAIN_STABLE 1
 
 // --- Dither ---
-// Masks 8-bit quantization artifacts that get amplified by expansion.
-// Applied in PQ space (perceptually uniform).
+// PQ-space dither to mask 8-bit banding amplified by expansion.
 #define ENABLE_DITHER 1
 #define DITHER_STRENGTH 0.7
-#define DITHER_TEMPORAL 1          // Animate noise per frame (integrates temporally)
+#define DITHER_TEMPORAL 1          // Animate noise per frame
 
 // --- EOTF ---
-// Gamma used for linearization. BT.1886 = 2.4 (broadcast standard), sRGB ≈ 2.2.
-#define EOTF_GAMMA 2.3
+// BT.1886 = 2.4 (Rec.709 standard). sRGB ≈ 2.2.
+#define EOTF_GAMMA 2.4
 
 // --- PQ Output ---
-// Shader encodes to PQ BT.2020 directly to bypass libplacebo's SDR peak clipping.
-// Must match hdr-reference-white in mpv.conf and Windows SDR brightness.
+// Direct PQ BT.2020 encoding. Must match hdr-reference-white in mpv.conf.
 #define REFERENCE_WHITE 116.0
-#define PQ_FAST_APPROX 1       // 0 = exact ST.2084, 1 = degree-7 polynomial (~2.4x faster PQ encoding)
+#define PQ_FAST_APPROX 1           // Degree-7 polynomial (~2.4x faster than exact ST.2084)
 
 // =============================================================================
 // ADVANCED TUNING
 // =============================================================================
 
 // --- Grain Stabilization ---
-// Grain bilateral filter runs in CelFlare-blur.glsl (pre-pass).
-// See that file for tuning parameters (threshold, radius, edge detection, range).
-#define EARLY_EXIT_GAMMA 0.10      // Skip very dark pixels (gamma) - below any possible knee
+// Reads pre-filtered luma from CelFlare-blur.glsl (alpha channel).
+#define EARLY_EXIT_GAMMA 0.25      // Skip dark pixels where chroma processing is imperceptible (~3 nits)
 
-// --- Saturation Rolloff (Oklab chroma-based, separate from sat boost) ---
-// Reduces expansion on already-saturated colors to prevent clipping.
+// --- Saturation Rolloff ---
+// Reduces expansion on already-saturated colors to prevent gamut clipping.
 #define ENABLE_SAT_ROLLOFF 1
-#define SAT_THRESHOLD 0.4          // Normalized Oklab chroma threshold to start rolloff
+#define SAT_THRESHOLD 0.4          // Normalized Oklab chroma threshold
 #define SAT_POWER 10.0             // Rolloff curve steepness
-#define SAT_ROLLOFF 0.80           // Reduces expansion on saturated colors
+#define SAT_ROLLOFF 0.80           // Max expansion reduction
 
-// --- Chroma-Adaptive Expansion (Helmholtz-Kohlrausch compensation) ---
-// See CelFlare.glsl for full description.
+// --- Chroma-Adaptive Expansion (H-K compensation) ---
+// Adjusts expansion based on warm-band chroma to counter the perceived luminance
+// separation between pale and saturated skin after expansion. Keep strength subtle.
 #define ENABLE_CHROMA_EXPAND 1
-#define CHROMA_EXPAND_STRENGTH 0.12  // Max modifier magnitude; try 0.08–0.15
-#define CHROMA_EXPAND_PIVOT 0.20     // Normalized Oklab chroma crossover (~pale skin)
-#define CHROMA_EXPAND_RED_EXTEND 0.40 // Extend warm mask toward red/pink (0.0=yellow-orange only, 1.0=full red)
+#define CHROMA_EXPAND_STRENGTH 0.12   // Try 0.08–0.15 for anime
+#define CHROMA_EXPAND_PIVOT 0.20      // Normalized Oklab chroma crossover (~pale/warm skin)
+#define CHROMA_EXPAND_RED_EXTEND 0.40 // Extend warm mask toward red/pink
 
 // =============================================================================
 // DEBUG
@@ -253,7 +240,7 @@ vec4 hook() {
 
     float Y_gamma = get_luma(rgb_gamma);
 
-    // Early exit for very dark pixels (below any possible expansion knee)
+    // Early exit for dark pixels where chroma processing is imperceptible
     #if !DEBUG_SHOW_MASK && !DEBUG_SHOW_SAT && !DEBUG_SHOW_GRAIN
         if (Y_gamma < EARLY_EXIT_GAMMA) return vec4(gamma709_to_pq2020(color.rgb), color.a);
     #else
@@ -284,12 +271,11 @@ vec4 hook() {
     vec3 rgb_linear = eotf_gamma(rgb_gamma);
 
     // -------------------------------------------------------------------------
-    // SATURATION (Oklab chroma - perceptually uniform)
+    // SATURATION (Oklab chroma, used by sat rolloff + chroma expand)
     // -------------------------------------------------------------------------
     vec3 oklab_orig = rgb_to_oklab(rgb_linear);
     float chroma_orig = sqrt(oklab_orig.y * oklab_orig.y + oklab_orig.z * oklab_orig.z);
-    // Normalize to 0-1 range (0.35 ≈ max sRGB chroma) for threshold compatibility
-    float sat_raw = chroma_orig / 0.35;
+    float sat_raw = chroma_orig / 0.35;  // Normalized to 0-1 (0.35 ≈ max sRGB chroma)
     float sat = pow(smoothstep(SAT_THRESHOLD, 1.0, sat_raw), SAT_POWER);
 
     #if DEBUG_SHOW_SAT
@@ -343,18 +329,22 @@ vec4 hook() {
     }
     #endif
 
+    // Below-knee chroma ramp (computed for both early-exit and main path)
+    #if ENABLE_SAT_BOOST
+        float sat_knee = max(master_knee - SAT_KNEE_OFFSET, 0.0);
+        float knee_chroma = (SAT_KNEE_OFFSET > 0.0)
+            ? smoothstep(sat_knee, master_knee, Y_decision) * SAT_KNEE_PEAK
+            : 0.0;
+    #endif
+
     // Early exit for non-expanded pixels (with below-knee chroma ramp)
     if (expansion < 1.001) {
         #if ENABLE_SAT_BOOST
-        {
-            float sat_knee = max(master_knee - SAT_KNEE_OFFSET, 0.0);
-            float sat_reach = smoothstep(sat_knee, master_knee, Y_decision);
-            if (SAT_KNEE_OFFSET > 0.0 && sat_reach > 0.001) {
+            if (knee_chroma > 0.001) {
                 float Y_lin = get_luma(rgb_linear);
-                vec3 rgb_boosted = mix(vec3(Y_lin), rgb_linear, 1.0 + sat_reach * 0.04);
+                vec3 rgb_boosted = mix(vec3(Y_lin), rgb_linear, 1.0 + knee_chroma);
                 return vec4(linear709_to_pq2020(rgb_boosted), color.a);
             }
-        }
         #endif
         return vec4(gamma709_to_pq2020(color.rgb), color.a);
     }
@@ -370,43 +360,20 @@ vec4 hook() {
     vec3 rgb_expanded = rgb_linear * expansion;
 
     // -------------------------------------------------------------------------
-    // SATURATION BOOST + HUE CORRECTION (Merged Single Oklab Pass)
+    // CHROMA PROCESSING (Single Oklab Round-Trip)
     // -------------------------------------------------------------------------
-    // Merged into one Oklab round-trip to save ALU and eliminate the
-    // intermediate gamut clip that would distort hue before correction.
-    #if ENABLE_SAT_BOOST || ENABLE_HUE_CORRECTION || ENABLE_BB_WARMTH
+    #if ENABLE_SAT_BOOST || ENABLE_BB_WARMTH
     {
         vec3 oklab_exp = rgb_to_oklab(rgb_expanded);
 
         #if ENABLE_SAT_BOOST
-            // Stevens' power law: uniform chroma scaling by expansion^exponent
             float sat_boost = min(pow(max(expansion, 0.0), SAT_BOOST_EXPONENT), SAT_BOOST_MAX);
+            sat_boost = max(sat_boost, 1.0 + knee_chroma);
 
             oklab_exp.y *= sat_boost;
             oklab_exp.z *= sat_boost;
         #endif
 
-        #if ENABLE_HUE_CORRECTION
-        {
-            float chroma_post = length(oklab_exp.yz);
-            float chroma_ref = length(oklab_orig.yz);
-
-            if (chroma_post > 0.001 && chroma_ref > 0.001) {
-                // Blend hue direction toward original (pre-expansion) hue
-                oklab_exp.yz = mix(oklab_exp.yz, oklab_orig.yz, HUE_CORRECTION_STRENGTH);
-
-                // Restore expanded chroma magnitude (only hue angle changed)
-                float chroma_corrected = length(oklab_exp.yz);
-                if (chroma_corrected > 0.001) {
-                    oklab_exp.yz *= chroma_post / chroma_corrected;
-                }
-            }
-        }
-        #endif
-
-        // Bezold-Brücke pre-compensation: clockwise rotation in Oklab ab plane for
-        // yellow-orange hues, proportional to expansion. Warm mask b/(|a|+chroma)
-        // gives high weight to yellow, moderate to orange, near-zero to red.
         #if ENABLE_BB_WARMTH
         {
             float bb_chroma = length(oklab_exp.yz);
@@ -414,7 +381,6 @@ vec4 hook() {
                 float warm_ratio = oklab_exp.z / (abs(oklab_exp.y) + bb_chroma);
                 float warm_t = smoothstep(0.15, 0.65, warm_ratio);
                 float exp_t  = smoothstep(0.05, 0.80, expansion - 1.0);
-                // Clockwise rotation: Δa = +b·θ, Δb = −a·θ
                 oklab_exp.yz += (BB_WARMTH * warm_t * exp_t) * vec2(oklab_exp.z, -oklab_exp.y);
                 float new_chroma = length(oklab_exp.yz);
                 if (new_chroma > 0.001) oklab_exp.yz *= bb_chroma / new_chroma;
@@ -422,8 +388,6 @@ vec4 hook() {
         }
         #endif
 
-        // Convert back to linear RGB — allow out-of-709 negatives to pass through
-        // to BT.2020 conversion where the wider gamut absorbs them
         rgb_expanded = oklab_to_rgb(oklab_exp);
     }
     #endif

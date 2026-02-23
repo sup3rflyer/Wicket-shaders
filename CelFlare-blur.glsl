@@ -15,7 +15,7 @@
 #define GRAIN_RANGE_MAX     0.95
 #define GRAIN_EDGE_LOW      0.20
 #define GRAIN_EDGE_HIGH     0.45
-#define EARLY_EXIT_GAMMA    0.10
+#define EARLY_EXIT_GAMMA    0.25
 
 #define BILATERAL_SHARPNESS 4.8           
 

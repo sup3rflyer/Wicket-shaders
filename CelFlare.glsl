@@ -39,42 +39,42 @@
 // =============================================================================
 
 // --- Core Expansion ---
-#define INTENSITY 1.5              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
-#define CURVE_STEEPNESS 0.4        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy highlights
+#define INTENSITY 1.4              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
+#define CURVE_STEEPNESS 0.2        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy highlights
 
 // --- Dynamic Intensity ---
 // Per-scene contrast-adaptive multiplier on INTENSITY.
 // Flat/pastel scenes get gentler expansion, high-contrast scenes get more pop.
 #define ENABLE_DYNAMIC_INTENSITY 1
-#define DYN_INTENSITY_LOW  0.75    // Flat/low-contrast scenes
+#define DYN_INTENSITY_LOW  0.65    // Flat/low-contrast scenes
 #define DYN_INTENSITY_HIGH 1.15    // High-contrast/dramatic scenes
-#define DYN_CONTRAST_LOW   2.2     // Contrast floor (stops)
-#define DYN_CONTRAST_HIGH  5.5     // Contrast ceiling (stops)
+#define DYN_CONTRAST_LOW   3.5     // Contrast floor (stops)
+#define DYN_CONTRAST_HIGH  6.0     // Contrast ceiling (stops)
 
 // --- Saturation Boost (Oklab) ---
 // Perceptual chroma compensation via Stevens' power law in Oklab space.
 // RGB expansion already scales chroma by cbrt(k); this adds the remaining k^(1/6) gap
 // to reach the Stevens target of sqrt(k) for constant perceived colorfulness.
-#define ENABLE_SAT_BOOST 1
+#define ENABLE_SAT_BOOST 0
 #define SAT_BOOST_EXPONENT 0.167   // k^(1/6) base + empirical offset for PQ compression / Hunt effect
-#define SAT_BOOST_MAX 2.0          // Safety cap
+#define SAT_BOOST_MAX 1.2          // Safety cap
 #define SAT_KNEE_OFFSET 0.1        // Extend chroma boost below luminance knee (linear luma, 0 = disabled)
 #define SAT_KNEE_PEAK 0.04         // Max chroma boost at knee boundary (0.04 = 4%)
 
 // --- Scene-Wide APL Saturation ---
 // Global chroma boost proportional to scene brightness (smoothed_log_avg).
 // Complements luminance expansion — bright scenes get more chroma, dark scenes none.
-#define ENABLE_APL_SAT 1
+#define ENABLE_APL_SAT 0
 #define APL_SAT_THRESHOLD 0.12     // Scene key below which no boost
 #define APL_SAT_CEILING 0.25       // Scene key at which boost reaches maximum
-#define APL_SAT_MAX 0.10           // Maximum chroma boost (0.10 = 10%)
+#define APL_SAT_MAX 0.05           // Maximum chroma boost (0.10 = 10%)
 
 // --- Bezold-Brücke Warmth Compensation ---
 // Pre-compensates for perceptual yellow→green hue shift at higher output luminances.
 // Clockwise rotation in Oklab ab plane; warm mask targets yellow-orange, excludes red/blue.
 // NOTE: Above ~400 nits, a full hue map with atan2 would be needed.
 #define ENABLE_BB_WARMTH 1
-#define BB_WARMTH 0.1             // Rotation in radians; try 0.03–0.10
+#define BB_WARMTH 0.10             // Rotation in radians; try 0.03–0.10
 
 // --- Grain Stabilization ---
 // Reads pre-filtered luma from CelFlare-blur.glsl (alpha channel).
@@ -104,25 +104,32 @@
 // Reads pre-filtered luma from CelFlare-blur.glsl (alpha channel).
 #define EARLY_EXIT_GAMMA 0.25      // Skip dark pixels where chroma processing is imperceptible (~3 nits)
 
+// --- Expansion Luminance Space ---
+// Controls how expansion maps to perceptual luminance in Oklab L.
+// 0.333 (1/3) = identical to linear RGB multiply (current default).
+// Lower = softer highlights, more mid-tone lift. Try 0.20–0.28.
+// Luminance scales as expansion^(3 * L_EXPONENT): 0.333→1.0x, 0.25→0.75x, 0.20→0.60x.
+#define OKLAB_L_EXPONENT (1.0/3.0)
+
 // --- Expansion Knee ---
 #define MASTER_KNEE_OFFSET 0.15    // Onset below knee_end (linear units)
 
 // --- Saturation Rolloff ---
 // Reduces expansion on already-saturated colors to prevent gamut clipping.
-#define ENABLE_SAT_ROLLOFF 0
-#define SAT_THRESHOLD 0.25         // Normalized Oklab chroma threshold
-#define SAT_POWER 6.0              // Rolloff curve steepness
-#define SAT_ROLLOFF 0.40           // Max expansion reduction
+#define ENABLE_SAT_ROLLOFF 1
+#define SAT_THRESHOLD 0.22         // Normalized Oklab chroma threshold
+#define SAT_POWER 5.0              // Rolloff curve steepness
+#define SAT_ROLLOFF 0.80           // Max expansion reduction
 
-// --- Chroma-Adaptive Expansion (H-K compensation) ---
-// Adjusts expansion based on warm-band chroma to counter the perceived luminance
-// separation between pale and saturated skin after expansion. Below pivot: slight
-// compression (pale skin glows less). Above pivot: slight lift (saturated skin keeps up).
+// --- Chroma-Adaptive Luminance (H-K compensation) ---
+// Lifts warm saturated skin and compresses pale skin to counter perceived luminance
+// separation. APL-gated (shares APL_SAT thresholds): scales with scene brightness.
+// Applies to all warm pixels regardless of expansion zone.
 // Keep strength subtle — edge contouring risk at sharp anime saturation boundaries.
 #define ENABLE_CHROMA_EXPAND 1
-#define CHROMA_EXPAND_STRENGTH 0.40   // Try 0.08–0.15 for anime
-#define CHROMA_EXPAND_PIVOT 0.20      // Normalized Oklab chroma crossover (~pale/warm skin)
-#define CHROMA_EXPAND_RED_EXTEND 0.50 // Extend warm mask toward red/pink
+#define CHROMA_EXPAND_STRENGTH 0.45   // Try 0.08–0.15 for anime
+#define CHROMA_EXPAND_PIVOT 0.05      // Normalized Oklab chroma crossover (~pale/warm skin)
+#define CHROMA_EXPAND_RED_EXTEND 0.35 // Extend warm mask toward red/pink
 
 // =============================================================================
 // INTERNAL PARAMETERS
@@ -131,14 +138,14 @@
 
 // --- Temporal Smoothing ---
 #define TEMPORAL_ALPHA 0.03        // Normal smoothing (lower = slower adaptation)
-#define TEMPORAL_ALPHA_FAST 0.6    // Fast adaptation after scene cuts
+#define TEMPORAL_ALPHA_FAST 0.9    // Fast adaptation after scene cuts
 
 // --- Scene Cut Detection (Gamma-Space Perceptual) ---
 // Block-based: requires majority of samples to change in BOTH luma AND chroma.
 #define BLOCK_LUMA_THRESH 0.09
 #define BLOCK_CHROMA_THRESH 0.04
 #define BLOCK_CHROMA_THRESH_SQ (BLOCK_CHROMA_THRESH * BLOCK_CHROMA_THRESH)
-#define BLOCK_CHANGE_PCT 0.55      // Percentage of samples that must change (stricter to reduce false positives from fast camera motion)
+#define BLOCK_CHANGE_PCT 0.55      // Percentage of samples that must change
 #define LOCKOUT_FRAMES 6.0         // Frames to wait before detecting another cut
 
 // --- Scene Sampling ---
@@ -854,36 +861,13 @@ vec4 hook() {
         expansion = 1.0 + (expansion - 1.0) * INTENSITY;
     #endif
 
-    // Chroma-adaptive expansion: warm low-sat (pale skin) → compress;
-    // warm mid-sat (healthy skin) → lift. Lift gated on expansion zone
-    // to prevent halos at onset. Compression: early exit handles result.
-    #if ENABLE_CHROMA_EXPAND
-    {
-        float ce_chroma_n = clamp(chroma_orig / 0.35, 0.0, 1.0);
-        // Blend red axis (a+) into warm signal so pink/blush tones are included.
-        // RED_EXTEND=0 → original yellow-only; 0.4 → red gets warm_ratio≈0.2 (enters smoothstep).
-        float warm_signal = oklab_orig.z + CHROMA_EXPAND_RED_EXTEND * max(oklab_orig.y, 0.0);
-        float warm_ratio  = warm_signal / (abs(oklab_orig.y) + chroma_orig + 0.001);
-        // Gate on BOTH hue angle AND chroma magnitude. warm_ratio alone is a pure hue
-        // direction measure — a near-neutral pixel with a tiny positive b still gets
-        // warm_ratio≈1, but has no meaningful warm chroma to compensate for. H-K effect
-        // is proportional to saturation, so correction should fade to zero at neutral.
-        float warm_t = smoothstep(0.15, 0.65, warm_ratio) * smoothstep(0.05, 0.20, ce_chroma_n);
-        float delta = CHROMA_EXPAND_STRENGTH * (ce_chroma_n - CHROMA_EXPAND_PIVOT) * warm_t;
-        if (delta > 0.0) {
-            expansion *= 1.0 + delta * smoothstep(1.001, 1.10, expansion);
-        } else {
-            expansion *= 1.0 + delta;
-        }
-    }
-    #endif
-
     // -------------------------------------------------------------------------
-    // BELOW-KNEE CHROMA RAMP + APL SAT (computed for both early-exit and main path)
+    // BELOW-KNEE CHROMA RAMP + APL SAT + CHROMA-ADAPTIVE LUMINANCE
     // -------------------------------------------------------------------------
     // knee_chroma: smoothstep ramp from sat_knee → master_knee, peaking at SAT_KNEE_PEAK.
-    // apl_sat: scene-wide boost from smoothed_log_avg (bright scenes get more chroma).
-    // Early-exit pixels use both directly; main-path uses max(sat_boost, 1+knee_chroma) + apl_sat.
+    // apl_sat: scene-wide chroma boost from smoothed_log_avg (bright scenes get more chroma).
+    // ce_delta: warm skin lift / pale skin compress, APL-gated (H-K luminance compensation).
+    // All three computed before early exit; applied in both early-exit and main paths.
     #if ENABLE_SAT_BOOST
         float sat_knee = max(master_knee - SAT_KNEE_OFFSET, 0.0);
         float knee_chroma = (SAT_KNEE_OFFSET > 0.0)
@@ -896,19 +880,38 @@ vec4 hook() {
         #endif
     #endif
 
+    // Chroma-adaptive luminance: warm skin lift / pale skin compress, APL-gated.
+    // H-K mismatch grows with display luminance, so effect scales with scene brightness.
+    // Early exit: applied as linear RGB multiply. Main path: folded into expansion.
+    #if ENABLE_CHROMA_EXPAND
+        float ce_chroma_n = clamp(chroma_orig / 0.35, 0.0, 1.0);
+        float warm_signal = oklab_orig.z + CHROMA_EXPAND_RED_EXTEND * max(oklab_orig.y, 0.0);
+        float warm_ratio  = warm_signal / (abs(oklab_orig.y) + chroma_orig + 0.001);
+        float warm_t = smoothstep(0.15, 0.65, warm_ratio) * smoothstep(0.05, 0.20, ce_chroma_n);
+        float ce_apl = smoothstep(APL_SAT_THRESHOLD, APL_SAT_CEILING, smoothed_log_avg);
+        float ce_delta = CHROMA_EXPAND_STRENGTH * (ce_chroma_n - CHROMA_EXPAND_PIVOT) * warm_t * ce_apl;
+    #else
+        float ce_delta = 0.0;
+    #endif
+
     // -------------------------------------------------------------------------
     // EARLY EXIT: Skip remaining processing for non-expanded pixels
     // -------------------------------------------------------------------------
     // Saves ALU on dark/mid-tone pixels that don't receive expansion.
     // Threshold slightly above 1.0 to catch edge cases from sat rolloff.
     if (expansion < 1.001) {
-        #if ENABLE_SAT_BOOST
+        #if ENABLE_SAT_BOOST || ENABLE_CHROMA_EXPAND
         {
-            float early_boost = knee_chroma + apl_sat;
-            if (early_boost > 0.001) {
-                float Y_lin = get_luma(rgb_linear);
-                vec3 rgb_boosted = mix(vec3(Y_lin), rgb_linear, 1.0 + early_boost);
-                return vec4(linear709_to_pq2020(rgb_boosted), color.a);
+            #if ENABLE_SAT_BOOST
+                float early_sat = knee_chroma + apl_sat;
+            #else
+                float early_sat = 0.0;
+            #endif
+            if (early_sat > 0.001 || abs(ce_delta) > 0.001) {
+                vec3 rgb_adj = rgb_linear * (1.0 + ce_delta);
+                float Y_adj = get_luma(rgb_adj);
+                vec3 rgb_out = mix(vec3(Y_adj), rgb_adj, 1.0 + early_sat);
+                return vec4(linear709_to_pq2020(rgb_out), color.a);
             }
         }
         #endif
@@ -929,48 +932,47 @@ vec4 hook() {
     #endif
 
     // -------------------------------------------------------------------------
-    // APPLY EXPANSION (Linear Space)
+    // APPLY EXPANSION + CHROMA PROCESSING (Oklab Space)
     // -------------------------------------------------------------------------
-    vec3 rgb_expanded = rgb_linear * expansion;
+    // Expansion applied in Oklab L: L_EXPONENT controls luminance curve character.
+    // Base chroma scales by cbrt(expansion) (preserves RGB-multiply relationship).
+    // Sat_boost adds Stevens compensation on top. Saves one Oklab conversion.
+    #if ENABLE_CHROMA_EXPAND
+        expansion *= (1.0 + ce_delta);
+    #endif
 
-    // -------------------------------------------------------------------------
-    // CHROMA PROCESSING (Single Oklab Round-Trip)
-    // -------------------------------------------------------------------------
-    #if ENABLE_SAT_BOOST || ENABLE_BB_WARMTH
+    vec3 oklab_exp = oklab_orig;
+    oklab_exp.x *= pow(max(expansion, 0.0), OKLAB_L_EXPONENT);
+    float base_chroma = pow(max(expansion, 0.0), 1.0/3.0);
+    oklab_exp.yz *= base_chroma;
+
+    #if ENABLE_SAT_BOOST
+        float sat_boost = min(pow(max(expansion, 0.0), SAT_BOOST_EXPONENT), SAT_BOOST_MAX);
+        sat_boost = max(sat_boost, 1.0 + knee_chroma) + apl_sat;
+        oklab_exp.yz *= sat_boost;
+
+        #if DEBUG_SHOW_SAT_BOOST
+            float boost_viz = (sat_boost - 1.0) / (SAT_BOOST_MAX - 1.0);
+            float chroma_out = sqrt(oklab_exp.y * oklab_exp.y + oklab_exp.z * oklab_exp.z);
+            return vec4(gamma709_to_pq2020(vec3(boost_viz, chroma_out * 3.0, 0.0)), 1.0);
+        #endif
+    #endif
+
+    #if ENABLE_BB_WARMTH
     {
-        vec3 oklab_exp = rgb_to_oklab(rgb_expanded);
-
-        #if ENABLE_SAT_BOOST
-            float sat_boost = min(pow(max(expansion, 0.0), SAT_BOOST_EXPONENT), SAT_BOOST_MAX);
-            sat_boost = max(sat_boost, 1.0 + knee_chroma) + apl_sat;
-
-            oklab_exp.y *= sat_boost;
-            oklab_exp.z *= sat_boost;
-
-            #if DEBUG_SHOW_SAT_BOOST
-                float boost_viz = (sat_boost - 1.0) / (SAT_BOOST_MAX - 1.0);
-                float chroma_out = sqrt(oklab_exp.y * oklab_exp.y + oklab_exp.z * oklab_exp.z);
-                return vec4(gamma709_to_pq2020(vec3(boost_viz, chroma_out * 3.0, 0.0)), 1.0);
-            #endif
-        #endif
-
-        #if ENABLE_BB_WARMTH
-        {
-            float bb_chroma = length(oklab_exp.yz);
-            if (bb_chroma > 0.001) {
-                float warm_ratio = oklab_exp.z / (abs(oklab_exp.y) + bb_chroma);
-                float warm_t = smoothstep(0.15, 0.65, warm_ratio);
-                float exp_t  = smoothstep(0.05, 0.80, expansion - 1.0);
-                oklab_exp.yz += (BB_WARMTH * warm_t * exp_t) * vec2(oklab_exp.z, -oklab_exp.y);
-                float new_chroma = length(oklab_exp.yz);
-                if (new_chroma > 0.001) oklab_exp.yz *= bb_chroma / new_chroma;
-            }
+        float bb_chroma = length(oklab_exp.yz);
+        if (bb_chroma > 0.001) {
+            float warm_ratio = oklab_exp.z / (abs(oklab_exp.y) + bb_chroma);
+            float warm_t = smoothstep(0.15, 0.65, warm_ratio);
+            float exp_t  = smoothstep(0.05, 0.80, expansion - 1.0);
+            oklab_exp.yz += (BB_WARMTH * warm_t * exp_t) * vec2(oklab_exp.z, -oklab_exp.y);
+            float new_chroma = length(oklab_exp.yz);
+            if (new_chroma > 0.001) oklab_exp.yz *= bb_chroma / new_chroma;
         }
-        #endif
-
-        rgb_expanded = oklab_to_rgb(oklab_exp);
     }
     #endif
+
+    vec3 rgb_expanded = oklab_to_rgb(oklab_exp);
 
     // -------------------------------------------------------------------------
     // ENCODE PQ BT.2020 OUTPUT

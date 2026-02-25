@@ -3,7 +3,7 @@
 
 //!HOOK MAIN
 //!BIND HOOKED
-//!DESC CelFlare Lite v2.6 (Static SDR→HDR)
+//!DESC CelFlare Lite v2.9 (Static SDR→HDR)
 
 // =============================================================================
 // USER CONTROLS
@@ -65,9 +65,9 @@
 #define SAT_POWER 10.0             // Rolloff curve steepness
 #define SAT_ROLLOFF 0.80           // Max expansion reduction
 
-// --- Chroma-Adaptive Expansion (H-K compensation) ---
-// Adjusts expansion based on warm-band chroma to counter the perceived luminance
-// separation between pale and saturated skin after expansion. Keep strength subtle.
+// --- Chroma-Adaptive Luminance (H-K compensation) ---
+// Lifts warm saturated skin and compresses pale skin to counter perceived luminance
+// separation after expansion. Keep strength subtle.
 #define ENABLE_CHROMA_EXPAND 1
 #define CHROMA_EXPAND_STRENGTH 0.12   // Try 0.08–0.15 for anime
 #define CHROMA_EXPAND_PIVOT 0.20      // Normalized Oklab chroma crossover (~pale/warm skin)

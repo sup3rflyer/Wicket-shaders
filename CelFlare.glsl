@@ -32,7 +32,7 @@
 //!HOOK MAIN
 //!BIND HOOKED
 //!BIND SCENE_STATE
-//!DESC CelFlare v2.6 (Scene-Adaptive SDR→HDR)
+//!DESC CelFlare v2.9 (Scene-Adaptive SDR→HDR)
 
 // =============================================================================
 // USER CONTROLS
@@ -40,34 +40,35 @@
 
 // --- Core Expansion ---
 #define INTENSITY 1.4              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
-#define CURVE_STEEPNESS 0.2        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy highlights
+#define CURVE_STEEPNESS 0.40        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy highlights
 
 // --- Dynamic Intensity ---
 // Per-scene contrast-adaptive multiplier on INTENSITY.
 // Flat/pastel scenes get gentler expansion, high-contrast scenes get more pop.
 #define ENABLE_DYNAMIC_INTENSITY 1
 #define DYN_INTENSITY_LOW  0.65    // Flat/low-contrast scenes
-#define DYN_INTENSITY_HIGH 1.15    // High-contrast/dramatic scenes
+#define DYN_INTENSITY_HIGH 1.25    // High-contrast/dramatic scenes
 #define DYN_CONTRAST_LOW   3.5     // Contrast floor (stops)
 #define DYN_CONTRAST_HIGH  6.0     // Contrast ceiling (stops)
+#define DYN_APL_ATTEN  0.60        // Less dynamic intensity for high average brightness scenes (0.70 = 30% reduction at KEY_VERY_BRIGHT)
 
 // --- Saturation Boost (Oklab) ---
-// Perceptual chroma compensation via Stevens' power law in Oklab space.
-// RGB expansion already scales chroma by cbrt(k); this adds the remaining k^(1/6) gap
+// Perceptual chroma compensation via Stevens' power law.
+// Oklab expansion scales base chroma by cbrt(k); this adds the remaining k^(1/6) gap
 // to reach the Stevens target of sqrt(k) for constant perceived colorfulness.
-#define ENABLE_SAT_BOOST 0
+#define ENABLE_SAT_BOOST 1
 #define SAT_BOOST_EXPONENT 0.167   // k^(1/6) base + empirical offset for PQ compression / Hunt effect
-#define SAT_BOOST_MAX 1.2          // Safety cap
-#define SAT_KNEE_OFFSET 0.1        // Extend chroma boost below luminance knee (linear luma, 0 = disabled)
+#define SAT_BOOST_MAX 1.1          // Safety cap
+#define SAT_KNEE_OFFSET 0.2        // Extend chroma boost below luminance knee (linear luma, 0 = disabled)
 #define SAT_KNEE_PEAK 0.04         // Max chroma boost at knee boundary (0.04 = 4%)
 
 // --- Scene-Wide APL Saturation ---
 // Global chroma boost proportional to scene brightness (smoothed_log_avg).
 // Complements luminance expansion — bright scenes get more chroma, dark scenes none.
-#define ENABLE_APL_SAT 0
-#define APL_SAT_THRESHOLD 0.12     // Scene key below which no boost
-#define APL_SAT_CEILING 0.25       // Scene key at which boost reaches maximum
-#define APL_SAT_MAX 0.05           // Maximum chroma boost (0.10 = 10%)
+#define ENABLE_APL_SAT 1
+#define APL_SAT_THRESHOLD 0.20     // Scene key below which no boost
+#define APL_SAT_CEILING 0.32       // Scene key at which boost reaches maximum (KEY_VERY_BRIGHT)
+#define APL_SAT_MAX 0.03           // Maximum chroma boost (0.03 = 3%)
 
 // --- Bezold-Brücke Warmth Compensation ---
 // Pre-compensates for perceptual yellow→green hue shift at higher output luminances.
@@ -102,21 +103,19 @@
 
 // --- Grain Stabilization ---
 // Reads pre-filtered luma from CelFlare-blur.glsl (alpha channel).
-#define EARLY_EXIT_GAMMA 0.25      // Skip dark pixels where chroma processing is imperceptible (~3 nits)
+#define EARLY_EXIT_GAMMA 0.35      // Skip dark pixels where chroma processing is imperceptible
 
-// --- Expansion Luminance Space ---
-// Controls how expansion maps to perceptual luminance in Oklab L.
+// --- Expansion Curve ---
+// L_EXPONENT: how expansion maps to perceptual luminance in Oklab L.
 // 0.333 (1/3) = identical to linear RGB multiply (current default).
 // Lower = softer highlights, more mid-tone lift. Try 0.20–0.28.
 // Luminance scales as expansion^(3 * L_EXPONENT): 0.333→1.0x, 0.25→0.75x, 0.20→0.60x.
 #define OKLAB_L_EXPONENT (1.0/3.0)
-
-// --- Expansion Knee ---
-#define MASTER_KNEE_OFFSET 0.15    // Onset below knee_end (linear units)
+#define MASTER_KNEE_OFFSET 0.15    // Expansion onset distance below knee_end (linear units)
 
 // --- Saturation Rolloff ---
 // Reduces expansion on already-saturated colors to prevent gamut clipping.
-#define ENABLE_SAT_ROLLOFF 1
+#define ENABLE_SAT_ROLLOFF 0
 #define SAT_THRESHOLD 0.22         // Normalized Oklab chroma threshold
 #define SAT_POWER 5.0              // Rolloff curve steepness
 #define SAT_ROLLOFF 0.80           // Max expansion reduction
@@ -129,7 +128,7 @@
 #define ENABLE_CHROMA_EXPAND 1
 #define CHROMA_EXPAND_STRENGTH 0.45   // Try 0.08–0.15 for anime
 #define CHROMA_EXPAND_PIVOT 0.05      // Normalized Oklab chroma crossover (~pale/warm skin)
-#define CHROMA_EXPAND_RED_EXTEND 0.35 // Extend warm mask toward red/pink
+#define CHROMA_EXPAND_RED_EXTEND 0.0 // Extend warm mask toward red/pink
 
 // =============================================================================
 // INTERNAL PARAMETERS
@@ -605,6 +604,8 @@ vec4 hook() {
         // Double-buffer scene parameters: write to current frame's slot.
         // Other pixels read the OPPOSITE slot (previous frame's values),
         // eliminating the GPU race condition that causes grid artifacts on scene cuts.
+        // The 1-frame delay on dark→bright cuts is dampened by APL attenuation, which
+        // reads smoothed_log_avg directly (not double-buffered, immediate on cuts).
         if (frame % 2 == 0) {
             scene_highlight_peak = computed_peak;
             scene_exp_steepness = computed_steep;
@@ -856,7 +857,9 @@ vec4 hook() {
     #if ENABLE_DYNAMIC_INTENSITY
         float dyn_factor = smoothstep(DYN_CONTRAST_LOW, DYN_CONTRAST_HIGH, db_contrast);
         float dyn_intensity = mix(DYN_INTENSITY_LOW, DYN_INTENSITY_HIGH, dyn_factor);
-        expansion = 1.0 + (expansion - 1.0) * dyn_intensity * INTENSITY;
+        // APL attenuation: bright scenes get reduced expansion to restrain paper-white lift.
+        float apl_atten = mix(1.0, DYN_APL_ATTEN, smoothstep(KEY_BRIGHT, KEY_VERY_BRIGHT, smoothed_log_avg));
+        expansion = 1.0 + (expansion - 1.0) * dyn_intensity * apl_atten * INTENSITY;
     #else
         expansion = 1.0 + (expansion - 1.0) * INTENSITY;
     #endif

@@ -39,36 +39,40 @@
 // =============================================================================
 
 // --- Core Expansion ---
-#define INTENSITY 1.4              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
+#define INTENSITY 1.3              // 0.5 = subtle, 1.0 = normal, 1.5+ = aggressive
 #define CURVE_STEEPNESS 0.40        // 0.5 = gentle (lifts mids), 1.0 = adaptive, 1.5+ = punchy highlights
 
 // --- Dynamic Intensity ---
 // Per-scene contrast-adaptive multiplier on INTENSITY.
 // Flat/pastel scenes get gentler expansion, high-contrast scenes get more pop.
 #define ENABLE_DYNAMIC_INTENSITY 1
-#define DYN_INTENSITY_LOW  0.65    // Flat/low-contrast scenes
+#define DYN_INTENSITY_LOW  0.70    // Flat/low-contrast scenes
 #define DYN_INTENSITY_HIGH 1.25    // High-contrast/dramatic scenes
 #define DYN_CONTRAST_LOW   3.5     // Contrast floor (stops)
 #define DYN_CONTRAST_HIGH  6.0     // Contrast ceiling (stops)
-#define DYN_APL_ATTEN  0.60        // Less dynamic intensity for high average brightness scenes (0.70 = 30% reduction at KEY_VERY_BRIGHT)
+#define DYN_APL_ATTEN  0.70        // Less dynamic intensity for high average brightness scenes (0.70 = 30% reduction at KEY_VERY_BRIGHT)
 
 // --- Saturation Boost (Oklab) ---
 // Perceptual chroma compensation via Stevens' power law.
 // Oklab expansion scales base chroma by cbrt(k); this adds the remaining k^(1/6) gap
 // to reach the Stevens target of sqrt(k) for constant perceived colorfulness.
-#define ENABLE_SAT_BOOST 1
+#define ENABLE_SAT_BOOST 0
 #define SAT_BOOST_EXPONENT 0.167   // k^(1/6) base + empirical offset for PQ compression / Hunt effect
 #define SAT_BOOST_MAX 1.1          // Safety cap
 #define SAT_KNEE_OFFSET 0.2        // Extend chroma boost below luminance knee (linear luma, 0 = disabled)
 #define SAT_KNEE_PEAK 0.04         // Max chroma boost at knee boundary (0.04 = 4%)
 
-// --- Scene-Wide APL Saturation ---
-// Global chroma boost proportional to scene brightness (smoothed_log_avg).
-// Complements luminance expansion — bright scenes get more chroma, dark scenes none.
+// --- APL Low-Saturation Compensation ---
+// Per-pixel chroma boost targeting desaturated pixels in bright scenes.
+// Counters silvery/washed-out appearance from Hunt effect adaptation mismatch:
+// viewer adapts to HDR highlights, making low-chroma midtones appear duller.
+// Inversely weighted by pixel chroma — low-sat pixels get full boost, saturated pixels none.
+// Self-limiting on true neutrals (mix toward luma is identity when R=G=B).
 #define ENABLE_APL_SAT 1
-#define APL_SAT_THRESHOLD 0.20     // Scene key below which no boost
-#define APL_SAT_CEILING 0.32       // Scene key at which boost reaches maximum (KEY_VERY_BRIGHT)
-#define APL_SAT_MAX 0.03           // Maximum chroma boost (0.03 = 3%)
+#define APL_SAT_THRESHOLD 0.15     // Scene key below which no boost
+#define APL_SAT_CEILING 0.32       // Scene key at which boost reaches maximum
+#define APL_SAT_MAX 0.18           // Maximum chroma boost for lowest-sat pixels (6%)
+#define APL_SAT_LOWSAT_CEIL 0.40   // Normalized chroma (sat_raw) above which boost is zero
 
 // --- Bezold-Brücke Warmth Compensation ---
 // Pre-compensates for perceptual yellow→green hue shift at higher output luminances.
@@ -859,28 +863,29 @@ vec4 hook() {
         float dyn_intensity = mix(DYN_INTENSITY_LOW, DYN_INTENSITY_HIGH, dyn_factor);
         // APL attenuation: bright scenes get reduced expansion to restrain paper-white lift.
         float apl_atten = mix(1.0, DYN_APL_ATTEN, smoothstep(KEY_BRIGHT, KEY_VERY_BRIGHT, smoothed_log_avg));
-        expansion = 1.0 + (expansion - 1.0) * dyn_intensity * apl_atten * INTENSITY;
+        float atten_factor = mix(apl_atten, sqrt(apl_atten), master_curve);  // Midtones get full atten, peak gets sqrt (proportional)
+        expansion = 1.0 + (expansion - 1.0) * dyn_intensity * atten_factor * INTENSITY;
     #else
         expansion = 1.0 + (expansion - 1.0) * INTENSITY;
     #endif
 
     // -------------------------------------------------------------------------
-    // BELOW-KNEE CHROMA RAMP + APL SAT + CHROMA-ADAPTIVE LUMINANCE
+    // BELOW-KNEE CHROMA RAMP + APL LOW-SAT COMP + CHROMA-ADAPTIVE LUMINANCE
     // -------------------------------------------------------------------------
     // knee_chroma: smoothstep ramp from sat_knee → master_knee, peaking at SAT_KNEE_PEAK.
-    // apl_sat: scene-wide chroma boost from smoothed_log_avg (bright scenes get more chroma).
+    // apl_sat: per-pixel low-sat compensation — bright scenes boost desaturated pixels only.
     // ce_delta: warm skin lift / pale skin compress, APL-gated (H-K luminance compensation).
-    // All three computed before early exit; applied in both early-exit and main paths.
+    // All computed before early exit; applied in both early-exit and main paths.
     #if ENABLE_SAT_BOOST
         float sat_knee = max(master_knee - SAT_KNEE_OFFSET, 0.0);
         float knee_chroma = (SAT_KNEE_OFFSET > 0.0)
             ? smoothstep(sat_knee, master_knee, Y_decision) * SAT_KNEE_PEAK
             : 0.0;
-        #if ENABLE_APL_SAT
-            float apl_sat = smoothstep(APL_SAT_THRESHOLD, APL_SAT_CEILING, smoothed_log_avg) * APL_SAT_MAX;
-        #else
-            float apl_sat = 0.0;
-        #endif
+    #endif
+    #if ENABLE_APL_SAT
+        float apl_scene = smoothstep(APL_SAT_THRESHOLD, APL_SAT_CEILING, smoothed_log_avg) * APL_SAT_MAX;
+        float lowsat_w = 1.0 - smoothstep(0.0, APL_SAT_LOWSAT_CEIL, sat_raw);
+        float apl_sat = apl_scene * lowsat_w;
     #endif
 
     // Chroma-adaptive luminance: warm skin lift / pale skin compress, APL-gated.
@@ -903,12 +908,14 @@ vec4 hook() {
     // Saves ALU on dark/mid-tone pixels that don't receive expansion.
     // Threshold slightly above 1.0 to catch edge cases from sat rolloff.
     if (expansion < 1.001) {
-        #if ENABLE_SAT_BOOST || ENABLE_CHROMA_EXPAND
+        #if ENABLE_SAT_BOOST || ENABLE_APL_SAT || ENABLE_CHROMA_EXPAND
         {
+            float early_sat = 0.0;
             #if ENABLE_SAT_BOOST
-                float early_sat = knee_chroma + apl_sat;
-            #else
-                float early_sat = 0.0;
+                early_sat = knee_chroma;
+            #endif
+            #if ENABLE_APL_SAT
+                early_sat += apl_sat;
             #endif
             if (early_sat > 0.001 || abs(ce_delta) > 0.001) {
                 vec3 rgb_adj = rgb_linear * (1.0 + ce_delta);
@@ -951,7 +958,10 @@ vec4 hook() {
 
     #if ENABLE_SAT_BOOST
         float sat_boost = min(pow(max(expansion, 0.0), SAT_BOOST_EXPONENT), SAT_BOOST_MAX);
-        sat_boost = max(sat_boost, 1.0 + knee_chroma) + apl_sat;
+        sat_boost = max(sat_boost, 1.0 + knee_chroma);
+        #if ENABLE_APL_SAT
+            sat_boost += apl_sat;
+        #endif
         oklab_exp.yz *= sat_boost;
 
         #if DEBUG_SHOW_SAT_BOOST
@@ -959,6 +969,8 @@ vec4 hook() {
             float chroma_out = sqrt(oklab_exp.y * oklab_exp.y + oklab_exp.z * oklab_exp.z);
             return vec4(gamma709_to_pq2020(vec3(boost_viz, chroma_out * 3.0, 0.0)), 1.0);
         #endif
+    #elif ENABLE_APL_SAT
+        oklab_exp.yz *= (1.0 + apl_sat);
     #endif
 
     #if ENABLE_BB_WARMTH

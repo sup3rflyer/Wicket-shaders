@@ -54,11 +54,8 @@ hdr-reference-white=110          # Match your Windows SDR brightness (nits)
 sub-hdr-peak=110
 image-subs-hdr-peak=110
 vf-append=format:gamma=pq:primaries=bt.2020 		#Has to be set
-glsl-shaders-append=~~/shaders/CelFlare-blur.glsl
 glsl-shaders-append=~~/shaders/CelFlare.glsl
 ```
-
-`CelFlare-blur.glsl` must load before `CelFlare.glsl` — it packs stabilized luma into the alpha channel that CelFlare reads for grain-aware expansion decisions.
 
 Set `REFERENCE_WHITE` inside the shader to match your `hdr-reference-white` value.
 
@@ -81,7 +78,7 @@ Source: [DISPLAYCONFIG_SDR_WHITE_LEVEL (Microsoft)](https://learn.microsoft.com/
 
 ### CelFlare Lite
 
-**Static SDR-to-HDR highlight expansion** — lightweight variant of CelFlare using the same processing pipeline (PQ BT.2020 output, Oklab sat boost + hue correction, bilateral grain stabilization, PQ-aware dither) but with fixed expansion parameters instead of scene-adaptive analysis.
+**Static SDR-to-HDR highlight expansion** — lightweight variant of CelFlare using the same processing pipeline (PQ BT.2020 output, bilateral grain stabilization, chroma-adaptive expansion, PQ-aware dither) but with fixed expansion parameters instead of scene-adaptive analysis.
 
 Uses the same mpv profile and `REFERENCE_WHITE` setup as CelFlare. Tune with `INTENSITY`, `CURVE_STEEPNESS`, `HIGHLIGHT_PEAK`, and `KNEE_END`.
 
@@ -89,7 +86,7 @@ Uses the same mpv profile and `REFERENCE_WHITE` setup as CelFlare. Tune with `IN
 
 ### TextureClarity
 
-**Subtle texture sharpening** that enhances fine detail without edge artifacts or grain amplification.
+**Subtle texture sharpening** that enhances fine detail without edge sharpening or grain amplification.
 
 Operates on the luma channel only. Uses a 5x5 neighborhood with variance-based texture/grain discrimination and Sobel edge detection to selectively sharpen real texture while leaving edges, grain, and flat areas untouched. Works best when it's barely noticeable. This is meant to restore subtle texture detail affected by encoding.
 
@@ -108,9 +105,9 @@ glsl-shaders-append=~~/shaders/TextureClarity.glsl
 
 Technical approach:
 - PCG hash PRNG (stateless, pattern-free)
-- Gaussian noise via Box-Muller transform
+- Triangular noise (sum of two uniforms — bounded, no transcendentals)
 - Separable multi-tap Gaussian convolution for grain size control (per-channel tap counts create natural chromatic grain structure)
-- Luminance-adaptive scaling via Gaussian curve (grain concentrated in midtones)
+- Luminance-adaptive scaling via Tukey window (grain concentrated in midtones, finite support)
 
 #### SDR Variants
 
@@ -128,7 +125,7 @@ For HDR content or use after SDR-to-HDR expansion. Include a soft-toe black leve
 
 | Variant | Intensity | Character |
 |---------|-----------|-----------|
-| **HDR Light** | 0.04 | Minimal grain. Fine texture without compromising HDR clarity. |
+| **HDR Light** | 0.05 | Minimal grain. Fine texture without compromising HDR clarity. |
 | **HDR Medium** | 0.08 | Moderate grain with differential channel blur (R/G coarser, B sharper). |
 | **HDR Heavy** | 0.12 | Strong grain with multi-scale channel structure (R coarsest, B finest). |
 
@@ -162,12 +159,11 @@ If using multiple shaders together, load them in this order:
 
 ```ini
 glsl-shaders-append=~~/shaders/TextureClarity.glsl
-glsl-shaders-append=~~/shaders/CelFlare-blur.glsl
 glsl-shaders-append=~~/shaders/CelFlare.glsl
 glsl-shaders-append=~~/shaders/filmgrain-smooth-HDR-light.glsl
 ```
 
-TextureClarity runs on LUMA before expansion. CelFlare-blur and CelFlare both hook at MAIN (blur must precede CelFlare/Lite). Film grain hooks at OUTPUT (final stage).
+TextureClarity runs on LUMA before expansion. CelFlare hooks at MAIN (multi-pass: blur → stats → expand). Film grain hooks at OUTPUT (final stage).
 
 ## License
 

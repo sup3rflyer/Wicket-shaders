@@ -8,7 +8,7 @@
 
 // --- SETTINGS ---
 #define GRAIN_RATE 1.0
-#define INTENSITY 0.04
+#define INTENSITY 0.05
 #define SATURATION 0.20
 
 #define RED_TAPS 1
@@ -23,29 +23,21 @@
 #define GREEN_VARIANCE_SCALE 1.0
 #define BLUE_VARIANCE_SCALE 1.0
 
-// Threshold is now handled by the function, so these are unused, but keep at 0.0
-#define RED_LUMA_THRESHOLD 0.00
-#define GREEN_LUMA_THRESHOLD 0.00
-#define BLUE_LUMA_THRESHOLD 0.00
-
 // Peak at 0.22 ensures grain lives in the "meat" of the image, not the floor
 #define RED_MID 0.22
 #define GREEN_MID 0.22
 #define BLUE_MID 0.22
 
 // Very steep falloff to keep highlights crystal clear
-#define RED_STEEPNESS 20.0
-#define GREEN_STEEPNESS 20.0
-#define BLUE_STEEPNESS 20.0
+#define RED_STEEPNESS 15.0
+#define GREEN_STEEPNESS 15.0
+#define BLUE_STEEPNESS 15.0
 
 #define RED_SATURATION 0.5
 #define GREEN_SATURATION 0.5
 #define BLUE_SATURATION 0.5
 
-#define USE_LINEAR 0 
 #define MAX_TAPS 1
-
-const uint row_size = 2 * MAX_TAPS + 1;
 
 // Optimized Gaussian Weights (Sigma ~0.8) - Sharp
 const float weights_red[3] = { 0.23899, 0.52202, 0.23899 };
@@ -64,27 +56,22 @@ uint pcg_hash(uint s) {
     return (word >> 22u) ^ word;
 }
 
-float rand_gaussian(inout uint state, float variance_scale) {
-    uint u_int = pcg_hash(state); state = u_int;
-    uint v_int = pcg_hash(state); state = v_int;
-    float u = float(u_int) * (1.0 / 4294967296.0);
-    float v = float(v_int) * (1.0 / 4294967296.0);
-    if (u < 1e-6) u = 1e-6;
-    float r = sqrt(-2.0 * log(u));
-    float theta = 6.28318530718 * v;
-    return r * cos(theta) * 0.25 * variance_scale;
+float rand_triangular(inout uint state, float variance_scale) {
+    uint a = pcg_hash(state); state = a;
+    uint b = pcg_hash(state); state = b;
+    float u = float(a) * (1.0 / 4294967296.0);
+    float v = float(b) * (1.0 / 4294967296.0);
+    return (u + v - 1.0) * 0.612 * variance_scale;
 }
 
-// Grain scaling function with "Soft Toe" to protect black levels
-float grain_scale(float lum, float mid, float steepness, float threshold) {
-    // 1. Calculate the Gaussian curve
-    float gaussian = exp(-steepness * (lum - mid) * (lum - mid));
-    
-    // 2. Protect the blacks: Smoothly fade grain out between 0.0 and 0.05 luminance.
-    // This ensures pure black (0.0) is ALWAYS free of noise.
-    float protection_mask = smoothstep(0.00, 0.05, lum); 
+#define TUKEY_SCALE 0.383
 
-    return gaussian * protection_mask;
+float grain_scale(float lum, float mid, float steepness) {
+    float d2 = steepness * (lum - mid) * (lum - mid);
+    float t = 1.0 - d2 * TUKEY_SCALE;
+    float curve = t > 0.0 ? t * t : 0.0;
+    float protection = smoothstep(0.0, 0.05, lum);
+    return curve * protection;
 }
 
 void hook() {
@@ -97,11 +84,9 @@ void hook() {
         uvec2 global_pos = uvec2(global_coord_i);
         
         uint seed_init = (global_pos.x * 1664525u) + (global_pos.y * 22695477u) + (frame_seed * 314159265u);
-        uint seed = pcg_hash(seed_init);
-        
-        float g_r = rand_gaussian(seed, RED_VARIANCE_SCALE);
-        float g_g = rand_gaussian(seed, GREEN_VARIANCE_SCALE);
-        float g_b = rand_gaussian(seed, BLUE_VARIANCE_SCALE);
+        float g_r = rand_triangular(seed_init, RED_VARIANCE_SCALE);
+        float g_g = rand_triangular(seed_init, GREEN_VARIANCE_SCALE);
+        float g_b = rand_triangular(seed_init, BLUE_VARIANCE_SCALE);
         
         float grain_lum = dot(vec3(g_r, g_g, g_b), vec3(0.299, 0.587, 0.114));
         grain_r[local_pos.y][local_pos.x] = mix(grain_lum, g_r, RED_SATURATION * SATURATION);
@@ -133,16 +118,14 @@ void hook() {
     }
 
     vec4 color = HOOKED_tex(HOOKED_pos);
-    if (USE_LINEAR == 1) color = linearize(color);
 
-    float scale_r = grain_scale(color.r, RED_MID, RED_STEEPNESS, RED_LUMA_THRESHOLD);
-    float scale_g = grain_scale(color.g, GREEN_MID, GREEN_STEEPNESS, GREEN_LUMA_THRESHOLD);
-    float scale_b = grain_scale(color.b, BLUE_MID, BLUE_STEEPNESS, BLUE_LUMA_THRESHOLD);
+    float scale_r = grain_scale(color.r, RED_MID, RED_STEEPNESS);
+    float scale_g = grain_scale(color.g, GREEN_MID, GREEN_STEEPNESS);
+    float scale_b = grain_scale(color.b, BLUE_MID, BLUE_STEEPNESS);
 
     vec3 vsum = vec3(vsum_r * RED_INTENSITY_MULTIPLIER, vsum_g * GREEN_INTENSITY_MULTIPLIER, vsum_b * BLUE_INTENSITY_MULTIPLIER);
     vec3 scale_vec = vec3(scale_r, scale_g, scale_b);
     color.rgb += INTENSITY * vsum * scale_vec;
 
-    if (USE_LINEAR == 1) color = delinearize(color);
     imageStore(out_image, ivec2(gl_GlobalInvocationID), color);
 }

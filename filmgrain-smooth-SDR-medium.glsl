@@ -7,7 +7,6 @@
 //!COMPUTE 32 32
 
 #define GRAIN_RATE 1.0
-#define USE_LINEAR 0
 #define INTENSITY 0.12
 #define SATURATION 0.25
 #define MAX_TAPS 3
@@ -24,10 +23,6 @@
 #define GREEN_VARIANCE_SCALE 1.0
 #define BLUE_VARIANCE_SCALE 1.0
 
-#define RED_LUMA_THRESHOLD 0.04
-#define GREEN_LUMA_THRESHOLD 0.04
-#define BLUE_LUMA_THRESHOLD 0.04
-
 #define RED_MID 0.40
 #define GREEN_MID 0.40
 #define BLUE_MID 0.40
@@ -40,7 +35,6 @@
 #define GREEN_SATURATION 0.5
 #define BLUE_SATURATION 0.4
 
-const uint row_size = 2 * MAX_TAPS + 1;
 const uvec2 isize = uvec2(gl_WorkGroupSize) + uvec2(2 * MAX_TAPS);
 
 shared float grain_r[isize.y][isize.x];
@@ -58,24 +52,22 @@ uint pcg_hash(uint s) {
     return (word >> 22u) ^ word;
 }
 
-float rand_gaussian(inout uint state, float variance_scale) {
-    uint s = pcg_hash(state);
-    state = s; // Advance state
-    float u = float(s) * (1.0 / 4294967296.0);
-    
-    s = pcg_hash(state); 
-    state = s;
-    float v = float(s) * (1.0 / 4294967296.0);
-
-    if (u < 1e-6) u = 1e-6;
-    float r = sqrt(-2.0 * log(u));
-    float theta = 6.28318530718 * v;
-    return r * cos(theta) * 0.25 * variance_scale;
+float rand_triangular(inout uint state, float variance_scale) {
+    uint a = pcg_hash(state); state = a;
+    uint b = pcg_hash(state); state = b;
+    float u = float(a) * (1.0 / 4294967296.0);
+    float v = float(b) * (1.0 / 4294967296.0);
+    return (u + v - 1.0) * 0.612 * variance_scale;
 }
 
-float grain_scale(float lum, float mid, float steepness, float threshold) {
-    if (lum < threshold) return 0.0;
-    return exp(-steepness * (lum - mid) * (lum - mid));
+#define TUKEY_SCALE 0.459
+
+float grain_scale(float lum, float mid, float steepness) {
+    float d2 = steepness * (lum - mid) * (lum - mid);
+    float t = 1.0 - d2 * TUKEY_SCALE;
+    float curve = t > 0.0 ? t * t : 0.0;
+    float protection = smoothstep(0.0, 0.05, lum);
+    return curve * protection;
 }
 
 void hook() {
@@ -91,9 +83,9 @@ void hook() {
         // Asymmetric Seed: x*Prime1 + y*Prime2 to prevent mirroring
         uint seed_init = (global_pos.x * 1664525u) + (global_pos.y * 22695477u) + (frame_seed * 314159265u);
         
-        float g_r = rand_gaussian(seed_init, RED_VARIANCE_SCALE);
-        float g_g = rand_gaussian(seed_init, GREEN_VARIANCE_SCALE);
-        float g_b = rand_gaussian(seed_init, BLUE_VARIANCE_SCALE);
+        float g_r = rand_triangular(seed_init, RED_VARIANCE_SCALE);
+        float g_g = rand_triangular(seed_init, GREEN_VARIANCE_SCALE);
+        float g_b = rand_triangular(seed_init, BLUE_VARIANCE_SCALE);
 
         float grain_lum = dot(vec3(g_r, g_g, g_b), vec3(0.299, 0.587, 0.114));
         grain_r[local_pos.y][local_pos.x] = mix(grain_lum, g_r, RED_SATURATION * SATURATION);
@@ -134,18 +126,14 @@ void hook() {
     }
 
     vec4 color = HOOKED_tex(HOOKED_pos);
-    // Linearization moved to macros to support HDR switch
-    if (USE_LINEAR == 1) color.rgb = pow(max(color.rgb, 0.0), vec3(2.2)); // Approx linearize
 
-    float scale_r = grain_scale(color.r, RED_MID, RED_STEEPNESS, RED_LUMA_THRESHOLD);
-    float scale_g = grain_scale(color.g, GREEN_MID, GREEN_STEEPNESS, GREEN_LUMA_THRESHOLD);
-    float scale_b = grain_scale(color.b, BLUE_MID, BLUE_STEEPNESS, BLUE_LUMA_THRESHOLD);
+    float scale_r = grain_scale(color.r, RED_MID, RED_STEEPNESS);
+    float scale_g = grain_scale(color.g, GREEN_MID, GREEN_STEEPNESS);
+    float scale_b = grain_scale(color.b, BLUE_MID, BLUE_STEEPNESS);
 
     vec3 vsum = vec3(vsum_r * RED_INTENSITY_MULTIPLIER, vsum_g * GREEN_INTENSITY_MULTIPLIER, vsum_b * BLUE_INTENSITY_MULTIPLIER);
     vec3 scale_vec = vec3(scale_r, scale_g, scale_b);
     color.rgb += INTENSITY * vsum * scale_vec;
 
-    if (USE_LINEAR == 1) color.rgb = pow(max(color.rgb, 0.0), vec3(1.0/2.2)); // Approx delinearize
-    
     imageStore(out_image, ivec2(gl_GlobalInvocationID), color);
 }

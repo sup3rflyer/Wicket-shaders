@@ -1,9 +1,113 @@
-// Copyright (C) 2026 Ágúst Ari
+// Copyright (C) 2026 Agust Ari
 // Licensed under GPL-3.0 — see LICENSE
 
 //!HOOK MAIN
 //!BIND HOOKED
-//!DESC CelFlare Lite v2.9 (Static SDR→HDR)
+//!DESC CelFlare Lite Grain Pre-filter
+
+#define STABILIZE_OPACITY   0.85
+#define GRAIN_THRESHOLD     0.28
+#define GRAIN_BLUR_RADIUS   14.0
+
+#define GRAIN_RANGE_MIN     0.35
+#define GRAIN_RANGE_MAX     0.95
+#define GRAIN_EDGE_LOW      0.20
+#define GRAIN_EDGE_HIGH     0.45
+#define GRAIN_EARLY_EXIT    0.25
+
+#define BILATERAL_SHARPNESS 4.8
+
+#define INNER_RING_BOOST    2.0
+
+vec4 hook() {
+    vec4 original = HOOKED_tex(HOOKED_pos);
+    const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
+    float Y_gamma = dot(original.rgb, luma_coeff);
+
+    if (Y_gamma < GRAIN_EARLY_EXIT) {
+        return vec4(original.rgb, Y_gamma);
+    }
+
+    float range_mask = smoothstep(GRAIN_RANGE_MIN - 0.05, GRAIN_RANGE_MIN, Y_gamma)
+                     * (1.0 - smoothstep(GRAIN_RANGE_MAX, GRAIN_RANGE_MAX + 0.05, Y_gamma));
+
+    if (range_mask < 0.01) {
+        return vec4(original.rgb, Y_gamma);
+    }
+
+    vec2 pixel = floor(HOOKED_pos * HOOKED_size);
+    float angle = fract(sin(dot(pixel, vec2(12.9898, 78.233))) * 43758.5453) * 6.2832;
+    float ca = cos(angle);
+    float sa = sin(angle);
+
+    const vec2 outer[6] = vec2[6](
+        vec2( 1.000, 0.000), vec2( 0.500, 0.866), vec2(-0.500, 0.866),
+        vec2(-1.000, 0.000), vec2(-0.500, -0.866), vec2( 0.500, -0.866)
+    );
+
+    const vec2 inner[6] = vec2[6](
+        vec2( 0.866, 0.500), vec2( 0.000, 1.000), vec2(-0.866, 0.500),
+        vec2(-0.866, -0.500), vec2( 0.000, -1.000), vec2( 0.866, -0.500)
+    );
+
+    float asym_scale = mix(1.0, 7.0, smoothstep(0.55, 0.98, Y_gamma));
+    float effective_sharpness = BILATERAL_SHARPNESS * mix(1.0, 0.82, smoothstep(0.60, 1.0, Y_gamma));
+
+    float total_w = 1.0;
+    float blurred = Y_gamma;
+    float gx = 0.0, gy = 0.0, grad_w = 0.0;
+
+    float raw_diff, asym, diff, w, s;
+    vec2 rotated, offset;
+
+    for (int i = 0; i < 6; i++) {
+        vec2 h = outer[i];
+        rotated = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
+        offset = HOOKED_pt * GRAIN_BLUR_RADIUS * rotated;
+        s = dot(HOOKED_tex(HOOKED_pos + offset).rgb, luma_coeff);
+        raw_diff = s - Y_gamma;
+        asym = raw_diff < 0.0 ? asym_scale : 1.0;
+        diff = (raw_diff * asym) / GRAIN_THRESHOLD;
+        w = exp(-effective_sharpness * diff * diff);
+        blurred += s * w;
+        total_w += w;
+
+        gx += s * w * rotated.x;
+        gy += s * w * rotated.y;
+        grad_w += w;
+    }
+
+    float inv_grad_w = grad_w > 0.0 ? 1.0 / grad_w : 0.0;
+    gx *= inv_grad_w;
+    gy *= inv_grad_w;
+
+    for (int i = 0; i < 6; i++) {
+        vec2 h = inner[i];
+        rotated = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
+        offset = HOOKED_pt * GRAIN_BLUR_RADIUS * 0.5 * rotated;
+        s = dot(HOOKED_tex(HOOKED_pos + offset).rgb, luma_coeff);
+        raw_diff = s - Y_gamma;
+        asym = raw_diff < 0.0 ? asym_scale : 1.0;
+        diff = (raw_diff * asym) / GRAIN_THRESHOLD;
+        w = exp(-effective_sharpness * diff * diff) * INNER_RING_BOOST;
+        blurred += s * w;
+        total_w += w;
+    }
+
+    blurred /= total_w;
+
+    float edge = sqrt(gx * gx + gy * gy) / 2.7;
+    float edge_mask = smoothstep(GRAIN_EDGE_LOW, GRAIN_EDGE_HIGH, edge);
+
+    float Y_stabilized = mix(blurred, Y_gamma, edge_mask * 0.97);
+    float Y_decision = mix(Y_gamma, Y_stabilized, range_mask * STABILIZE_OPACITY);
+
+    return vec4(original.rgb, Y_decision);
+}
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!DESC CelFlare Lite v3.0 (Static SDR->HDR)
 
 // =============================================================================
 // USER CONTROLS
@@ -19,7 +123,7 @@
 // --- Saturation Boost (Oklab) ---
 // Perceptual chroma compensation via Stevens' power law in Oklab space.
 // RGB expansion already scales chroma by cbrt(k); this adds the remaining k^(1/6) gap.
-#define ENABLE_SAT_BOOST 1
+#define ENABLE_SAT_BOOST 0
 #define SAT_BOOST_EXPONENT 0.267   // k^(1/6) base + empirical offset for PQ compression / Hunt effect
 #define SAT_BOOST_MAX 1.25         // Safety cap
 #define SAT_KNEE_OFFSET 0.10       // Extend chroma boost below luminance knee (linear luma, 0 = disabled)
@@ -71,7 +175,7 @@
 #define ENABLE_CHROMA_EXPAND 1
 #define CHROMA_EXPAND_STRENGTH 0.12   // Try 0.08–0.15 for anime
 #define CHROMA_EXPAND_PIVOT 0.20      // Normalized Oklab chroma crossover (~pale/warm skin)
-#define CHROMA_EXPAND_RED_EXTEND 0.40 // Extend warm mask toward red/pink
+#define CE_CHROMA_CEIL 0.40           // Normalized chroma above which effect fades (0.40 = chroma 0.14)
 
 // =============================================================================
 // DEBUG
@@ -306,30 +410,7 @@ vec4 hook() {
     // Intensity multiplier
     expansion = 1.0 + (expansion - 1.0) * INTENSITY;
 
-    // Chroma-adaptive expansion: warm low-sat (pale skin) → compress;
-    // warm mid-sat (healthy skin) → lift. Lift gated on expansion zone
-    // to prevent halos at onset. Compression: early exit handles result.
-    #if ENABLE_CHROMA_EXPAND
-    {
-        float ce_chroma_n = clamp(chroma_orig / 0.35, 0.0, 1.0);
-        // Blend red axis (a+) into warm signal so pink/blush tones are included.
-        float warm_signal = oklab_orig.z + CHROMA_EXPAND_RED_EXTEND * max(oklab_orig.y, 0.0);
-        float warm_ratio  = warm_signal / (abs(oklab_orig.y) + chroma_orig + 0.001);
-        // Gate on BOTH hue angle AND chroma magnitude. warm_ratio alone is a pure hue
-        // direction measure — a near-neutral pixel with a tiny positive b still gets
-        // warm_ratio≈1, but has no meaningful warm chroma to compensate for. H-K effect
-        // is proportional to saturation, so correction should fade to zero at neutral.
-        float warm_t = smoothstep(0.15, 0.65, warm_ratio) * smoothstep(0.05, 0.20, ce_chroma_n);
-        float delta = CHROMA_EXPAND_STRENGTH * (ce_chroma_n - CHROMA_EXPAND_PIVOT) * warm_t;
-        if (delta > 0.0) {
-            expansion *= 1.0 + delta * smoothstep(1.001, 1.10, expansion);
-        } else {
-            expansion *= 1.0 + delta;
-        }
-    }
-    #endif
-
-    // Below-knee chroma ramp (computed for both early-exit and main path)
+    // Below-knee chroma ramp + H-K compensation (before early exit)
     #if ENABLE_SAT_BOOST
         float sat_knee = max(master_knee - SAT_KNEE_OFFSET, 0.0);
         float knee_chroma = (SAT_KNEE_OFFSET > 0.0)
@@ -337,14 +418,33 @@ vec4 hook() {
             : 0.0;
     #endif
 
-    // Early exit for non-expanded pixels (with below-knee chroma ramp)
+    #if ENABLE_CHROMA_EXPAND
+        float ce_chroma_n = clamp(chroma_orig / 0.35, 0.0, 1.0);
+        float skin_hue = smoothstep(-0.01, 0.03, oklab_orig.y)
+                       * smoothstep(-0.01, 0.03, oklab_orig.z);
+        float chroma_gate = smoothstep(0.05, 0.15, ce_chroma_n)
+                          * (1.0 - smoothstep(CE_CHROMA_CEIL, CE_CHROMA_CEIL + 0.20, ce_chroma_n));
+        float warm_t = skin_hue * chroma_gate;
+        float ce_delta = CHROMA_EXPAND_STRENGTH * (ce_chroma_n - CHROMA_EXPAND_PIVOT) * warm_t;
+    #else
+        float ce_delta = 0.0;
+    #endif
+
+    // Early exit for non-expanded pixels
     if (expansion < 1.001) {
-        #if ENABLE_SAT_BOOST
-            if (knee_chroma > 0.001) {
-                float Y_lin = get_luma(rgb_linear);
-                vec3 rgb_boosted = mix(vec3(Y_lin), rgb_linear, 1.0 + knee_chroma);
-                return vec4(linear709_to_pq2020(rgb_boosted), color.a);
+        #if ENABLE_SAT_BOOST || ENABLE_CHROMA_EXPAND
+        {
+            float early_sat = 0.0;
+            #if ENABLE_SAT_BOOST
+                early_sat = knee_chroma;
+            #endif
+            if (early_sat > 0.001 || abs(ce_delta) > 0.001) {
+                vec3 rgb_adj = rgb_linear * (1.0 + ce_delta);
+                float Y_adj = get_luma(rgb_adj);
+                vec3 rgb_out = mix(vec3(Y_adj), rgb_adj, 1.0 + early_sat);
+                return vec4(linear709_to_pq2020(rgb_out), color.a);
             }
+        }
         #endif
         return vec4(gamma709_to_pq2020(color.rgb), color.a);
     }
@@ -357,6 +457,9 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // APPLY EXPANSION (Linear Space)
     // -------------------------------------------------------------------------
+    #if ENABLE_CHROMA_EXPAND
+        expansion *= (1.0 + ce_delta);
+    #endif
     vec3 rgb_expanded = rgb_linear * expansion;
 
     // -------------------------------------------------------------------------

@@ -107,7 +107,7 @@ vec4 hook() {
 
 //!HOOK MAIN
 //!BIND HOOKED
-//!DESC CelFlare Lite v3.0 (Static SDR->HDR)
+//!DESC CelFlare Lite v3.1 (Static SDR->HDR)
 
 // =============================================================================
 // USER CONTROLS
@@ -169,13 +169,28 @@ vec4 hook() {
 #define SAT_POWER 10.0             // Rolloff curve steepness
 #define SAT_ROLLOFF 0.80           // Max expansion reduction
 
-// --- Chroma-Adaptive Luminance (H-K compensation) ---
-// Lifts warm saturated skin and compresses pale skin to counter perceived luminance
-// separation after expansion. Keep strength subtle.
-#define ENABLE_CHROMA_EXPAND 1
-#define CHROMA_EXPAND_STRENGTH 0.12   // Try 0.08–0.15 for anime
-#define CHROMA_EXPAND_PIVOT 0.20      // Normalized Oklab chroma crossover (~pale/warm skin)
-#define CE_CHROMA_CEIL 0.40           // Normalized chroma above which effect fades (0.40 = chroma 0.14)
+// --- Warm Tone Compensation ---
+// Luminance lift for warm/skin hues, countering perceived darkening from
+// surrounding highlight expansion. Ramps from shadows to WP_LUM_FLOOR.
+//
+#define ENABLE_WARM_PROTECT 1
+#define WP_LUM_BOOST        0.60    // Max expansion lift for warm tones
+//
+// --- Pale Skin Protection ---
+// Compresses expansion on bright desaturated warm pixels (pale skin glow)
+// and adds slight chroma boost to maintain skin warmth.
+// Shares hue detection with warm protect.
+//
+#define ENABLE_PALE_SKIN 1
+#define PS_COMPRESS         0.20    // Expansion compression (0 = off, 1 = full)
+#define PS_SAT_BOOST        0.10    // Chroma boost to maintain skin warmth
+#define PS_BRIGHT_FLOOR     0.65    // Luma below which effect fades
+#define PS_CHROMA_CEIL      0.02    // Oklab chroma above which effect fades
+#define WP_HUE_CENTER       1.05    // Oklab hue center in radians (~60°, orange-yellow midpoint)
+#define WP_HUE_SIGMA        0.60    // Gaussian width in radians (~34°, covers ~15°–105°)
+#define WP_CHROMA_MIN       0.03    // Min Oklab chroma (excludes near-neutrals)
+#define WP_CHROMA_MAX       0.14    // Oklab chroma where effect fades (protects saturated reds/fire)
+#define WP_LUM_FLOOR        0.50    // Linear luma below which effect fades (protects dark shadows)
 
 // =============================================================================
 // DEBUG
@@ -187,6 +202,7 @@ vec4 hook() {
 #define DEBUG_SHOW_SAT 0           // Show saturation rolloff factor
 #define DEBUG_SHOW_GRAIN 0         // Show grain stabilization effect
 #define DEBUG_SHOW_DITHER 0        // Show dither magnitude and pattern
+#define DEBUG_SHOW_WP 0            // Show warm tone protection (green=lift, red=attenuate)
 
 // =============================================================================
 // HELPER FUNCTIONS
@@ -410,7 +426,34 @@ vec4 hook() {
     // Intensity multiplier
     expansion = 1.0 + (expansion - 1.0) * INTENSITY;
 
-    // Below-knee chroma ramp + H-K compensation (before early exit)
+    // -------------------------------------------------------------------------
+    // WARM TONE COMPENSATION + PALE SKIN PROTECTION
+    // -------------------------------------------------------------------------
+    #if ENABLE_WARM_PROTECT || ENABLE_PALE_SKIN
+        float wp_hue = atan(oklab_orig.z, oklab_orig.y);
+        float wp_dh = wp_hue - WP_HUE_CENTER;
+        wp_dh -= 6.2831853 * floor((wp_dh + 3.1415927) / 6.2831853);
+        float wp_hue_w = exp(-0.5 * wp_dh * wp_dh / (WP_HUE_SIGMA * WP_HUE_SIGMA));
+    #endif
+
+    #if ENABLE_WARM_PROTECT
+        float wp_chroma_w = smoothstep(WP_CHROMA_MIN - 0.03, WP_CHROMA_MIN + 0.03, chroma_orig)
+                          * (1.0 - smoothstep(WP_CHROMA_MAX, WP_CHROMA_MAX + 0.08, chroma_orig));
+        float wp_lum_w = smoothstep(0.0, WP_LUM_FLOOR, Y_decision);
+        float wp_w = wp_hue_w * wp_chroma_w * wp_lum_w;
+        expansion += WP_LUM_BOOST * wp_w;
+    #endif
+
+    #if ENABLE_PALE_SKIN
+        float ps_chroma_w = smoothstep(0.015, 0.06, chroma_orig)
+                          * (1.0 - smoothstep(0.04, PS_CHROMA_CEIL + 0.04, chroma_orig));
+        float ps_bright_w = smoothstep(PS_BRIGHT_FLOOR, PS_BRIGHT_FLOOR + 0.15, Y_decision);
+        float ps_w = wp_hue_w * ps_chroma_w * ps_bright_w;
+        expansion = mix(expansion, 1.0, PS_COMPRESS * ps_w);
+        float ps_sat = PS_SAT_BOOST * ps_w;
+    #endif
+
+    // Below-knee chroma ramp (before early exit)
     #if ENABLE_SAT_BOOST
         float sat_knee = max(master_knee - SAT_KNEE_OFFSET, 0.0);
         float knee_chroma = (SAT_KNEE_OFFSET > 0.0)
@@ -418,30 +461,29 @@ vec4 hook() {
             : 0.0;
     #endif
 
-    #if ENABLE_CHROMA_EXPAND
-        float ce_chroma_n = clamp(chroma_orig / 0.35, 0.0, 1.0);
-        float skin_hue = smoothstep(-0.01, 0.03, oklab_orig.y)
-                       * smoothstep(-0.01, 0.03, oklab_orig.z);
-        float chroma_gate = smoothstep(0.05, 0.15, ce_chroma_n)
-                          * (1.0 - smoothstep(CE_CHROMA_CEIL, CE_CHROMA_CEIL + 0.20, ce_chroma_n));
-        float warm_t = skin_hue * chroma_gate;
-        float ce_delta = CHROMA_EXPAND_STRENGTH * (ce_chroma_n - CHROMA_EXPAND_PIVOT) * warm_t;
-    #else
-        float ce_delta = 0.0;
+    #if DEBUG_SHOW_WP && (ENABLE_WARM_PROTECT || ENABLE_PALE_SKIN)
+    {
+        float wp_mag = 0.0;
+        float ps_mag = 0.0;
+        #if ENABLE_WARM_PROTECT
+            wp_mag = WP_LUM_BOOST * wp_w * 10.0;
+        #endif
+        #if ENABLE_PALE_SKIN
+            ps_mag = PS_COMPRESS * ps_w * 10.0;
+        #endif
+        vec3 dbg = vec3(ps_mag, wp_mag, 0.0);  // green: warm lift, red: pale compress
+        return vec4(gamma709_to_pq2020(dbg), color.a);
+    }
     #endif
 
     // Early exit for non-expanded pixels
     if (expansion < 1.001) {
-        #if ENABLE_SAT_BOOST || ENABLE_CHROMA_EXPAND
+        #if ENABLE_SAT_BOOST
         {
-            float early_sat = 0.0;
-            #if ENABLE_SAT_BOOST
-                early_sat = knee_chroma;
-            #endif
-            if (early_sat > 0.001 || abs(ce_delta) > 0.001) {
-                vec3 rgb_adj = rgb_linear * (1.0 + ce_delta);
-                float Y_adj = get_luma(rgb_adj);
-                vec3 rgb_out = mix(vec3(Y_adj), rgb_adj, 1.0 + early_sat);
+            float early_sat = knee_chroma;
+            if (early_sat > 0.001) {
+                float Y_lin = get_luma(rgb_linear);
+                vec3 rgb_out = mix(vec3(Y_lin), rgb_linear, 1.0 + early_sat);
                 return vec4(linear709_to_pq2020(rgb_out), color.a);
             }
         }
@@ -457,15 +499,12 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // APPLY EXPANSION (Linear Space)
     // -------------------------------------------------------------------------
-    #if ENABLE_CHROMA_EXPAND
-        expansion *= (1.0 + ce_delta);
-    #endif
     vec3 rgb_expanded = rgb_linear * expansion;
 
     // -------------------------------------------------------------------------
     // CHROMA PROCESSING (Single Oklab Round-Trip)
     // -------------------------------------------------------------------------
-    #if ENABLE_SAT_BOOST || ENABLE_BB_WARMTH
+    #if ENABLE_SAT_BOOST || ENABLE_BB_WARMTH || ENABLE_PALE_SKIN
     {
         vec3 oklab_exp = rgb_to_oklab(rgb_expanded);
 
@@ -475,6 +514,10 @@ vec4 hook() {
 
             oklab_exp.y *= sat_boost;
             oklab_exp.z *= sat_boost;
+        #endif
+
+        #if ENABLE_PALE_SKIN
+            oklab_exp.yz *= (1.0 + ps_sat);
         #endif
 
         #if ENABLE_BB_WARMTH

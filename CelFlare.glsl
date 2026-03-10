@@ -539,7 +539,7 @@ vec4 hook() {
 //!HEIGHT HOOKED.h 4 /
 //!DESC CelFlare Scorch Blur H
 
-#define SCORCH_BRIGHT_BIAS 4.0  // Bright samples weighted higher — prevents dark pull-down at occluder edges
+#define SCORCH_BRIGHT_BIAS 8.0  // Bright samples weighted higher — prevents dark pull-down at occluder edges
 
 vec4 hook() {
     // Stride-2 bilinear tap-merged Gaussian: sigma=80, radius=120
@@ -597,7 +597,7 @@ vec4 hook() {
 //!HEIGHT HOOKED.h 4 /
 //!DESC CelFlare Scorch Blur V
 
-#define SCORCH_BRIGHT_BIAS 4.0
+#define SCORCH_BRIGHT_BIAS 8.0
 
 vec4 hook() {
     // Stride-2 bilinear tap-merged Gaussian: sigma=80, radius=120
@@ -734,10 +734,9 @@ vec4 hook() {
 //  on low luma).
 //
 #define ENABLE_SCORCH 1
-#define SCORCH_PEAK_BOOST   1.00    // Extra expansion at region center
-#define SCORCH_BLACK_CRUSH  0.15     // Crush low blur values — remaps [this..1] to [0..1]. Higher = less effect at edges.
-#define SCORCH_OCCLUDE_FLOOR 0.55   // Luma below this = dark occluder, fully rejected
-#define SCORCH_OCCLUDE_CEIL  0.80   // Luma above this = bright enough, full boost allowed
+#define SCORCH_PEAK_BOOST    1.00   // Extra expansion at region center
+#define SCORCH_OCCLUDE_FLOOR 0.40   // Luma below this = dark occluder, fully rejected
+#define SCORCH_OCCLUDE_CEIL  0.90   // Luma above this = bright enough, full boost allowed
 #define SCORCH_SHUTOFF_BEGIN 0.65   // Start reducing at this screen fraction
 #define SCORCH_SHUTOFF_END   0.75   // Fully off at this screen fraction
 
@@ -1146,7 +1145,28 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     #if ENABLE_SCORCH
     {
-        float blur_val = CELFLARE_SCORCH_tex(CELFLARE_SCORCH_pos).r;
+        // B-spline (C2 cubic) upsampling — 4 bilinear fetches, kills 1/4-res grid.
+        // C2 needed because blur_val² amplifies C0/C1 kinks into visible artifacts.
+        vec2 tc = CELFLARE_SCORCH_pos / CELFLARE_SCORCH_pt - 0.5;
+        vec2 f  = fract(tc);
+        tc = (floor(tc) + 0.5) * CELFLARE_SCORCH_pt;
+
+        vec2 f2  = f * f, f3 = f2 * f;
+        vec2 w0  = (1.0 - f) * (1.0 - f) * (1.0 - f) * (1.0 / 6.0);
+        vec2 w1  = (4.0 - 6.0 * f2 + 3.0 * f3) * (1.0 / 6.0);
+        vec2 w2  = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) * (1.0 / 6.0);
+        vec2 w3  = f3 * (1.0 / 6.0);
+
+        vec2 s01 = w0 + w1, s23 = w2 + w3;
+        vec2 p01 = tc + (-1.0 + w1 / s01) * CELFLARE_SCORCH_pt;
+        vec2 p23 = tc + ( 1.0 + w3 / s23) * CELFLARE_SCORCH_pt;
+
+        // Weights sum to exactly 1.0 (B-spline partition of unity) — no division needed.
+        float blur_val =
+            CELFLARE_SCORCH_tex(vec2(p01.x, p01.y)).r * s01.x * s01.y +
+            CELFLARE_SCORCH_tex(vec2(p23.x, p01.y)).r * s23.x * s01.y +
+            CELFLARE_SCORCH_tex(vec2(p01.x, p23.y)).r * s01.x * s23.y +
+            CELFLARE_SCORCH_tex(vec2(p23.x, p23.y)).r * s23.x * s23.y;
 
         // Occlusion mask: reject dark occluders (trees, buildings against bright sky).
         // Dark pixels have clean, noise-free luma — sharp threshold is stable.
@@ -1156,9 +1176,9 @@ vec4 hook() {
         // blur_val² — natural center concentration, no threshold boundary.
         float raw = blur_val * blur_val * occlusion * scorch_shutoff;
 
-        // Smootherstep crush (C2, degree-5) — soften low end with wide banding-free toe.
-        float t = clamp((raw - SCORCH_BLACK_CRUSH) / max(1.0 - SCORCH_BLACK_CRUSH, 1e-6), 0.0, 1.0);
-        raw = t*t*t*(t*(6.0*t - 15.0) + 10.0);
+        // Floor kills faint outer fringe, smootherstep (C2) compresses midrange.
+        raw = max(raw - 0.07, 0.0) / 0.93;
+        raw = raw*raw*raw*(raw*(6.0*raw - 15.0) + 10.0);
 
         expansion += SCORCH_PEAK_BOOST * raw;
     }
@@ -1166,7 +1186,23 @@ vec4 hook() {
 
     #if DEBUG_SHOW_SCORCH
     {
-        float sd = CELFLARE_SCORCH_tex(CELFLARE_SCORCH_pos).r;
+        // Same B-spline upsample as main path for accurate debug view.
+        vec2 dtc = CELFLARE_SCORCH_pos / CELFLARE_SCORCH_pt - 0.5;
+        vec2 df  = fract(dtc);
+        dtc = (floor(dtc) + 0.5) * CELFLARE_SCORCH_pt;
+        vec2 df2 = df * df, df3 = df2 * df;
+        vec2 dw0 = (1.0 - df) * (1.0 - df) * (1.0 - df) * (1.0 / 6.0);
+        vec2 dw1 = (4.0 - 6.0 * df2 + 3.0 * df3) * (1.0 / 6.0);
+        vec2 dw2 = (1.0 + 3.0 * df + 3.0 * df2 - 3.0 * df3) * (1.0 / 6.0);
+        vec2 dw3 = df3 * (1.0 / 6.0);
+        vec2 ds01 = dw0 + dw1, ds23 = dw2 + dw3;
+        vec2 dp01 = dtc + (-1.0 + dw1 / ds01) * CELFLARE_SCORCH_pt;
+        vec2 dp23 = dtc + ( 1.0 + dw3 / ds23) * CELFLARE_SCORCH_pt;
+        float sd =
+            CELFLARE_SCORCH_tex(vec2(dp01.x, dp01.y)).r * ds01.x * ds01.y +
+            CELFLARE_SCORCH_tex(vec2(dp23.x, dp01.y)).r * ds23.x * ds01.y +
+            CELFLARE_SCORCH_tex(vec2(dp01.x, dp23.y)).r * ds01.x * ds23.y +
+            CELFLARE_SCORCH_tex(vec2(dp23.x, dp23.y)).r * ds23.x * ds23.y;
         float oc = smoothstep(SCORCH_OCCLUDE_FLOOR, SCORCH_OCCLUDE_CEIL, Y_decision);
         float boost = sd * sd * oc;
         // Yellow = raw blur² × occlusion (without shutoff/crush/peak scaling)

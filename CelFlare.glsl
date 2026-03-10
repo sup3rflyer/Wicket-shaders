@@ -1,4 +1,4 @@
-// CelFlare v3.1 — Scene-Adaptive SDR→HDR Highlight Expansion
+// CelFlare v3.2 — Scene-Adaptive SDR→HDR Highlight Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // You MUST set REFERENCE_WHITE to match your SDR white and hdr-reference-white in mpv.conf
@@ -12,7 +12,6 @@
 //!BUFFER SCENE_STATE
 //!VAR float smoothed_avg
 //!VAR float smoothed_max
-//!VAR float smoothed_min
 //!VAR float smoothed_log_avg
 //!VAR float smoothed_contrast
 //!VAR float smoothed_highlight_pop
@@ -157,7 +156,7 @@ vec4 hook() {
 //
 #define INTENSITY           1.2     // 0.5 subtle · 1.0 normal · 1.5+ aggressive
 #define CURVE_STEEPNESS     0.3     // 0.5 gentle (lifts mids) · 1.0 full adaptive · 1.5+ punchy highlights
-#define MASTER_KNEE_OFFSET  0.15    // Distance below knee where expansion starts. Larger = more dark pixels expanded
+#define MASTER_KNEE_OFFSET  0.0	    // Distance below knee where expansion starts. Larger = more dark pixels expanded
 
 // =============================================
 //  DYNAMIC INTENSITY — per-scene adaptation
@@ -355,7 +354,6 @@ vec4 hook() {
     float current_highlight_pop = stats_valid ? highlight_count / valid_samples : smoothed_highlight_pop;
     float current_contrast = stats_valid ? log2(max(Y_max, 0.001) / max(Y_min, 0.001)) : smoothed_contrast;
     float current_Y_max = stats_valid ? Y_max : smoothed_max;
-    float current_Y_min = stats_valid ? Y_min : smoothed_min;
     float current_avg_chroma = stats_valid ? chroma_sum / valid_samples : smoothed_avg_chroma;
     float current_bright_frac = (stats_valid && frame > 0) ? bright_above_knee / valid_samples : smoothed_bright_frac;
     float current_scorch_frac = stats_valid ? scorch_count / valid_samples : smoothed_scorch_frac;
@@ -384,7 +382,6 @@ vec4 hook() {
     if (frame == 0) {
         smoothed_avg = current_avg;
         smoothed_max = current_Y_max;
-        smoothed_min = current_Y_min;
         smoothed_log_avg = current_log_avg;
         smoothed_contrast = current_contrast;
         smoothed_highlight_pop = current_highlight_pop;
@@ -395,7 +392,6 @@ vec4 hook() {
     } else {
         smoothed_avg = mix(smoothed_avg, current_avg, alpha);
         smoothed_max = mix(smoothed_max, current_Y_max, alpha);
-        smoothed_min = mix(smoothed_min, current_Y_min, alpha);
         smoothed_log_avg = mix(smoothed_log_avg, current_log_avg, alpha);
         smoothed_contrast = mix(smoothed_contrast, current_contrast, alpha);
         smoothed_highlight_pop = mix(smoothed_highlight_pop, current_highlight_pop, alpha);
@@ -508,8 +504,8 @@ vec4 hook() {
 //!HEIGHT HOOKED.h 4 /
 //!DESC CelFlare Scorch Mask
 
-// Wide-net threshold for dense, smooth blur input. The size_gate and
-// occlusion mask in the expansion pass control the actual boundary.
+// Wide-net threshold for dense, smooth blur input. The occlusion mask
+// in the expansion pass controls the actual boundary.
 #define SCORCH_MASK_THRESH 0.86
 #define SCORCH_MASK_SPREAD 0.10
 
@@ -543,23 +539,47 @@ vec4 hook() {
 //!HEIGHT HOOKED.h 4 /
 //!DESC CelFlare Scorch Blur H
 
-#define SCORCH_SIGMA 80.0
-#define SCORCH_RADIUS 120
 #define SCORCH_BRIGHT_BIAS 4.0  // Bright samples weighted higher — prevents dark pull-down at occluder edges
 
 vec4 hook() {
+    // Stride-2 bilinear tap-merged Gaussian: sigma=80, radius=120
+    // Samples at odd offsets (1,3,5,...,119) merged as pairs via bilinear.
+    // 30 merged taps + center = 61 fetches (was 241).
+    const float go[30] = {
+        1.999688, 5.999063, 9.998438, 13.997813, 17.997188, 21.996563,
+        25.995938, 29.995313, 33.994688, 37.994063, 41.993438, 45.992813,
+        49.992188, 53.991563, 57.990938, 61.990313, 65.989688, 69.989063,
+        73.988438, 77.987813, 81.987188, 85.986563, 89.985938, 93.985314,
+        97.984689, 101.984064, 105.983439, 109.982814, 113.982189, 117.981565
+    };
+    const float gw[30] = {
+        1.99921900, 1.99422797, 1.98428327, 1.96945912, 1.94986572, 1.92564786,
+        1.89698315, 1.86407983, 1.82717428, 1.78652820, 1.74242547, 1.69516891,
+        1.64507680, 1.59247937, 1.53771511, 1.48112729, 1.42306035, 1.36385653,
+        1.30385257, 1.24337670, 1.18274574, 1.12226261, 1.06221402, 1.00286852,
+        0.94447486, 0.88726068, 0.83143156, 0.77717032, 0.72463673, 0.67396744
+    };
+
     float sum = 0.0;
     float wsum = 0.0;
     vec2 pt = CELFLARE_MASK_pt;
     vec2 pos = CELFLARE_MASK_pos;
 
-    for (int x = -SCORCH_RADIUS; x <= SCORCH_RADIUS; x++) {
-        float d = float(x);
-        float gw = exp(-0.5 * d * d / (SCORCH_SIGMA * SCORCH_SIGMA));
-        float s = CELFLARE_MASK_tex(pos + vec2(d * pt.x, 0.0)).r;
-        float w = gw * (1.0 + s * SCORCH_BRIGHT_BIAS);
-        sum += s * w;
-        wsum += w;
+    // Center tap
+    float s0 = CELFLARE_MASK_tex(pos).r;
+    float w0 = 1.0 + s0 * SCORCH_BRIGHT_BIAS;
+    sum += s0 * w0;
+    wsum += w0;
+
+    // Stride-2 bilinear-merged symmetric pairs — 61 fetches total
+    for (int i = 0; i < 30; i++) {
+        float g = gw[i];
+        float sp = CELFLARE_MASK_tex(pos + vec2(go[i] * pt.x, 0.0)).r;
+        float sn = CELFLARE_MASK_tex(pos - vec2(go[i] * pt.x, 0.0)).r;
+        float wp = g * (1.0 + sp * SCORCH_BRIGHT_BIAS);
+        float wn = g * (1.0 + sn * SCORCH_BRIGHT_BIAS);
+        sum += sp * wp + sn * wn;
+        wsum += wp + wn;
     }
 
     return vec4(sum / wsum, 0.0, 0.0, 1.0);
@@ -577,23 +597,45 @@ vec4 hook() {
 //!HEIGHT HOOKED.h 4 /
 //!DESC CelFlare Scorch Blur V
 
-#define SCORCH_SIGMA 80.0
-#define SCORCH_RADIUS 120
 #define SCORCH_BRIGHT_BIAS 4.0
 
 vec4 hook() {
+    // Stride-2 bilinear tap-merged Gaussian: sigma=80, radius=120
+    const float go[30] = {
+        1.999688, 5.999063, 9.998438, 13.997813, 17.997188, 21.996563,
+        25.995938, 29.995313, 33.994688, 37.994063, 41.993438, 45.992813,
+        49.992188, 53.991563, 57.990938, 61.990313, 65.989688, 69.989063,
+        73.988438, 77.987813, 81.987188, 85.986563, 89.985938, 93.985314,
+        97.984689, 101.984064, 105.983439, 109.982814, 113.982189, 117.981565
+    };
+    const float gw[30] = {
+        1.99921900, 1.99422797, 1.98428327, 1.96945912, 1.94986572, 1.92564786,
+        1.89698315, 1.86407983, 1.82717428, 1.78652820, 1.74242547, 1.69516891,
+        1.64507680, 1.59247937, 1.53771511, 1.48112729, 1.42306035, 1.36385653,
+        1.30385257, 1.24337670, 1.18274574, 1.12226261, 1.06221402, 1.00286852,
+        0.94447486, 0.88726068, 0.83143156, 0.77717032, 0.72463673, 0.67396744
+    };
+
     float sum = 0.0;
     float wsum = 0.0;
     vec2 pt = CELFLARE_BLUR_H_pt;
     vec2 pos = CELFLARE_BLUR_H_pos;
 
-    for (int y = -SCORCH_RADIUS; y <= SCORCH_RADIUS; y++) {
-        float d = float(y);
-        float gw = exp(-0.5 * d * d / (SCORCH_SIGMA * SCORCH_SIGMA));
-        float s = CELFLARE_BLUR_H_tex(pos + vec2(0.0, d * pt.y)).r;
-        float w = gw * (1.0 + s * SCORCH_BRIGHT_BIAS);
-        sum += s * w;
-        wsum += w;
+    // Center tap
+    float s0 = CELFLARE_BLUR_H_tex(pos).r;
+    float w0 = 1.0 + s0 * SCORCH_BRIGHT_BIAS;
+    sum += s0 * w0;
+    wsum += w0;
+
+    // Stride-2 bilinear-merged symmetric pairs — 61 fetches total
+    for (int i = 0; i < 30; i++) {
+        float g = gw[i];
+        float sp = CELFLARE_BLUR_H_tex(pos + vec2(0.0, go[i] * pt.y)).r;
+        float sn = CELFLARE_BLUR_H_tex(pos - vec2(0.0, go[i] * pt.y)).r;
+        float wp = g * (1.0 + sp * SCORCH_BRIGHT_BIAS);
+        float wn = g * (1.0 + sn * SCORCH_BRIGHT_BIAS);
+        sum += sp * wp + sn * wn;
+        wsum += wp + wn;
     }
 
     return vec4(sum / wsum, 0.0, 0.0, 1.0);
@@ -610,7 +652,8 @@ vec4 hook() {
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_SCORCH
-//!DESC CelFlare v3.1 (Scene-Adaptive SDR->HDR)
+//!DESC CelFlare v3.2 (Scene-Adaptive SDR->HDR)
+// CELFLARE_STATS: not sampled — barrier anchor ensuring Pass 1 SSBO writes complete
 
 // =============================================
 //  CHROMA — color processing features
@@ -685,16 +728,14 @@ vec4 hook() {
 //  glows brighter than edges. Cannot distinguish light sources from bright
 //  materials (snow, shirts).
 //
-//  Pipeline: mask pass (1/4 res, 25-tap averaged, wide-net threshold) →
-//  separable Gaussian blur → main pass reads blur_val as distance-from-edge
-//  gradient. Size gate rejects small regions. Occlusion mask rejects dark
-//  pixels (sharp, noise-free threshold on low luma).
+//  Pipeline: mask pass (1/4 res, averaged, wide-net threshold) →
+//  separable Gaussian blur → main pass reads blur_val² as distance-from-edge
+//  gradient. Occlusion mask rejects dark pixels (sharp, noise-free threshold
+//  on low luma).
 //
 #define ENABLE_SCORCH 1
 #define SCORCH_PEAK_BOOST   1.00    // Extra expansion at region center
 #define SCORCH_BLACK_CRUSH  0.15     // Crush low blur values — remaps [this..1] to [0..1]. Higher = less effect at edges.
-#define SCORCH_SIZE_FLOOR   0.30    // Blur value where size gate begins (raise to reject more small areas)
-#define SCORCH_SIZE_CEIL    0.60    // Blur value where size gate is full strength
 #define SCORCH_OCCLUDE_FLOOR 0.55   // Luma below this = dark occluder, fully rejected
 #define SCORCH_OCCLUDE_CEIL  0.80   // Luma above this = bright enough, full boost allowed
 #define SCORCH_SHUTOFF_BEGIN 0.65   // Start reducing at this screen fraction
@@ -831,7 +872,7 @@ float triangularNoise(vec2 p) {
 }
 
 // =============================================================================
-// OKLAB COLOR SPACE (Bjorn Ottosson, 2020)
+// OKLAB COLOR SPACE (Björn Ottosson, 2020)
 // =============================================================================
 
 float fast_cbrt(float x) {
@@ -886,7 +927,6 @@ vec4 hook() {
     // Read scene parameters from SSBO (current frame, barrier-protected)
     float highlight_peak = scene_highlight_peak;
     float exp_steepness = scene_exp_steepness;
-    float knee_end = scene_knee_end;
     float master_knee = scene_master_knee;
     int scene_type = int(scene_type_val);
     float exp_denom = scene_exp_denom;
@@ -1117,7 +1157,7 @@ vec4 hook() {
         float raw = blur_val * blur_val * occlusion * scorch_shutoff;
 
         // Smootherstep crush (C2, degree-5) — soften low end with wide banding-free toe.
-        float t = clamp((raw - SCORCH_BLACK_CRUSH) / (1.0 - SCORCH_BLACK_CRUSH), 0.0, 1.0);
+        float t = clamp((raw - SCORCH_BLACK_CRUSH) / max(1.0 - SCORCH_BLACK_CRUSH, 1e-6), 0.0, 1.0);
         raw = t*t*t*(t*(6.0*t - 15.0) + 10.0);
 
         expansion += SCORCH_PEAK_BOOST * raw;
@@ -1129,7 +1169,7 @@ vec4 hook() {
         float sd = CELFLARE_SCORCH_tex(CELFLARE_SCORCH_pos).r;
         float oc = smoothstep(SCORCH_OCCLUDE_FLOOR, SCORCH_OCCLUDE_CEIL, Y_decision);
         float boost = sd * sd * oc;
-        // Yellow = final boost, red = raw blur², green = occluded
+        // Yellow = raw blur² × occlusion (without shutoff/crush/peak scaling)
         return vec4(gamma709_to_pq2020(vec3(boost, boost * 0.6, 0.0)), 1.0);
     }
     #endif
@@ -1200,7 +1240,7 @@ vec4 hook() {
         if (HOOKED_pos.x > 0.75 && HOOKED_pos.y > 0.9) {
             float peak_norm = (highlight_peak - 1.5) / 2.0;
             float steep_norm = (exp_steepness - 1.5) / 2.5;
-            return vec4(gamma709_to_pq2020(vec3(peak_norm, steep_norm, knee_end)), 1.0);
+            return vec4(gamma709_to_pq2020(vec3(peak_norm, steep_norm, scene_knee_end)), 1.0);
         }
     #endif
 
@@ -1210,8 +1250,7 @@ vec4 hook() {
     vec3 oklab_exp = oklab_orig;
     float cbrt_exp = fast_cbrt(expansion);  // pow(x, 1/3) = linear RGB multiply equivalence
     oklab_exp.x *= cbrt_exp;
-    float base_chroma = cbrt_exp;
-    oklab_exp.yz *= base_chroma;
+    oklab_exp.yz *= cbrt_exp;
 
     #if ENABLE_SAT_BOOST
         float sat_boost = min(pow(max(expansion, 0.0), SAT_BOOST_EXPONENT), SAT_BOOST_MAX);
@@ -1296,7 +1335,7 @@ vec4 hook() {
 //
 // | SDR Gamma | Linear | Nits (@100) | PQ Output |
 // |-----------|--------|-------------|-----------|
-// | 1.00      | 1.00   | 100         | ~0.501    |
+// | 1.00      | 1.00   | 100         | ~0.508    |
 // | 0.78      | 0.57   | 57          | ~0.433    |
 // | 0.50      | 0.19   | 19          | ~0.328    |
 // | 0.25      | 0.04   | 4.0         | ~0.191    |

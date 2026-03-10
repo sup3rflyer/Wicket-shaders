@@ -30,6 +30,7 @@
 //!VAR float scene_exp_denom
 //!VAR float scene_intensity
 //!VAR float scene_apl_atten
+//!VAR float smoothed_scorch_frac
 //!STORAGE
 
 //!HOOK MAIN
@@ -154,8 +155,8 @@ vec4 hook() {
 //  CURVE_STEEPNESS Where the lift concentrates.
 //  MASTER_KNEE     Where expansion begins.
 //
-#define INTENSITY           1.4     // 0.5 subtle · 1.0 normal · 1.5+ aggressive
-#define CURVE_STEEPNESS     0.5     // 0.5 gentle (lifts mids) · 1.0 full adaptive · 1.5+ punchy highlights
+#define INTENSITY           1.2     // 0.5 subtle · 1.0 normal · 1.5+ aggressive
+#define CURVE_STEEPNESS     0.3     // 0.5 gentle (lifts mids) · 1.0 full adaptive · 1.5+ punchy highlights
 #define MASTER_KNEE_OFFSET  0.15    // Distance below knee where expansion starts. Larger = more dark pixels expanded
 
 // =============================================
@@ -173,6 +174,8 @@ vec4 hook() {
 
 // --- Shared with expansion pass (must match) ---
 #define EOTF_GAMMA 2.4
+#define SCORCH_THRESH_STATS 0.95    // Luma threshold for scorch_frac scene metric (shutoff)
+#define SCORCH_SPREAD_STATS 0.15    // Spread threshold for scorch_frac scene metric (shutoff)
 
 // --- Temporal Smoothing ---
 #define TEMPORAL_ALPHA 0.03
@@ -269,6 +272,7 @@ vec4 hook() {
     float luma_changed_count = 0.0;
     float chroma_changed_count = 0.0;
     float bright_above_knee = 0.0;
+    float scorch_count = 0.0;
 
     // Use smoothed log_avg for adaptive thresholds (linearized for consistency)
     float key_factor, adaptive_highlight_zone, relative_highlight;
@@ -327,6 +331,11 @@ vec4 hook() {
             if (frame > 0 && Y_linear >= scene_master_knee) bright_above_knee += 1.0;
             valid_samples += 1.0;
             chroma_sum += sqrt(cb_gamma * cb_gamma + cr_gamma * cr_gamma);
+            {
+                float sc_spread = max(max(rgb_sample_gamma.r, rgb_sample_gamma.g), rgb_sample_gamma.b)
+                                - min(min(rgb_sample_gamma.r, rgb_sample_gamma.g), rgb_sample_gamma.b);
+                if (Y_gamma > SCORCH_THRESH_STATS && sc_spread < SCORCH_SPREAD_STATS) scorch_count += 1.0;
+            }
             Y_sum += Y_linear;
             Y_log_sum += log(max(Y_linear, 0.0001));
             Y_min = min(Y_min, Y_linear);
@@ -349,6 +358,7 @@ vec4 hook() {
     float current_Y_min = stats_valid ? Y_min : smoothed_min;
     float current_avg_chroma = stats_valid ? chroma_sum / valid_samples : smoothed_avg_chroma;
     float current_bright_frac = (stats_valid && frame > 0) ? bright_above_knee / valid_samples : smoothed_bright_frac;
+    float current_scorch_frac = stats_valid ? scorch_count / valid_samples : smoothed_scorch_frac;
 
     // Block-based scene cut detection
     float luma_change_pct = luma_changed_count / total_samples;
@@ -380,6 +390,7 @@ vec4 hook() {
         smoothed_highlight_pop = current_highlight_pop;
         smoothed_avg_chroma = current_avg_chroma;
         smoothed_bright_frac = 0.0;
+        smoothed_scorch_frac = 0.0;
         scene_cut_lockout = 0.0;
     } else {
         smoothed_avg = mix(smoothed_avg, current_avg, alpha);
@@ -390,6 +401,7 @@ vec4 hook() {
         smoothed_highlight_pop = mix(smoothed_highlight_pop, current_highlight_pop, alpha);
         smoothed_avg_chroma = mix(smoothed_avg_chroma, current_avg_chroma, alpha);
         smoothed_bright_frac = mix(smoothed_bright_frac, current_bright_frac, alpha);
+        smoothed_scorch_frac = mix(smoothed_scorch_frac, current_scorch_frac, alpha);
     }
 
     // -----------------------------------------------------------------
@@ -484,7 +496,111 @@ vec4 hook() {
 }
 
 // =============================================================================
-// PASS 2: EXPANSION (full resolution)
+// PASS 2: SCORCH THRESHOLD MASK (1/4 resolution)
+// =============================================================================
+// 25-tap averaged soft mask of near-white pixels. Fed into separable Gaussian
+// blur to produce a distance-from-edge gradient for the Scorch hotspot.
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!SAVE CELFLARE_MASK
+//!WIDTH HOOKED.w 4 /
+//!HEIGHT HOOKED.h 4 /
+//!DESC CelFlare Scorch Mask
+
+// Wide-net threshold for dense, smooth blur input. The size_gate and
+// occlusion mask in the expansion pass control the actual boundary.
+#define SCORCH_MASK_THRESH 0.86
+#define SCORCH_MASK_SPREAD 0.10
+
+vec4 hook() {
+    // 5x5 box average (25 taps) at 1/4 res — crushes grain before thresholding.
+    const vec3 lc = vec3(0.2126, 0.7152, 0.0722);
+    vec2 px = HOOKED_pt * 1.8;
+    vec3 rgb = vec3(0.0);
+    for (int x = -2; x <= 2; x++) {
+        for (int y = -2; y <= 2; y++) {
+            rgb += HOOKED_tex(HOOKED_pos + vec2(x, y) * px).rgb;
+        }
+    }
+    rgb /= 25.0;
+    float Y = dot(rgb, lc);
+    float spread = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);
+    float mask = smoothstep(SCORCH_MASK_THRESH - 0.12, SCORCH_MASK_THRESH + 0.06, Y)
+               * (1.0 - smoothstep(SCORCH_MASK_SPREAD * 0.3, SCORCH_MASK_SPREAD * 1.2, spread));
+    return vec4(mask, 0.0, 0.0, 1.0);
+}
+
+// =============================================================================
+// PASS 3: SCORCH HORIZONTAL BLUR (1/4 resolution)
+// =============================================================================
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!BIND CELFLARE_MASK
+//!SAVE CELFLARE_BLUR_H
+//!WIDTH HOOKED.w 4 /
+//!HEIGHT HOOKED.h 4 /
+//!DESC CelFlare Scorch Blur H
+
+#define SCORCH_SIGMA 80.0
+#define SCORCH_RADIUS 120
+#define SCORCH_BRIGHT_BIAS 4.0  // Bright samples weighted higher — prevents dark pull-down at occluder edges
+
+vec4 hook() {
+    float sum = 0.0;
+    float wsum = 0.0;
+    vec2 pt = CELFLARE_MASK_pt;
+    vec2 pos = CELFLARE_MASK_pos;
+
+    for (int x = -SCORCH_RADIUS; x <= SCORCH_RADIUS; x++) {
+        float d = float(x);
+        float gw = exp(-0.5 * d * d / (SCORCH_SIGMA * SCORCH_SIGMA));
+        float s = CELFLARE_MASK_tex(pos + vec2(d * pt.x, 0.0)).r;
+        float w = gw * (1.0 + s * SCORCH_BRIGHT_BIAS);
+        sum += s * w;
+        wsum += w;
+    }
+
+    return vec4(sum / wsum, 0.0, 0.0, 1.0);
+}
+
+// =============================================================================
+// PASS 4: SCORCH VERTICAL BLUR (1/4 resolution)
+// =============================================================================
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!BIND CELFLARE_BLUR_H
+//!SAVE CELFLARE_SCORCH
+//!WIDTH HOOKED.w 4 /
+//!HEIGHT HOOKED.h 4 /
+//!DESC CelFlare Scorch Blur V
+
+#define SCORCH_SIGMA 80.0
+#define SCORCH_RADIUS 120
+#define SCORCH_BRIGHT_BIAS 4.0
+
+vec4 hook() {
+    float sum = 0.0;
+    float wsum = 0.0;
+    vec2 pt = CELFLARE_BLUR_H_pt;
+    vec2 pos = CELFLARE_BLUR_H_pos;
+
+    for (int y = -SCORCH_RADIUS; y <= SCORCH_RADIUS; y++) {
+        float d = float(y);
+        float gw = exp(-0.5 * d * d / (SCORCH_SIGMA * SCORCH_SIGMA));
+        float s = CELFLARE_BLUR_H_tex(pos + vec2(0.0, d * pt.y)).r;
+        float w = gw * (1.0 + s * SCORCH_BRIGHT_BIAS);
+        sum += s * w;
+        wsum += w;
+    }
+
+    return vec4(sum / wsum, 0.0, 0.0, 1.0);
+}
+
+// =============================================================================
+// PASS 5: EXPANSION (full resolution)
 // =============================================================================
 // Reads scene parameters from SCENE_STATE SSBO (guaranteed current-frame by
 // pipeline barrier after Pass 1). Applies per-pixel expansion and PQ encoding.
@@ -493,6 +609,7 @@ vec4 hook() {
 //!BIND HOOKED
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
+//!BIND CELFLARE_SCORCH
 //!DESC CelFlare v3.1 (Scene-Adaptive SDR->HDR)
 
 // =============================================
@@ -562,6 +679,27 @@ vec4 hook() {
 #define SAT_POWER           5.0     // Rolloff curve steepness
 #define SAT_ROLLOFF         0.80    // Max expansion reduction
 
+// --- Scorch — bright region hotspot ---
+//  Adds extra peak luminance to the interior of large near-white regions
+//  (sun, bright sky fills). Creates a natural hotspot gradient — center
+//  glows brighter than edges. Cannot distinguish light sources from bright
+//  materials (snow, shirts).
+//
+//  Pipeline: mask pass (1/4 res, 25-tap averaged, wide-net threshold) →
+//  separable Gaussian blur → main pass reads blur_val as distance-from-edge
+//  gradient. Size gate rejects small regions. Occlusion mask rejects dark
+//  pixels (sharp, noise-free threshold on low luma).
+//
+#define ENABLE_SCORCH 1
+#define SCORCH_PEAK_BOOST   1.00    // Extra expansion at region center
+#define SCORCH_BLACK_CRUSH  0.15     // Crush low blur values — remaps [this..1] to [0..1]. Higher = less effect at edges.
+#define SCORCH_SIZE_FLOOR   0.30    // Blur value where size gate begins (raise to reject more small areas)
+#define SCORCH_SIZE_CEIL    0.60    // Blur value where size gate is full strength
+#define SCORCH_OCCLUDE_FLOOR 0.55   // Luma below this = dark occluder, fully rejected
+#define SCORCH_OCCLUDE_CEIL  0.80   // Luma above this = bright enough, full boost allowed
+#define SCORCH_SHUTOFF_BEGIN 0.65   // Start reducing at this screen fraction
+#define SCORCH_SHUTOFF_END   0.75   // Fully off at this screen fraction
+
 // =============================================
 //  OUTPUT — encoding and post-processing
 // =============================================
@@ -614,6 +752,7 @@ vec4 hook() {
 #define DEBUG_SHOW_SAT_BOOST 0     // Show saturation boost amount
 #define DEBUG_SHOW_DITHER 0        // Show dither magnitude and pattern
 #define DEBUG_SHOW_WP 0            // Show warm tone protection (green=lift, red=attenuate)
+#define DEBUG_SHOW_SCORCH 0        // Show scorch depth map (yellow = hotspot region)
 
 // =============================================================================
 // HELPER FUNCTIONS
@@ -960,6 +1099,39 @@ vec4 hook() {
         float ps_w = wp_hue_w * ps_chroma_w * ps_bright_w * wp_gate;
         expansion = mix(expansion, 1.0, PS_COMPRESS * ps_w);
         float ps_sat = PS_SAT_BOOST * ps_w;
+    #endif
+
+    // -------------------------------------------------------------------------
+    // SCORCH — bright region hotspot
+    // -------------------------------------------------------------------------
+    #if ENABLE_SCORCH
+    {
+        float blur_val = CELFLARE_SCORCH_tex(CELFLARE_SCORCH_pos).r;
+
+        // Occlusion mask: reject dark occluders (trees, buildings against bright sky).
+        // Dark pixels have clean, noise-free luma — sharp threshold is stable.
+        float occlusion = smoothstep(SCORCH_OCCLUDE_FLOOR, SCORCH_OCCLUDE_CEIL, Y_decision);
+
+        float scorch_shutoff = 1.0 - smoothstep(SCORCH_SHUTOFF_BEGIN, SCORCH_SHUTOFF_END, smoothed_scorch_frac);
+        // blur_val² — natural center concentration, no threshold boundary.
+        float raw = blur_val * blur_val * occlusion * scorch_shutoff;
+
+        // Smootherstep crush (C2, degree-5) — soften low end with wide banding-free toe.
+        float t = clamp((raw - SCORCH_BLACK_CRUSH) / (1.0 - SCORCH_BLACK_CRUSH), 0.0, 1.0);
+        raw = t*t*t*(t*(6.0*t - 15.0) + 10.0);
+
+        expansion += SCORCH_PEAK_BOOST * raw;
+    }
+    #endif
+
+    #if DEBUG_SHOW_SCORCH
+    {
+        float sd = CELFLARE_SCORCH_tex(CELFLARE_SCORCH_pos).r;
+        float oc = smoothstep(SCORCH_OCCLUDE_FLOOR, SCORCH_OCCLUDE_CEIL, Y_decision);
+        float boost = sd * sd * oc;
+        // Yellow = final boost, red = raw blur², green = occluded
+        return vec4(gamma709_to_pq2020(vec3(boost, boost * 0.6, 0.0)), 1.0);
+    }
     #endif
 
     // -------------------------------------------------------------------------

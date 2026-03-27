@@ -1,52 +1,39 @@
-// CelFlare v3.2 — Scene-Adaptive SDR→HDR Highlight Expansion
+// CelFlare v4.0 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
-// You MUST set REFERENCE_WHITE to match your SDR white and hdr-reference-white in mpv.conf
+// Expansion driven by regional illumination context (bright-biased blur of
+// the luminance field) rather than per-pixel luminance. All pixels in a
+// region get the same expansion multiplier — local contrast preserved by
+// construction via multiplicative application.
 //
-// Main tuning controls (INTENSITY, CURVE_STEEPNESS) are below the
-// grain pre-filter pass. Search for "MAIN TUNING" to jump there.
+// You MUST set REFERENCE_WHITE to match your SDR white and hdr-reference-white
+// in mpv.conf.
 //
-// Chroma and output settings are in the expansion pass further down.
-// Search for "CHROMA" or "OUTPUT" to find them.
+// Search for "MAIN TUNING" in the expansion pass for user-facing controls.
 
 //!BUFFER SCENE_STATE
-//!VAR float smoothed_avg
-//!VAR float smoothed_max
-//!VAR float smoothed_log_avg
-//!VAR float smoothed_contrast
-//!VAR float smoothed_highlight_pop
-//!VAR float scene_cut_lockout
-//!VAR float prev_luma[96]
-//!VAR float prev_cb[96]
-//!VAR float prev_cr[96]
-//!VAR float scene_highlight_peak
-//!VAR float scene_exp_steepness
-//!VAR float scene_knee_end
-//!VAR float scene_master_knee
-//!VAR float scene_type_val
-//!VAR float smoothed_avg_chroma
 //!VAR float smoothed_bright_frac
-//!VAR float scene_exp_denom
-//!VAR float scene_intensity
-//!VAR float scene_apl_atten
 //!VAR float smoothed_scorch_frac
+//!VAR float smoothed_contrast
+//!VAR float smoothed_log_avg
+//!VAR float scene_cut_lockout
+//!VAR float prev_illum[16]
 //!STORAGE
 
 //!HOOK MAIN
 //!BIND HOOKED
-//!DESC CelFlare Grain Pre-filter
+//!DESC CelFlare: Grain Pre-filter
 
-// --- Grain pre-filter internals (not user-facing) ---
 #define STABILIZE_OPACITY   0.85
 #define GRAIN_THRESHOLD     0.28
-#define GRAIN_BLUR_RADIUS   14.0
+#define GRAIN_BLUR_RADIUS   24.0
 #define GRAIN_RANGE_MIN     0.35
 #define GRAIN_RANGE_MAX     0.95
 #define GRAIN_EDGE_LOW      0.20
 #define GRAIN_EDGE_HIGH     0.45
-#define GRAIN_EARLY_EXIT    0.25    // Must match EARLY_EXIT_GAMMA in expansion pass
-#define BILATERAL_SHARPNESS 4.8
-#define INNER_RING_BOOST    2.0
+#define GRAIN_EARLY_EXIT    0.25
+#define BILATERAL_SHARPNESS 6.0
+#define INNER_RING_BOOST    3.0
 
 vec4 hook() {
     vec4 original = HOOKED_tex(HOOKED_pos);
@@ -74,9 +61,8 @@ vec4 hook() {
         vec2(-1.000, 0.000), vec2(-0.500, -0.866), vec2( 0.500, -0.866)
     );
 
-    const vec2 inner[6] = vec2[6](
-        vec2( 0.866, 0.500), vec2( 0.000, 1.000), vec2(-0.866, 0.500),
-        vec2(-0.866, -0.500), vec2( 0.000, -1.000), vec2( 0.866, -0.500)
+    const vec2 inner[3] = vec2[3](
+        vec2( 0.866, 0.500), vec2(-0.866, 0.500), vec2( 0.000, -1.000)
     );
 
     float asym_scale = mix(1.0, 7.0, smoothstep(0.55, 0.98, Y_gamma));
@@ -112,7 +98,7 @@ vec4 hook() {
     gx *= inv_grad_w;
     gy *= inv_grad_w;
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 3; i++) {
         vec2 h = inner[i];
         rotated = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
         offset = HOOKED_pt * GRAIN_BLUR_RADIUS * 0.5 * rotated;
@@ -138,661 +124,395 @@ vec4 hook() {
     return vec4(original.rgb, Y_decision);
 }
 
+// =============================================================================
+// PASS 2: LUMINANCE DOWNSAMPLE (1/4 resolution)
+// =============================================================================
+// 4-tap bilinear from RAW pixel luma (.rgb), not grain-stabilized alpha.
+// The illumination field is blurred at sigma=25 on 1/4 res — grain is
+// destroyed by the Gaussian. Using stabilized alpha leaked the bilateral
+// pre-filter's asymmetric rejection as visible outlines at feature edges.
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!SAVE CELFLARE_DS
+//!WIDTH HOOKED.w 4 /
+//!HEIGHT HOOKED.h 4 /
+//!DESC CelFlare: Downsample 1/4
+
+vec4 hook() {
+    const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
+    vec2 pt = HOOKED_pt;
+    float Y  = dot(HOOKED_tex(HOOKED_pos + vec2(-pt.x, -pt.y)).rgb, luma_coeff);
+    Y       += dot(HOOKED_tex(HOOKED_pos + vec2( pt.x, -pt.y)).rgb, luma_coeff);
+    Y       += dot(HOOKED_tex(HOOKED_pos + vec2(-pt.x,  pt.y)).rgb, luma_coeff);
+    Y       += dot(HOOKED_tex(HOOKED_pos + vec2( pt.x,  pt.y)).rgb, luma_coeff);
+    Y *= 0.25;
+    return vec4(Y, 0.0, 0.0, 1.0);
+}
+
+// =============================================================================
+// PASS 3: ILLUMINATION BLUR H (1/4 resolution)
+// =============================================================================
+// Separable Gaussian. sigma=20 at 1/4 res = effective ~80px at 1080p full
+// res. BRIGHT_BIAS must be 0 for correct separability — any nonzero value
+// makes weights data-dependent, creating visible outline artifacts at every
+// bright/dark boundary. The halo guard in the expansion pass handles
+// boundary protection instead.
+
+//!HOOK MAIN
+//!BIND CELFLARE_DS
+//!SAVE CELFLARE_BLUR_H
+//!WIDTH CELFLARE_DS.w
+//!HEIGHT CELFLARE_DS.h
+//!DESC CelFlare: Illumination Blur H
+
+// sigma=20, radius=40, stride=2 bilinear tap merging (20 pairs, 41 fetches)
+
+vec4 hook() {
+    const float go[20] = {
+        1.4990625011, 3.4978125140, 5.4965625542, 7.4953126373,
+        9.4940627791, 11.4928129950, 13.4915633008, 15.4903137120,
+        17.4890642443, 19.4878149131, 21.4865657342, 23.4853167231,
+        25.4840678954, 27.4828192666, 29.4815708524, 31.4803226681,
+        33.4790747295, 35.4778270520, 37.4765796511, 39.4753325423
+    };
+    const float gw[20] = {
+        1.9937632601, 1.9690117179, 1.9252307163, 1.8637044098,
+        1.7862039805, 1.6949029750, 1.5922761869, 1.4809886391,
+        1.3637815864, 1.2433622741, 1.1223035003, 1.0029579299,
+        0.8873907200, 0.7773324819, 0.6741530676, 0.5788552548,
+        0.4920862280, 0.4141638659, 0.3451143082, 0.2847170585
+    };
+
+    // Precomputed: 1.0 + 2.0 * sum(gw[]) = 47.98460032
+    #define BLUR_INV_WSUM 0.02084002
+
+    vec2 pt = CELFLARE_DS_pt;
+    vec2 pos = CELFLARE_DS_pos;
+
+    float s0 = CELFLARE_DS_tex(pos).r;
+    float sum = s0;
+
+    for (int i = 0; i < 20; i++) {
+        float sp = CELFLARE_DS_tex(pos + vec2(go[i] * pt.x, 0.0)).r;
+        float sn = CELFLARE_DS_tex(pos - vec2(go[i] * pt.x, 0.0)).r;
+        sum += (sp + sn) * gw[i];
+    }
+
+    return vec4(sum * BLUR_INV_WSUM, 0.0, 0.0, 1.0);
+}
+
+// =============================================================================
+// PASS 4: ILLUMINATION BLUR V (1/4 resolution)
+// =============================================================================
+
+//!HOOK MAIN
+//!BIND CELFLARE_BLUR_H
+//!SAVE CELFLARE_ILLUM
+//!WIDTH CELFLARE_BLUR_H.w
+//!HEIGHT CELFLARE_BLUR_H.h
+//!DESC CelFlare: Illumination Blur V
+
+vec4 hook() {
+    const float go[20] = {
+        1.4990625011, 3.4978125140, 5.4965625542, 7.4953126373,
+        9.4940627791, 11.4928129950, 13.4915633008, 15.4903137120,
+        17.4890642443, 19.4878149131, 21.4865657342, 23.4853167231,
+        25.4840678954, 27.4828192666, 29.4815708524, 31.4803226681,
+        33.4790747295, 35.4778270520, 37.4765796511, 39.4753325423
+    };
+    const float gw[20] = {
+        1.9937632601, 1.9690117179, 1.9252307163, 1.8637044098,
+        1.7862039805, 1.6949029750, 1.5922761869, 1.4809886391,
+        1.3637815864, 1.2433622741, 1.1223035003, 1.0029579299,
+        0.8873907200, 0.7773324819, 0.6741530676, 0.5788552548,
+        0.4920862280, 0.4141638659, 0.3451143082, 0.2847170585
+    };
+
+    // Precomputed: 1.0 + 2.0 * sum(gw[]) = 47.98460032
+    #define BLUR_INV_WSUM 0.02084002
+
+    vec2 pt = CELFLARE_BLUR_H_pt;
+    vec2 pos = CELFLARE_BLUR_H_pos;
+
+    float s0 = CELFLARE_BLUR_H_tex(pos).r;
+    float sum = s0;
+
+    for (int i = 0; i < 20; i++) {
+        float sp = CELFLARE_BLUR_H_tex(pos + vec2(0.0, go[i] * pt.y)).r;
+        float sn = CELFLARE_BLUR_H_tex(pos - vec2(0.0, go[i] * pt.y)).r;
+        sum += (sp + sn) * gw[i];
+    }
+
+    return vec4(sum * BLUR_INV_WSUM, 0.0, 0.0, 1.0);
+}
+
+// =============================================================================
+// PASS 5: FRAME STATS (1x1 render pass)
+// =============================================================================
+// Samples illumination field at 4x4 grid. Computes frame-level metrics that
+// modulate the expansion curve: average illumination, bright fraction (replaces
+// the entire 7-type scene classifier from v3.2), and scene cut detection.
+
 //!HOOK MAIN
 //!BIND HOOKED
 //!BIND SCENE_STATE
+//!BIND CELFLARE_ILLUM
 //!SAVE CELFLARE_STATS
 //!WIDTH 1
 //!HEIGHT 1
-//!DESC CelFlare Scene Analysis
+//!DESC CelFlare: Frame Stats
 
-// =============================================
-//  MAIN TUNING — start here
-// =============================================
-//
-//  INTENSITY       How much highlights are lifted.
-//  CURVE_STEEPNESS Where the lift concentrates.
-//  MASTER_KNEE     Where expansion begins.
-//
-#define INTENSITY           1.2     // 0.5 subtle · 1.0 normal · 1.5+ aggressive
-#define CURVE_STEEPNESS     0.3     // 0.5 gentle (lifts mids) · 1.0 full adaptive · 1.5+ punchy highlights
-#define MASTER_KNEE_OFFSET  0.0	    // Distance below knee where expansion starts. Larger = more dark pixels expanded
+#define KNEE            0.40
+#define ENABLE_SCORCH   0
+#define SCORCH_THRESH   0.80
 
-// =============================================
-//  DYNAMIC INTENSITY — per-scene adaptation
-// =============================================
-//  Scales INTENSITY by scene contrast. Flat/pastel scenes get less,
-//  dramatic high-contrast scenes get more. Disable for fixed strength.
-//
-#define ENABLE_DYNAMIC_INTENSITY 1
-#define DYN_INTENSITY_LOW   0.70    // Floor — flat/low-contrast scenes
-#define DYN_INTENSITY_HIGH  1.25    // Ceiling — high-contrast/dramatic scenes
-#define DYN_CONTRAST_LOW    3.5     // Contrast floor (stops)
-#define DYN_CONTRAST_HIGH   6.0     // Contrast ceiling (stops)
-#define DYN_APL_ATTEN       0.70    // Bright-scene dampening (0.70 = 30% reduction at peak brightness)
-
-// --- Shared with expansion pass (must match) ---
-#define EOTF_GAMMA 2.4
-#define SCORCH_THRESH_STATS 0.95    // Luma threshold for scorch_frac scene metric (shutoff)
-#define SCORCH_SPREAD_STATS 0.15    // Spread threshold for scorch_frac scene metric (shutoff)
-
-// --- Temporal Smoothing ---
-#define TEMPORAL_ALPHA 0.03
+#define TEMPORAL_ALPHA      0.03
 #define TEMPORAL_ALPHA_FAST 0.9
+#define LOCKOUT_FRAMES      6.0
+#define ILLUM_CHANGE_THRESH 0.06
+#define SCENE_CUT_PCT       0.50
 
-// --- Scene Cut Detection ---
-#define BLOCK_LUMA_THRESH 0.09
-#define BLOCK_CHROMA_THRESH 0.04
-#define BLOCK_CHROMA_THRESH_SQ (BLOCK_CHROMA_THRESH * BLOCK_CHROMA_THRESH)
-#define BLOCK_CHANGE_PCT 0.55
-#define LOCKOUT_FRAMES 6.0
-
-// --- Scene Sampling ---
-#define SAMPLE_COLS 12
-#define SAMPLE_ROWS 8
-
-// --- Brightness Classification ---
-#define KEY_DARK 0.022
-#define KEY_BRIGHT 0.065
-#define KEY_VERY_BRIGHT 0.32
-
-// --- Contrast Classification ---
-#define CONTRAST_LOW_DARK 2.0
-#define CONTRAST_LOW_BRIGHT 2.0
-#define CONTRAST_HIGH_DARK 3.25
-#define CONTRAST_HIGH_BRIGHT 4.2
-
-// --- Specular Detection ---
-#define HIGHLIGHT_ZONE_DARK 0.22
-#define HIGHLIGHT_ZONE_BRIGHT 0.40
-#define SPECULAR_THRESH_DARK 0.065
-#define SPECULAR_THRESH_BRIGHT 0.22
-#define SPECULAR_RELATIVE_FACTOR 2.0
-
-// --- Expansion Curves by Scene Type ---
-#define PEAK_DARK_SPECULAR 2.3
-#define STEEP_DARK_SPECULAR 4.0
-#define KNEE_DARK_SPECULAR 0.35
-
-#define PEAK_DARK_MOODY 1.9
-#define STEEP_DARK_MOODY 2.8
-#define KNEE_DARK_MOODY 0.30
-
-#define PEAK_BRIGHT_SPECULAR 2.1
-#define STEEP_BRIGHT_SPECULAR 6.0
-#define KNEE_BRIGHT_SPECULAR 0.45
-
-#define PEAK_BRIGHT_FLAT 2.0
-#define STEEP_BRIGHT_FLAT 7.0
-#define KNEE_BRIGHT_FLAT 0.45
-
-#define PEAK_HIGH_CONTRAST 2.2
-#define STEEP_HIGH_CONTRAST 3.8
-#define KNEE_HIGH_CONTRAST 0.35
-
-#define PEAK_DEFAULT 2.0
-#define STEEP_DEFAULT 3.2
-#define KNEE_DEFAULT 0.45
-
-#define PEAK_VERY_BRIGHT 1.9
-#define STEEP_VERY_BRIGHT 10.0
-#define KNEE_VERY_BRIGHT 0.50
-
-// Scene type constants
-#define SCENE_DARK_SPECULAR 0
-#define SCENE_DARK_MOODY 1
-#define SCENE_BRIGHT_SPECULAR 2
-#define SCENE_BRIGHT_FLAT 3
-#define SCENE_HIGH_CONTRAST 4
-#define SCENE_DEFAULT 5
-#define SCENE_VERY_BRIGHT 6
-
-// --- Helpers ---
 float get_luma(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
 
-vec3 eotf_gamma(vec3 v) {
-    return pow(max(v, 0.0), vec3(EOTF_GAMMA));
-}
-
-float eotf_gamma(float v) {
-    return pow(max(v, 0.0), EOTF_GAMMA);
-}
-
 vec4 hook() {
-    float Y_sum = 0.0;
-    float Y_log_sum = 0.0;
-    float Y_min = 1.0;
-    float Y_max = 0.0;
-    float highlight_count = 0.0;
-    float valid_samples = 0.0;
-    float chroma_sum = 0.0;
-    float luma_changed_count = 0.0;
-    float chroma_changed_count = 0.0;
-    float bright_above_knee = 0.0;
+    float illum_sum = 0.0;
+    float bright_count = 0.0;
+    float change_count = 0.0;
+    float illum_min = 1.0;
+    float illum_max = 0.0;
+    float log_luma_sum = 0.0;
+    int valid_luma = 0;
+    #if ENABLE_SCORCH
     float scorch_count = 0.0;
+    #endif
 
-    // Use smoothed log_avg for adaptive thresholds (linearized for consistency)
-    float key_factor, adaptive_highlight_zone, relative_highlight;
-    if (frame > 0) {
-        key_factor = smoothstep(KEY_DARK, KEY_BRIGHT, smoothed_log_avg);
-        adaptive_highlight_zone = mix(HIGHLIGHT_ZONE_DARK, HIGHLIGHT_ZONE_BRIGHT, key_factor);
-        relative_highlight = smoothed_avg * SPECULAR_RELATIVE_FACTOR;
-    } else {
-        key_factor = 0.5;
-        adaptive_highlight_zone = mix(HIGHLIGHT_ZONE_DARK, HIGHLIGHT_ZONE_BRIGHT, 0.5);
-        relative_highlight = 0.5;
-    }
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            int idx = y * 4 + x;
+            vec2 spos = vec2((float(x) + 0.5) / 4.0,
+                             (float(y) + 0.5) / 4.0);
 
-    float total_samples = float(SAMPLE_COLS * SAMPLE_ROWS);
+            float illum = CELFLARE_ILLUM_tex(spos).r;
+            illum_sum += illum;
+            illum_min = min(illum_min, illum);
+            illum_max = max(illum_max, illum);
 
-    // Sample and compare to previous frame
-    for (int y = 0; y < SAMPLE_ROWS; y++) {
-        for (int x = 0; x < SAMPLE_COLS; x++) {
-            int idx = y * SAMPLE_COLS + x;
-            vec2 spos = vec2((float(x) + 0.5) / float(SAMPLE_COLS),
-                             (float(y) + 0.5) / float(SAMPLE_ROWS));
+            if (illum > KNEE) bright_count += 1.0;
+            #if ENABLE_SCORCH
+            if (illum > SCORCH_THRESH) scorch_count += 1.0;
+            #endif
 
-            vec3 rgb_sample_gamma = HOOKED_tex(spos).rgb;
-            float Y_gamma = get_luma(rgb_sample_gamma);
-
-            float cb_gamma = rgb_sample_gamma.b - Y_gamma;
-            float cr_gamma = rgb_sample_gamma.r - Y_gamma;
-
-            // Scene cut detection on ALL 96 samples (including black bars)
             if (frame > 0) {
-                float luma_diff = abs(Y_gamma - prev_luma[idx]);
-                float cb_diff = cb_gamma - prev_cb[idx];
-                float cr_diff = cr_gamma - prev_cr[idx];
-                float chroma_diff_sq = cb_diff * cb_diff + cr_diff * cr_diff;
-
-                if (luma_diff > BLOCK_LUMA_THRESH) {
-                    luma_changed_count += 1.0;
-                }
-                if (chroma_diff_sq > BLOCK_CHROMA_THRESH_SQ) {
-                    chroma_changed_count += 1.0;
-                }
+                if (abs(illum - prev_illum[idx]) > ILLUM_CHANGE_THRESH)
+                    change_count += 1.0;
             }
+            prev_illum[idx] = illum;
 
-            // Store gamma values for next frame
-            prev_luma[idx] = Y_gamma;
-            prev_cb[idx] = cb_gamma;
-            prev_cr[idx] = cr_gamma;
-
-            // Linearize for statistics
-            vec3 rgb_sample_linear = eotf_gamma(rgb_sample_gamma);
-            float Y_linear = get_luma(rgb_sample_linear);
-
-            // Black bar exclusion
-            if (Y_linear < 0.001) continue;
-
-            if (frame > 0 && Y_linear >= scene_master_knee) bright_above_knee += 1.0;
-            valid_samples += 1.0;
-            chroma_sum += sqrt(cb_gamma * cb_gamma + cr_gamma * cr_gamma);
-            {
-                float sc_spread = max(max(rgb_sample_gamma.r, rgb_sample_gamma.g), rgb_sample_gamma.b)
-                                - min(min(rgb_sample_gamma.r, rgb_sample_gamma.g), rgb_sample_gamma.b);
-                if (Y_gamma > SCORCH_THRESH_STATS && sc_spread < SCORCH_SPREAD_STATS) scorch_count += 1.0;
-            }
-            Y_sum += Y_linear;
-            Y_log_sum += log(max(Y_linear, 0.0001));
-            Y_min = min(Y_min, Y_linear);
-            Y_max = max(Y_max, Y_linear);
-
-            if (Y_linear >= adaptive_highlight_zone && Y_linear > relative_highlight) {
-                highlight_count += 1.0;
+            // Log-average from source pixels (skip black bars)
+            vec3 rgb = HOOKED_tex(spos).rgb;
+            float Y = get_luma(rgb);
+            if (Y > 0.001) {
+                log_luma_sum += log(max(Y, 1e-6));
+                valid_luma++;
             }
         }
     }
 
-    // If too few valid samples (>75% black bars), keep previous frame's smoothed stats
-    bool stats_valid = valid_samples >= 24.0;
+    float avg_illum = illum_sum / 16.0;
+    float bright_frac = bright_count / 16.0;
 
-    float current_avg = stats_valid ? Y_sum / valid_samples : smoothed_avg;
-    float current_log_avg = stats_valid ? exp(Y_log_sum / valid_samples) : smoothed_log_avg;
-    float current_highlight_pop = stats_valid ? highlight_count / valid_samples : smoothed_highlight_pop;
-    float current_contrast = stats_valid ? log2(max(Y_max, 0.001) / max(Y_min, 0.001)) : smoothed_contrast;
-    float current_Y_max = stats_valid ? Y_max : smoothed_max;
-    float current_avg_chroma = stats_valid ? chroma_sum / valid_samples : smoothed_avg_chroma;
-    float current_bright_frac = (stats_valid && frame > 0) ? bright_above_knee / valid_samples : smoothed_bright_frac;
-    float current_scorch_frac = stats_valid ? scorch_count / valid_samples : smoothed_scorch_frac;
+    // Contrast: dynamic range from illumination field (stable, noise-free)
+    float contrast = (illum_min > 0.001)
+        ? log2(max(illum_max / illum_min, 1.0))
+        : 0.0;
 
-    // Block-based scene cut detection
-    float luma_change_pct = luma_changed_count / total_samples;
-    float chroma_change_pct = chroma_changed_count / total_samples;
+    // Log-average: perceptual brightness key from source pixels
+    float log_avg = (valid_luma > 4)
+        ? exp(log_luma_sum / float(valid_luma))
+        : avg_illum;
 
+    // Scene cut detection
     scene_cut_lockout = max(scene_cut_lockout - 1.0, 0.0);
+    float change_pct = change_count / 16.0;
+    bool scene_cut = (change_pct > SCENE_CUT_PCT) && (scene_cut_lockout <= 0.0);
 
-    // B&W scene cut fallback
-    bool is_bw = current_avg_chroma < 0.02;
-    bool scene_cut = is_bw
-        ? (luma_change_pct > BLOCK_CHANGE_PCT) && (scene_cut_lockout <= 0.0)
-        : (luma_change_pct > BLOCK_CHANGE_PCT) &&
-          (chroma_change_pct > BLOCK_CHANGE_PCT) &&
-          (scene_cut_lockout <= 0.0);
+    if (scene_cut) scene_cut_lockout = LOCKOUT_FRAMES;
 
-    if (scene_cut) {
-        scene_cut_lockout = LOCKOUT_FRAMES;
-    }
-
-    // Fast adaptation during scene cut AND lockout period
-    float alpha = (scene_cut || scene_cut_lockout > 0.0) ? TEMPORAL_ALPHA_FAST : TEMPORAL_ALPHA;
+    float alpha = (scene_cut || scene_cut_lockout > 0.0)
+                  ? TEMPORAL_ALPHA_FAST : TEMPORAL_ALPHA;
 
     if (frame == 0) {
-        smoothed_avg = current_avg;
-        smoothed_max = current_Y_max;
-        smoothed_log_avg = current_log_avg;
-        smoothed_contrast = current_contrast;
-        smoothed_highlight_pop = current_highlight_pop;
-        smoothed_avg_chroma = current_avg_chroma;
         smoothed_bright_frac = 0.0;
-        smoothed_scorch_frac = 0.0;
+        smoothed_contrast = contrast;
+        smoothed_log_avg = log_avg;
         scene_cut_lockout = 0.0;
+        #if ENABLE_SCORCH
+        smoothed_scorch_frac = 0.0;
+        #endif
     } else {
-        smoothed_avg = mix(smoothed_avg, current_avg, alpha);
-        smoothed_max = mix(smoothed_max, current_Y_max, alpha);
-        smoothed_log_avg = mix(smoothed_log_avg, current_log_avg, alpha);
-        smoothed_contrast = mix(smoothed_contrast, current_contrast, alpha);
-        smoothed_highlight_pop = mix(smoothed_highlight_pop, current_highlight_pop, alpha);
-        smoothed_avg_chroma = mix(smoothed_avg_chroma, current_avg_chroma, alpha);
-        smoothed_bright_frac = mix(smoothed_bright_frac, current_bright_frac, alpha);
-        smoothed_scorch_frac = mix(smoothed_scorch_frac, current_scorch_frac, alpha);
+        smoothed_bright_frac = mix(smoothed_bright_frac, bright_frac, alpha);
+        smoothed_contrast = mix(smoothed_contrast, contrast, alpha);
+        smoothed_log_avg = mix(smoothed_log_avg, log_avg, alpha);
+        #if ENABLE_SCORCH
+        float scorch_frac = scorch_count / 16.0;
+        smoothed_scorch_frac = mix(smoothed_scorch_frac, scorch_frac, alpha);
+        #endif
     }
-
-    // -----------------------------------------------------------------
-    // SCENE CLASSIFICATION
-    // -----------------------------------------------------------------
-    float key = smoothed_log_avg;
-    float contrast = smoothed_contrast;
-
-    float key_factor_spec = smoothstep(KEY_DARK, KEY_BRIGHT, key);
-    float adaptive_spec_threshold = mix(SPECULAR_THRESH_DARK, SPECULAR_THRESH_BRIGHT, key_factor_spec);
-
-    float spec_blend_width = adaptive_spec_threshold * 0.5;
-    float specular_factor = smoothstep(
-        adaptive_spec_threshold - spec_blend_width,
-        adaptive_spec_threshold + spec_blend_width,
-        smoothed_highlight_pop
-    );
-
-    float brightness_factor = smoothstep(KEY_DARK, KEY_BRIGHT, key);
-    float very_bright_factor = smoothstep(KEY_BRIGHT, KEY_VERY_BRIGHT, key);
-
-    float adaptive_contrast_low = mix(CONTRAST_LOW_DARK, CONTRAST_LOW_BRIGHT, brightness_factor);
-    float adaptive_contrast_high = mix(CONTRAST_HIGH_DARK, CONTRAST_HIGH_BRIGHT, brightness_factor);
-
-    float contrast_factor = smoothstep(adaptive_contrast_low - 1.0, adaptive_contrast_low + 1.0, contrast);
-    float high_contrast_factor = smoothstep(adaptive_contrast_high - 1.0, adaptive_contrast_high + 1.0, contrast);
-
-    // Dark treatment
-    float dark_peak = mix(PEAK_DARK_MOODY, PEAK_DARK_SPECULAR, specular_factor);
-    float dark_steep = mix(STEEP_DARK_MOODY, STEEP_DARK_SPECULAR, specular_factor);
-    float dark_knee = mix(KNEE_DARK_MOODY, KNEE_DARK_SPECULAR, specular_factor);
-
-    // Bright treatment
-    float bright_base_peak = mix(PEAK_BRIGHT_FLAT, PEAK_DEFAULT, contrast_factor);
-    float bright_base_steep = mix(STEEP_BRIGHT_FLAT, STEEP_DEFAULT, contrast_factor);
-    float bright_base_knee = mix(KNEE_BRIGHT_FLAT, KNEE_DEFAULT, contrast_factor);
-
-    float bright_peak = mix(bright_base_peak, PEAK_BRIGHT_SPECULAR, specular_factor);
-    float bright_steep = mix(bright_base_steep, STEEP_BRIGHT_SPECULAR, specular_factor);
-    float bright_knee = mix(bright_base_knee, KNEE_BRIGHT_SPECULAR, specular_factor);
-
-    // Dark <-> Bright blend
-    float base_peak = mix(dark_peak, bright_peak, brightness_factor);
-    float base_steep = mix(dark_steep, bright_steep, brightness_factor);
-    float base_knee = mix(dark_knee, bright_knee, brightness_factor);
-
-    // High contrast blend
-    float pre_vb_peak = mix(base_peak, PEAK_HIGH_CONTRAST, high_contrast_factor);
-    float pre_vb_steep = mix(base_steep, STEEP_HIGH_CONTRAST, high_contrast_factor);
-    float pre_vb_knee = mix(base_knee, KNEE_HIGH_CONTRAST, high_contrast_factor);
-
-    // Very bright blend
-    float computed_peak = mix(pre_vb_peak, PEAK_VERY_BRIGHT, very_bright_factor);
-    float computed_steep = mix(pre_vb_steep, STEEP_VERY_BRIGHT, very_bright_factor);
-    float computed_knee = mix(pre_vb_knee, KNEE_VERY_BRIGHT, very_bright_factor);
-    float computed_master = max(computed_knee - MASTER_KNEE_OFFSET, 0.05);
-    float computed_exp_denom = exp(min(computed_steep * CURVE_STEEPNESS, 20.0)) - 1.0;
-
-    // Scene type for debug visualization
-    float st = float(SCENE_DEFAULT);
-    if (very_bright_factor > 0.5) {
-        st = float(SCENE_VERY_BRIGHT);
-    } else if (brightness_factor < 0.3) {
-        st = (specular_factor > 0.5) ? float(SCENE_DARK_SPECULAR) : float(SCENE_DARK_MOODY);
-    } else if (brightness_factor > 0.7) {
-        if (specular_factor > 0.5) st = float(SCENE_BRIGHT_SPECULAR);
-        else if (contrast_factor < 0.5) st = float(SCENE_BRIGHT_FLAT);
-    } else if (high_contrast_factor > 0.5) {
-        st = float(SCENE_HIGH_CONTRAST);
-    }
-
-    // Precompute intensity (scene-level; per-pixel APL attenuation applied in Pass 3)
-    #if ENABLE_DYNAMIC_INTENSITY
-        float dyn_factor = smoothstep(DYN_CONTRAST_LOW, DYN_CONTRAST_HIGH, smoothed_contrast);
-        float dyn_intensity = mix(DYN_INTENSITY_LOW, DYN_INTENSITY_HIGH, dyn_factor);
-        scene_intensity = dyn_intensity * INTENSITY;
-        scene_apl_atten = mix(1.0, DYN_APL_ATTEN, smoothstep(KEY_BRIGHT, KEY_VERY_BRIGHT, smoothed_log_avg));
-    #else
-        scene_intensity = INTENSITY;
-        scene_apl_atten = 1.0;
-    #endif
-
-    // Write scene parameters to SSBO (barrier before Pass 3 guarantees visibility)
-    scene_highlight_peak = computed_peak;
-    scene_exp_steepness = min(computed_steep * CURVE_STEEPNESS, 20.0);
-    scene_knee_end = computed_knee;
-    scene_master_knee = computed_master;
-    scene_type_val = st;
-    scene_exp_denom = computed_exp_denom;
 
     return vec4(0);
 }
 
 // =============================================================================
-// PASS 2: SCORCH THRESHOLD MASK (1/4 resolution)
+// PASS 6: ILLUMINATION EXPANSION (full resolution)
 // =============================================================================
-// 25-tap averaged soft mask of near-white pixels. Fed into separable Gaussian
-// blur to produce a distance-from-edge gradient for the Scorch hotspot.
-
-//!HOOK MAIN
-//!BIND HOOKED
-//!SAVE CELFLARE_MASK
-//!WIDTH HOOKED.w 4 /
-//!HEIGHT HOOKED.h 4 /
-//!DESC CelFlare Scorch Mask
-
-// Wide-net threshold for dense, smooth blur input. The occlusion mask
-// in the expansion pass controls the actual boundary.
-#define SCORCH_MASK_THRESH 0.86
-#define SCORCH_MASK_SPREAD 0.10
-
-vec4 hook() {
-    // 5x5 box average (25 taps) at 1/4 res — crushes grain before thresholding.
-    const vec3 lc = vec3(0.2126, 0.7152, 0.0722);
-    vec2 px = HOOKED_pt * 1.8;
-    vec3 rgb = vec3(0.0);
-    for (int x = -2; x <= 2; x++) {
-        for (int y = -2; y <= 2; y++) {
-            rgb += HOOKED_tex(HOOKED_pos + vec2(x, y) * px).rgb;
-        }
-    }
-    rgb /= 25.0;
-    float Y = dot(rgb, lc);
-    float spread = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);
-    float mask = smoothstep(SCORCH_MASK_THRESH - 0.12, SCORCH_MASK_THRESH + 0.06, Y)
-               * (1.0 - smoothstep(SCORCH_MASK_SPREAD * 0.3, SCORCH_MASK_SPREAD * 1.2, spread));
-    return vec4(mask, 0.0, 0.0, 1.0);
-}
-
-// =============================================================================
-// PASS 3: SCORCH HORIZONTAL BLUR (1/4 resolution)
-// =============================================================================
-
-//!HOOK MAIN
-//!BIND HOOKED
-//!BIND CELFLARE_MASK
-//!SAVE CELFLARE_BLUR_H
-//!WIDTH HOOKED.w 4 /
-//!HEIGHT HOOKED.h 4 /
-//!DESC CelFlare Scorch Blur H
-
-#define SCORCH_BRIGHT_BIAS 8.0  // Bright samples weighted higher — prevents dark pull-down at occluder edges
-
-vec4 hook() {
-    // Stride-2 bilinear tap-merged Gaussian: sigma=80, radius=120
-    // Samples at odd offsets (1,3,5,...,119) merged as pairs via bilinear.
-    // 30 merged taps + center = 61 fetches (was 241).
-    const float go[30] = {
-        1.999688, 5.999063, 9.998438, 13.997813, 17.997188, 21.996563,
-        25.995938, 29.995313, 33.994688, 37.994063, 41.993438, 45.992813,
-        49.992188, 53.991563, 57.990938, 61.990313, 65.989688, 69.989063,
-        73.988438, 77.987813, 81.987188, 85.986563, 89.985938, 93.985314,
-        97.984689, 101.984064, 105.983439, 109.982814, 113.982189, 117.981565
-    };
-    const float gw[30] = {
-        1.99921900, 1.99422797, 1.98428327, 1.96945912, 1.94986572, 1.92564786,
-        1.89698315, 1.86407983, 1.82717428, 1.78652820, 1.74242547, 1.69516891,
-        1.64507680, 1.59247937, 1.53771511, 1.48112729, 1.42306035, 1.36385653,
-        1.30385257, 1.24337670, 1.18274574, 1.12226261, 1.06221402, 1.00286852,
-        0.94447486, 0.88726068, 0.83143156, 0.77717032, 0.72463673, 0.67396744
-    };
-
-    float sum = 0.0;
-    float wsum = 0.0;
-    vec2 pt = CELFLARE_MASK_pt;
-    vec2 pos = CELFLARE_MASK_pos;
-
-    // Center tap
-    float s0 = CELFLARE_MASK_tex(pos).r;
-    float w0 = 1.0 + s0 * SCORCH_BRIGHT_BIAS;
-    sum += s0 * w0;
-    wsum += w0;
-
-    // Stride-2 bilinear-merged symmetric pairs — 61 fetches total
-    for (int i = 0; i < 30; i++) {
-        float g = gw[i];
-        float sp = CELFLARE_MASK_tex(pos + vec2(go[i] * pt.x, 0.0)).r;
-        float sn = CELFLARE_MASK_tex(pos - vec2(go[i] * pt.x, 0.0)).r;
-        float wp = g * (1.0 + sp * SCORCH_BRIGHT_BIAS);
-        float wn = g * (1.0 + sn * SCORCH_BRIGHT_BIAS);
-        sum += sp * wp + sn * wn;
-        wsum += wp + wn;
-    }
-
-    return vec4(sum / wsum, 0.0, 0.0, 1.0);
-}
-
-// =============================================================================
-// PASS 4: SCORCH VERTICAL BLUR (1/4 resolution)
-// =============================================================================
-
-//!HOOK MAIN
-//!BIND HOOKED
-//!BIND CELFLARE_BLUR_H
-//!SAVE CELFLARE_SCORCH
-//!WIDTH HOOKED.w 4 /
-//!HEIGHT HOOKED.h 4 /
-//!DESC CelFlare Scorch Blur V
-
-#define SCORCH_BRIGHT_BIAS 8.0
-
-vec4 hook() {
-    // Stride-2 bilinear tap-merged Gaussian: sigma=80, radius=120
-    const float go[30] = {
-        1.999688, 5.999063, 9.998438, 13.997813, 17.997188, 21.996563,
-        25.995938, 29.995313, 33.994688, 37.994063, 41.993438, 45.992813,
-        49.992188, 53.991563, 57.990938, 61.990313, 65.989688, 69.989063,
-        73.988438, 77.987813, 81.987188, 85.986563, 89.985938, 93.985314,
-        97.984689, 101.984064, 105.983439, 109.982814, 113.982189, 117.981565
-    };
-    const float gw[30] = {
-        1.99921900, 1.99422797, 1.98428327, 1.96945912, 1.94986572, 1.92564786,
-        1.89698315, 1.86407983, 1.82717428, 1.78652820, 1.74242547, 1.69516891,
-        1.64507680, 1.59247937, 1.53771511, 1.48112729, 1.42306035, 1.36385653,
-        1.30385257, 1.24337670, 1.18274574, 1.12226261, 1.06221402, 1.00286852,
-        0.94447486, 0.88726068, 0.83143156, 0.77717032, 0.72463673, 0.67396744
-    };
-
-    float sum = 0.0;
-    float wsum = 0.0;
-    vec2 pt = CELFLARE_BLUR_H_pt;
-    vec2 pos = CELFLARE_BLUR_H_pos;
-
-    // Center tap
-    float s0 = CELFLARE_BLUR_H_tex(pos).r;
-    float w0 = 1.0 + s0 * SCORCH_BRIGHT_BIAS;
-    sum += s0 * w0;
-    wsum += w0;
-
-    // Stride-2 bilinear-merged symmetric pairs — 61 fetches total
-    for (int i = 0; i < 30; i++) {
-        float g = gw[i];
-        float sp = CELFLARE_BLUR_H_tex(pos + vec2(0.0, go[i] * pt.y)).r;
-        float sn = CELFLARE_BLUR_H_tex(pos - vec2(0.0, go[i] * pt.y)).r;
-        float wp = g * (1.0 + sp * SCORCH_BRIGHT_BIAS);
-        float wn = g * (1.0 + sn * SCORCH_BRIGHT_BIAS);
-        sum += sp * wp + sn * wn;
-        wsum += wp + wn;
-    }
-
-    return vec4(sum / wsum, 0.0, 0.0, 1.0);
-}
-
-// =============================================================================
-// PASS 5: EXPANSION (full resolution)
-// =============================================================================
-// Reads scene parameters from SCENE_STATE SSBO (guaranteed current-frame by
-// pipeline barrier after Pass 1). Applies per-pixel expansion and PQ encoding.
+// Core change from v3.2: expansion curve evaluated at Y_illum (bright-biased
+// blur of regional luminance at ~100px effective scale) instead of per-pixel Y.
+// All pixels in a bright region get the bright region's expansion — local
+// contrast preserved by construction through multiplicative application.
+//
+// Scene adaptation via bright_frac (fraction of illumination above knee)
+// replaces the 7-type scene classifier. Continuous, no arbitrary boundaries.
 
 //!HOOK MAIN
 //!BIND HOOKED
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
-//!BIND CELFLARE_SCORCH
-//!DESC CelFlare v3.2 (Scene-Adaptive SDR->HDR)
-// CELFLARE_STATS: not sampled — barrier anchor ensuring Pass 1 SSBO writes complete
+//!BIND CELFLARE_ILLUM
+//!DESC CelFlare v4.0
 
 // =============================================
-//  CHROMA — color processing features
+//  MAIN TUNING — start here
 // =============================================
+#define INTENSITY       1.2     // Global scaling (0.5 subtle · 1.0 normal · 1.5 aggressive)
+#define KNEE            0.40    // Expansion onset — midtones below this stay near SDR
+#define MAX_EXPANSION   3.5     // Hard ceiling (3.5 = ~406 nits at 116 ref white)
+#define SCORCH_BOOST    0.00    // Extra lift for near-white highlights (0 = off)
 
-// --- Low-Saturation Compensation ---
-//  Boosts chroma on desaturated pixels whenever expansion is active, countering
-//  perceived color shifts from changed contrast ratios. Works on both bright
-//  (expanded) and dark (non-expanded) pixels. Inversely weighted by saturation.
-//  Gated on expansion activity (bright-pixel fraction from stats pass).
+// =============================================
+//  SPATIALLY-MODULATED CURVE — regional adaptation
+// =============================================
+// Expansion is always f(Y_pixel) — monotonic remapping, no 8-bit banding.
+// Y_illum modulates the curve SHAPE: bright regions get gentle/broad curves
+// (preserving face gradients), dark regions get steep/concentrated curves
+// (highlight pop). Uses linear ramp + pow(t, gamma) — no smoothstep
+// inflection point in the face brightness range.
 //
-#define ENABLE_APL_SAT 0
-#define APL_SAT_MAX         0.06    // Peak boost for lowest-sat pixels
-#define APL_SAT_LOWSAT_CEIL 0.45    // Oklab chroma above which boost is zero
-#define APL_SAT_FRAC_LOW    0.03    // Expansion fraction below which no boost
-#define APL_SAT_FRAC_HIGH   0.20    // Expansion fraction at which boost reaches max
+// Nit targets at REFERENCE_WHITE=116:
+//   Reference white (Y≈0.85): 150–200 nits
+//   Highlights (Y≈0.90–0.95): 230–290 nits
+//   Specular (Y≈0.95–1.00):   300–350 nits
+//   Midtones (Y<0.50):         near SDR (~no expansion)
+#define PEAK_BRIGHT     3.0     // Expansion peak for bright regions
+#define PEAK_DARK       3.5     // Expansion peak for dark regions (highlight headroom)
+#define GAMMA_BRIGHT    1.5     // Curve shape: moderate concentration
+#define GAMMA_DARK      3.0     // Curve shape: strong highlight concentration
+#define PEAK_ATTEN      0.35    // How much bright_frac further reduces peak (0.0–0.6)
+#define BRIGHT_FRAC_REF 0.30    // Bright fraction where scene adaptation plateaus
 
-// --- Bezold-Brucke Warmth ---
-//  Pre-compensates for perceptual yellow→green hue shift at HDR luminances.
-//  Targets yellow-orange only; reds and blues excluded.
+// =============================================
+//  DYNAMIC INTENSITY — contrast-driven expansion scaling
+// =============================================
+// Flat/pastel scenes (low contrast) get softer expansion.
+// Dramatic/high-contrast scenes (deep shadows + bright highlights) get punchier.
+// Driven by smoothed_contrast (log2 dynamic range in stops).
+#define ENABLE_DYNAMIC_INTENSITY 1
+#define DYN_CONTRAST_LOW    2.5     // Below this: flat scene, minimum intensity
+#define DYN_CONTRAST_HIGH   5.5     // Above this: dramatic scene, maximum intensity
+#define DYN_INTENSITY_LOW   0.85    // Multiplier for flat scenes
+#define DYN_INTENSITY_HIGH  1.40    // Multiplier for dramatic scenes
+
+// =============================================
+//  APL MODULATION — brightness-driven expansion scaling
+// =============================================
+// Dark scenes: neutral (gamma handles midtone suppression).
+// Bright scenes: dampened to prevent washing out.
+// Driven by smoothed_log_avg (perceptual brightness key).
+#define ENABLE_APL_MOD      1
+#define APL_KEY_DARK        0.03    // Below this: dark scene multiplier
+#define APL_KEY_BRIGHT      0.30    // Above this: bright scene multiplier
+#define APL_BOOST_DARK      1.00    // Neutral for dark scenes (gamma_dark suppresses midtones)
+#define APL_DAMPEN_BRIGHT   0.70    // Dampen bright scenes
+
+// =============================================
+//  SPECULAR BONUS — near-white highlight pop
+// =============================================
+// Extra expansion for near-white, low-saturation pixels (specular
+// reflections, bright sky, white objects). Purely per-pixel f(Y) — no
+// illumination field involvement (which caused spatial shadow contours).
 //
-#define ENABLE_BB_WARMTH 0
-#define BB_WARMTH            0.05    // Oklab rotation (radians). Try 0.03–0.10
+// Wide smoothstep ramp (SPEC_Y_LOW to 1.0) + squaring ensures the bonus
+// onset is vanishingly gentle: derivative is zero at SPEC_Y_LOW, and the
+// per-8-bit-step expansion change stays sub-visible across the ramp.
+// The bonus concentrates naturally toward Y=1.0.
+#define ENABLE_SPECULAR_BONUS 1
+#define SPEC_Y_LOW          0.40    // Ramp onset (wide = gentle 8-bit steps)
+#define SPEC_CHROMA_FLOOR   0.15    // Below this: full bonus (white/near-neutral)
+#define SPEC_CHROMA_CEIL    0.50    // Above this: no bonus (highly saturated only)
+#define SPEC_BOOST          0.40    // Peak expansion bonus at Y=1.0
+
+// =============================================
+//  SCORCH — bright region hotspot
+// =============================================
+// Uses min(Y_pixel, Y_illum) as driver — dark pixels near bright regions
+// can never get scorch higher than their own brightness warrants.
+// Eliminates dark-object halos from illumination field bleeding.
+#define ENABLE_SCORCH        0       // must match stats pass
+#define SCORCH_PIXEL_FLOOR   0.85    // Per-pixel gate: only near-white pixels get scorch
+#define SCORCH_SHUTOFF_BEGIN 0.60
+#define SCORCH_SHUTOFF_END   0.90
+
+// =============================================
+//  CHROMA — expansion color behavior
+// =============================================
+// Chroma amplification attenuation for saturated pixels. Full cbrt(expansion)
+// on chroma causes saturated colors to appear perceptually brighter than
+// desaturated highlights at the same luminance expansion (Helmholtz-Kohlrausch).
+// CHROMA_SCALE reduces this: 1.0 = full cbrt, 0.5 = half, 0.0 = chroma frozen.
+// Only affects already-saturated pixels — near-neutrals always get full cbrt.
+#define CHROMA_SCALE        0.50
 
 // --- Warm Tone Compensation ---
-//  Luminance lift for warm/skin hues, countering perceived darkening from
-//  surrounding highlight expansion. Ramps from shadows to WP_LUM_FLOOR.
-//  Gated on scene expansion activity (bright-pixel fraction from stats pass).
-//
 #define ENABLE_WARM_PROTECT 1
-#define WP_LUM_BOOST        0.60    // Max expansion lift for warm tones
-//
-// --- Pale Skin Protection ---
-//  Compresses expansion on bright desaturated warm pixels (pale skin glow)
-//  and adds slight chroma boost to maintain skin warmth.
-//  Shares hue detection with warm protect.
-//
+#define WP_LUM_BOOST        0.40
+#define WP_HUE_COS          0.7317  // cos(0.75) — precomputed unit vector for hue center
+#define WP_HUE_SIN          0.6816  // sin(0.75)
+#define WP_HUE_POWER        2.0     // Sharpness of hue window (higher = narrower)
+#define WP_CHROMA_MIN       0.03
+#define WP_CHROMA_MAX       0.14
+#define WP_LUM_FLOOR        0.50
+#define WP_BRIGHT_FRAC_LOW  0.05
+#define WP_BRIGHT_FRAC_HIGH 0.30
+
 #define ENABLE_PALE_SKIN 1
-#define PS_COMPRESS         0.20    // Expansion compression (0 = off, 1 = full)
-#define PS_SAT_BOOST        0.10    // Chroma boost to maintain skin warmth
-#define PS_BRIGHT_FLOOR     0.65    // Luma below which effect fades
-#define PS_CHROMA_CEIL      0.02    // Oklab chroma above which effect fades
-#define WP_HUE_CENTER       1.05    // Oklab hue center in radians (~60°, orange-yellow midpoint)
-#define WP_HUE_SIGMA        0.60    // Gaussian width in radians (~34°, covers ~15°–105°)
-#define WP_CHROMA_MIN       0.03    // Min Oklab chroma (excludes near-neutrals)
-#define WP_CHROMA_MAX       0.14    // Oklab chroma where effect fades (protects saturated reds/fire)
-#define WP_LUM_FLOOR        0.50    // Linear luma below which effect fades (protects dark shadows)
-#define WP_BRIGHT_FRAC_LOW  0.05    // Scene gate: min expanded-pixel fraction to activate
-#define WP_BRIGHT_FRAC_HIGH 0.30    // Scene gate: fraction for full effect
-
-// --- Saturation Boost (Stevens' power law) ---
-//  Extra chroma on top of the natural cbrt(k) from Oklab expansion.
-//  Off by default — cbrt(k) is usually sufficient.
-//
-#define ENABLE_SAT_BOOST 0
-#define SAT_BOOST_EXPONENT  0.167   // k^(1/6) + empirical offset
-#define SAT_BOOST_MAX       1.1     // Safety cap
-#define SAT_KNEE_OFFSET     0.2     // Extend boost below luminance knee (0 = disabled)
-#define SAT_KNEE_PEAK       0.04    // Max boost at knee boundary (4%)
-
-// --- Saturation Rolloff ---
-//  Reduces expansion on already-saturated colors to prevent gamut clipping.
-//
-#define ENABLE_SAT_ROLLOFF 0
-#define SAT_THRESHOLD       0.22    // Normalized Oklab chroma threshold
-#define SAT_POWER           5.0     // Rolloff curve steepness
-#define SAT_ROLLOFF         0.80    // Max expansion reduction
-
-// --- Scorch — bright region hotspot ---
-//  Adds extra peak luminance to the interior of large near-white regions
-//  (sun, bright sky fills). Creates a natural hotspot gradient — center
-//  glows brighter than edges. Cannot distinguish light sources from bright
-//  materials (snow, shirts).
-//
-//  Pipeline: mask pass (1/4 res, averaged, wide-net threshold) →
-//  separable Gaussian blur → main pass reads blur_val² as distance-from-edge
-//  gradient. Occlusion mask rejects dark pixels (sharp, noise-free threshold
-//  on low luma).
-//
-#define ENABLE_SCORCH 1
-#define SCORCH_PEAK_BOOST    1.00   // Extra expansion at region center
-#define SCORCH_OCCLUDE_FLOOR 0.40   // Luma below this = dark occluder, fully rejected
-#define SCORCH_OCCLUDE_CEIL  0.90   // Luma above this = bright enough, full boost allowed
-#define SCORCH_SHUTOFF_BEGIN 0.65   // Start reducing at this screen fraction
-#define SCORCH_SHUTOFF_END   0.75   // Fully off at this screen fraction
+#define ENABLE_PS_COMPRESS  0       // Pale skin expansion compression (0 = off)
+#define PS_COMPRESS         0.00
+#define PS_SAT_BOOST        0.10
+#define PS_BRIGHT_FLOOR     0.50
+#define PS_CHROMA_CEIL      0.03
 
 // =============================================
-//  OUTPUT — encoding and post-processing
+//  OUTPUT — encoding
 // =============================================
-
-// --- PQ BT.2020 ---
-//  Direct PQ encoding bypasses libplacebo's SDR peak clipping.
-//  REFERENCE_WHITE must match hdr-reference-white in mpv.conf.
-//
 #define REFERENCE_WHITE 116.0
-#define PQ_FAST_APPROX  1           // Degree-7 polynomial (~2.4x faster than exact ST.2084)
-#define EOTF_GAMMA      2.4         // BT.1886 = 2.4, sRGB = 2.2
-
-// --- Grain Stabilization ---
-//  Reads pre-filtered luma from blur pass (alpha channel).
-//
+#define PQ_FAST_APPROX  1
+#define EOTF_GAMMA      2.4
 #define ENABLE_GRAIN_STABLE 1
-#define EARLY_EXIT_GAMMA    0.25    // Skip dark pixels (must match GRAIN_EARLY_EXIT in blur pass)
+#define EARLY_EXIT_GAMMA    0.25
 
-// --- Dither ---
-//  PQ-space dither to mask 8-bit banding amplified by expansion.
-//
-#define ENABLE_DITHER 0
-#define DITHER_STRENGTH     0.7
-#define DITHER_TEMPORAL     1       // Animate noise per frame
-
-// =============================================================================
-// INTERNAL PARAMETERS
-// =============================================================================
-
-// --- Scene Type Constants (debug overlays) ---
-#define SCENE_DARK_SPECULAR 0
-#define SCENE_DARK_MOODY 1
-#define SCENE_BRIGHT_SPECULAR 2
-#define SCENE_BRIGHT_FLAT 3
-#define SCENE_HIGH_CONTRAST 4
-#define SCENE_DEFAULT 5
-#define SCENE_VERY_BRIGHT 6
-
-// =============================================================================
-// DEBUG
-// =============================================================================
-
-#define DEBUG_BYPASS 0             // Skip all processing, output original (gamma)
-#define DEBUG_SHOW_STATS 0         // Show scene analysis bar graphs (top-left)
-#define DEBUG_SHOW_SCENE_TYPE 0    // Show scene type color (top-right corner)
-#define DEBUG_SHOW_EXPANSION 0     // Show expansion parameters (bottom-right)
-#define DEBUG_SHOW_MASK 0          // Show expansion amount as grayscale
-#define DEBUG_SHOW_SAT 0           // Show saturation rolloff factor
-#define DEBUG_SHOW_GRAIN 0         // Show grain stabilization effect
-#define DEBUG_SHOW_SAT_BOOST 0     // Show saturation boost amount
-#define DEBUG_SHOW_DITHER 0        // Show dither magnitude and pattern
-#define DEBUG_SHOW_WP 0            // Show warm tone protection (green=lift, red=attenuate)
-#define DEBUG_SHOW_SCORCH 0        // Show scorch depth map (yellow = hotspot region)
+// =============================================
+//  DEBUG
+// =============================================
+#define DEBUG_BYPASS        0
+#define DEBUG_SHOW_ILLUM    0   // Illumination field as grayscale
+#define DEBUG_SHOW_EXPANSION 0  // Expansion amount as heat map
+#define DEBUG_SHOW_SCORCH   0   // Scorch contribution
+#define DEBUG_SHOW_DETAIL   0   // Spatial vs per-pixel: green=spatial, red=per-pixel fallback
+#define DEBUG_SHOW_SPECULAR 0   // Specular bonus: cyan = spec strength
+#define DEBUG_SHOW_WP       0   // Warm tone protection
+#define DEBUG_SHOW_STATS    0   // avg_illum + bright_frac + contrast + log_avg bars
 
 // =============================================================================
 // HELPER FUNCTIONS
@@ -858,20 +578,8 @@ vec3 linear709_to_pq2020(vec3 rgb_linear) {
     #endif
 }
 
-float hashNoise(vec2 p) {
-    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-}
-
-float triangularNoise(vec2 p) {
-    float r1 = hashNoise(p);
-    float r2 = hashNoise(p + vec2(1.7, 3.1));
-    return r1 + r2 - 1.0;
-}
-
 // =============================================================================
-// OKLAB COLOR SPACE (Björn Ottosson, 2020)
+// OKLAB COLOR SPACE (Bjorn Ottosson, 2020)
 // =============================================================================
 
 float fast_cbrt(float x) {
@@ -916,6 +624,40 @@ vec3 oklab_to_rgb(vec3 lab) {
 }
 
 // =============================================================================
+// ILLUMINATION FIELD UPSAMPLING (from 1/4 res)
+// =============================================================================
+// The illumination field is a sigma~100px Gaussian — extremely smooth.
+// BSPLINE_UPSAMPLE 1: C2 cubic B-spline (4 fetches, smooth gradients)
+// BSPLINE_UPSAMPLE 0: Hardware bilinear (1 fetch, sufficient for smooth fields)
+#define BSPLINE_UPSAMPLE 0
+
+float upsample_illum() {
+    #if BSPLINE_UPSAMPLE
+    vec2 tc = CELFLARE_ILLUM_pos / CELFLARE_ILLUM_pt - 0.5;
+    vec2 f  = fract(tc);
+    tc = (floor(tc) + 0.5) * CELFLARE_ILLUM_pt;
+
+    vec2 f2  = f * f, f3 = f2 * f;
+    vec2 w0  = (1.0 - f) * (1.0 - f) * (1.0 - f) * (1.0 / 6.0);
+    vec2 w1  = (4.0 - 6.0 * f2 + 3.0 * f3) * (1.0 / 6.0);
+    vec2 w2  = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) * (1.0 / 6.0);
+    vec2 w3  = f3 * (1.0 / 6.0);
+
+    vec2 s01 = w0 + w1, s23 = w2 + w3;
+    vec2 p01 = tc + (-1.0 + w1 / s01) * CELFLARE_ILLUM_pt;
+    vec2 p23 = tc + ( 1.0 + w3 / s23) * CELFLARE_ILLUM_pt;
+
+    return
+        CELFLARE_ILLUM_tex(vec2(p01.x, p01.y)).r * s01.x * s01.y +
+        CELFLARE_ILLUM_tex(vec2(p23.x, p01.y)).r * s23.x * s01.y +
+        CELFLARE_ILLUM_tex(vec2(p01.x, p23.y)).r * s01.x * s23.y +
+        CELFLARE_ILLUM_tex(vec2(p23.x, p23.y)).r * s23.x * s23.y;
+    #else
+    return CELFLARE_ILLUM_tex(CELFLARE_ILLUM_pos).r;
+    #endif
+}
+
+// =============================================================================
 // MAIN PROCESSING
 // =============================================================================
 
@@ -923,203 +665,196 @@ vec4 hook() {
     vec4 color = HOOKED_texOff(0);
     vec3 rgb_gamma = color.rgb;
 
-    // Read scene parameters from SSBO (current frame, barrier-protected)
-    float highlight_peak = scene_highlight_peak;
-    float exp_steepness = scene_exp_steepness;
-    float master_knee = scene_master_knee;
-    int scene_type = int(scene_type_val);
-    float exp_denom = scene_exp_denom;
-    float intensity = scene_intensity;
-    float apl_atten = scene_apl_atten;
-
-    // -------------------------------------------------------------------------
-    // DEBUG OVERLAYS (Scene Analysis)
-    // -------------------------------------------------------------------------
-    #if DEBUG_SHOW_STATS
-        vec2 pos = HOOKED_pos;
-        float bar_width = 0.25;
-        float bar_height = 0.015;
-        float bar_gap = 0.005;
-        float start_y = 0.0;
-
-        float dbg_key = smoothed_log_avg;
-        float dbg_brightness_factor = smoothstep(0.022, 0.065, dbg_key);
-        float dbg_adaptive_contrast_low = mix(2.0, 2.0, dbg_brightness_factor);
-        float dbg_adaptive_contrast_high = mix(3.25, 4.2, dbg_brightness_factor);
-        float dbg_key_factor_spec = smoothstep(0.022, 0.065, dbg_key);
-        float dbg_adaptive_spec_threshold = mix(0.065, 0.22, dbg_key_factor_spec);
-
-        // Bar 1: Log-average (Key) - Green
-        if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
-            float norm_x = pos.x / bar_width;
-            float display_max = 0.40;
-            float val = clamp(smoothed_log_avg / display_max, 0.0, 1.0);
-            vec3 bg = (norm_x < val) ? vec3(0.0, 0.5, 0.0) : vec3(0.1);
-
-            float dark_mark = 0.022 / display_max;
-            float bright_mark = 0.065 / display_max;
-            float very_bright_mark = 0.32 / display_max;
-            if (abs(norm_x - dark_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.0, 0.3, 0.6)), 1.0);
-            if (abs(norm_x - bright_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.6, 0.4, 0.0)), 1.0);
-            if (abs(norm_x - very_bright_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.6, 0.0, 0.0)), 1.0);
-            if (abs(norm_x - val) < 0.008) return vec4(gamma709_to_pq2020(vec3(0.6, 0.6, 0.6)), 1.0);
-            return vec4(gamma709_to_pq2020(bg), 1.0);
-        }
-        start_y += bar_height + bar_gap;
-
-        // Bar 2: Contrast - Yellow
-        if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
-            float norm_x = pos.x / bar_width;
-            float contrast_display_max = 8.0;
-            float val = clamp(smoothed_contrast / contrast_display_max, 0.0, 1.0);
-            vec3 bg = (norm_x < val) ? vec3(0.5, 0.5, 0.0) : vec3(0.1);
-
-            float low_mark = dbg_adaptive_contrast_low / contrast_display_max;
-            float high_mark = dbg_adaptive_contrast_high / contrast_display_max;
-            if (abs(norm_x - low_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.3, 0.3, 0.6)), 1.0);
-            if (abs(norm_x - high_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.6, 0.3, 0.3)), 1.0);
-            if (abs(norm_x - val) < 0.008) return vec4(gamma709_to_pq2020(vec3(0.6, 0.6, 0.6)), 1.0);
-            return vec4(gamma709_to_pq2020(bg), 1.0);
-        }
-        start_y += bar_height + bar_gap;
-
-        // Bar 3: Max luminance - Red
-        if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
-            float norm_x = pos.x / bar_width;
-            float val = clamp(smoothed_max, 0.0, 1.0);
-            vec3 bg = (norm_x < val) ? vec3(0.5, 0.0, 0.0) : vec3(0.1);
-
-            float zone_mark = mix(0.22, 0.40, dbg_brightness_factor);
-            if (abs(norm_x - zone_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.6, 0.6, 0.0)), 1.0);
-            if (abs(norm_x - val) < 0.008) return vec4(gamma709_to_pq2020(vec3(0.6, 0.6, 0.6)), 1.0);
-            return vec4(gamma709_to_pq2020(bg), 1.0);
-        }
-        start_y += bar_height + bar_gap;
-
-        // Bar 4: Highlight population - Magenta
-        if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
-            float norm_x = pos.x / bar_width;
-            float highlight_display_max = 0.30;
-            float val = clamp(smoothed_highlight_pop / highlight_display_max, 0.0, 1.0);
-            vec3 bg = (norm_x < val) ? vec3(0.5, 0.0, 0.5) : vec3(0.1);
-
-            float spec_mark = dbg_adaptive_spec_threshold / highlight_display_max;
-            if (abs(norm_x - spec_mark) < 0.006) return vec4(gamma709_to_pq2020(vec3(0.0, 0.6, 0.0)), 1.0);
-            if (abs(norm_x - val) < 0.008) return vec4(gamma709_to_pq2020(vec3(0.6, 0.6, 0.6)), 1.0);
-            return vec4(gamma709_to_pq2020(bg), 1.0);
-        }
-        start_y += bar_height + bar_gap;
-
-        // Bar 5: Scene type indicator
-        if (pos.x < bar_width && pos.y >= start_y && pos.y < start_y + bar_height) {
-            float norm_x = pos.x / bar_width;
-            vec3 type_color;
-            if (scene_type == SCENE_DARK_SPECULAR) type_color = vec3(0.6, 0.4, 0.0);
-            else if (scene_type == SCENE_DARK_MOODY) type_color = vec3(0.3, 0.0, 0.5);
-            else if (scene_type == SCENE_BRIGHT_SPECULAR) type_color = vec3(0.6, 0.6, 0.0);
-            else if (scene_type == SCENE_BRIGHT_FLAT) type_color = vec3(0.4, 0.4, 0.4);
-            else if (scene_type == SCENE_HIGH_CONTRAST) type_color = vec3(0.0, 0.5, 0.5);
-            else if (scene_type == SCENE_VERY_BRIGHT) type_color = vec3(0.9, 0.9, 0.9);
-            else type_color = vec3(0.0, 0.5, 0.0);
-
-            float peak_norm = (highlight_peak - 1.5) / 2.0;
-            if (norm_x < peak_norm) return vec4(gamma709_to_pq2020(type_color), 1.0);
-            return vec4(gamma709_to_pq2020(vec3(0.1)), 1.0);
-        }
-    #endif
-
-    #if DEBUG_SHOW_SCENE_TYPE
-        if (HOOKED_pos.x > 0.9 && HOOKED_pos.y < 0.1) {
-            vec3 type_color;
-            if (scene_type == SCENE_DARK_SPECULAR) type_color = vec3(0.6, 0.4, 0.0);
-            else if (scene_type == SCENE_DARK_MOODY) type_color = vec3(0.3, 0.0, 0.5);
-            else if (scene_type == SCENE_BRIGHT_SPECULAR) type_color = vec3(0.6, 0.6, 0.0);
-            else if (scene_type == SCENE_BRIGHT_FLAT) type_color = vec3(0.4, 0.4, 0.4);
-            else if (scene_type == SCENE_HIGH_CONTRAST) type_color = vec3(0.0, 0.5, 0.5);
-            else if (scene_type == SCENE_VERY_BRIGHT) type_color = vec3(0.9, 0.9, 0.9);
-            else type_color = vec3(0.0, 0.5, 0.0);
-            return vec4(gamma709_to_pq2020(type_color), 1.0);
-        }
-    #endif
-
     #if DEBUG_BYPASS
         return vec4(gamma709_to_pq2020(color.rgb), color.a);
     #endif
 
     // -------------------------------------------------------------------------
-    // PIXEL PROCESSING (Gamma Space)
+    // DEBUG: Stats overlay (top-left bars)
+    // -------------------------------------------------------------------------
+    #if DEBUG_SHOW_STATS
+    {
+        vec2 pos = HOOKED_pos;
+        if (pos.x < 0.15 && pos.y < 0.10) {
+            float bar_x = pos.x / 0.15;
+            vec3 dbg = vec3(0.05);
+            float row = pos.y / 0.10;
+            if (row < 0.333) {
+                // Row 1: bright_frac (yellow)
+                if (bar_x < smoothed_bright_frac) dbg = vec3(0.6, 0.6, 0.0);
+            } else if (row < 0.666) {
+                // Row 2: contrast / 8 stops (orange)
+                if (bar_x < smoothed_contrast / 8.0) dbg = vec3(0.7, 0.4, 0.0);
+            } else {
+                // Row 3: log_avg (green)
+                if (bar_x < smoothed_log_avg) dbg = vec3(0.0, 0.6, 0.0);
+            }
+            return vec4(gamma709_to_pq2020(dbg), 1.0);
+        }
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // PIXEL LUMA
     // -------------------------------------------------------------------------
     float Y_gamma = get_luma(rgb_gamma);
 
-    #if !DEBUG_SHOW_MASK && !DEBUG_SHOW_SAT && !DEBUG_SHOW_GRAIN
-        if (Y_gamma < EARLY_EXIT_GAMMA) return vec4(gamma709_to_pq2020(color.rgb), color.a);
-    #else
-        if (Y_gamma < 0.0001) return vec4(gamma709_to_pq2020(color.rgb), color.a);
-    #endif
+    if (Y_gamma < EARLY_EXIT_GAMMA) return vec4(gamma709_to_pq2020(color.rgb), color.a);
 
+    // -------------------------------------------------------------------------
+    // GRAIN STABILIZATION
+    // -------------------------------------------------------------------------
     float Y_decision_gamma = Y_gamma;
-
-    // -------------------------------------------------------------------------
-    // GRAIN STABILIZATION (Pre-filter Alpha Read)
-    // -------------------------------------------------------------------------
     #if ENABLE_GRAIN_STABLE
         Y_decision_gamma = (color.a > 0.99) ? Y_gamma : color.a;
-
-        #if DEBUG_SHOW_GRAIN
-            float grain_diff = abs(Y_gamma - Y_decision_gamma) * 20.0;
-            return vec4(gamma709_to_pq2020(vec3(grain_diff, 0.0, 0.0)), 1.0);
-        #endif
     #endif
 
     // -------------------------------------------------------------------------
-    // LINEARIZE FOR EXPANSION
+    // ILLUMINATION FIELD (B-spline upsampled from 1/4 res)
     // -------------------------------------------------------------------------
-    float Y_decision = eotf_gamma(Y_decision_gamma);
-    vec3 rgb_linear = eotf_gamma(rgb_gamma);
+    float Y_illum = upsample_illum();
+
+    #if DEBUG_SHOW_ILLUM
+        return vec4(gamma709_to_pq2020(vec3(Y_illum)), 1.0);
+    #endif
+
+    // Cheap gamma-space chroma for specular detection (max-min channel spread)
+    #if ENABLE_SPECULAR_BONUS
+        float chroma_orig_gamma = max(rgb_gamma.r, max(rgb_gamma.g, rgb_gamma.b))
+                                - min(rgb_gamma.r, min(rgb_gamma.g, rgb_gamma.b));
+    #endif
 
     // -------------------------------------------------------------------------
-    // SATURATION (Oklab chroma)
+    // SPATIALLY-MODULATED PER-PIXEL EXPANSION
+    // -------------------------------------------------------------------------
+    // Expansion is f(Y_pixel) — monotonic remapping, no 8-bit banding.
+    // Y_illum modulates the curve parameters: bright regions get gentle/broad
+    // curves (preserving face gradients), dark regions get steep/concentrated
+    // curves (highlight pop in dark scenes).
+    //
+    // Linear ramp + pow(t, gamma): no smoothstep inflection. For gamma >= 1,
+    // the derivative is monotonically increasing — no local maximum in the
+    // face brightness range that would create visible contours.
+
+    // Scene-level adaptation (from SSBO — uniform per frame)
+    float bf = smoothstep(0.0, BRIGHT_FRAC_REF, smoothed_bright_frac);
+
+    // Regional adaptation (from illumination field — varies per pixel)
+    float spatial_t = Y_illum;
+    float local_peak = mix(PEAK_DARK, PEAK_BRIGHT, spatial_t);
+    local_peak *= (1.0 - PEAK_ATTEN * bf);  // scene-level dampening on top
+    float local_gamma = mix(GAMMA_DARK, GAMMA_BRIGHT, spatial_t);
+
+    // Per-pixel expansion curve: linear ramp from KNEE, shaped by pow(gamma)
+    float t = max(Y_decision_gamma - KNEE, 0.0) / (1.0 - KNEE);
+    t = pow(max(t, 0.0), local_gamma);
+    float expansion = 1.0 + (local_peak - 1.0) * t * INTENSITY;
+
+    #if DEBUG_SHOW_DETAIL
+    {
+        float exp_contrib = max(expansion - 1.0, 0.0) * 2.0;
+        return vec4(gamma709_to_pq2020(vec3(0.0, exp_contrib, 0.0)), 1.0);
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // STEP 3: DYNAMIC INTENSITY (contrast-driven scaling)
+    // -------------------------------------------------------------------------
+    // Flat scenes get softer expansion, dramatic scenes get punchier.
+    #if ENABLE_DYNAMIC_INTENSITY
+    {
+        float dyn_factor = smoothstep(DYN_CONTRAST_LOW, DYN_CONTRAST_HIGH, smoothed_contrast);
+        float dyn_intensity = mix(DYN_INTENSITY_LOW, DYN_INTENSITY_HIGH, dyn_factor);
+        expansion = 1.0 + (expansion - 1.0) * dyn_intensity;
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // STEP 4: APL MODULATION (brightness-driven scaling)
+    // -------------------------------------------------------------------------
+    // Dark scenes get more headroom, bright scenes get dampened.
+    #if ENABLE_APL_MOD
+    {
+        float apl_t = smoothstep(APL_KEY_DARK, APL_KEY_BRIGHT, smoothed_log_avg);
+        float apl_factor = mix(APL_BOOST_DARK, APL_DAMPEN_BRIGHT, apl_t);
+        expansion = 1.0 + (expansion - 1.0) * apl_factor;
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // SCORCH — near-white highlight boost
+    // -------------------------------------------------------------------------
+    #if ENABLE_SCORCH
+    {
+        float scorch_drive = min(Y_decision_gamma, Y_illum);
+        float scorch_region = smoothstep(0.70, 0.92, scorch_drive);
+        float scorch_pixel = smoothstep(SCORCH_PIXEL_FLOOR, SCORCH_PIXEL_FLOOR + 0.10, Y_decision_gamma);
+        float scorch_t = scorch_region * scorch_pixel;
+        scorch_t *= scorch_t;
+        float scorch_shutoff = 1.0 - smoothstep(SCORCH_SHUTOFF_BEGIN, SCORCH_SHUTOFF_END, smoothed_scorch_frac);
+        expansion += SCORCH_BOOST * scorch_t * scorch_shutoff;
+
+        #if DEBUG_SHOW_SCORCH
+        {
+            float sc = scorch_t * scorch_shutoff;
+            return vec4(gamma709_to_pq2020(vec3(sc, sc * 0.6, 0.0)), 1.0);
+        }
+        #endif
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // SPECULAR BONUS — near-white highlight pop
+    // -------------------------------------------------------------------------
+    // Purely f(Y_pixel): wide smoothstep ramp squared so derivative is zero
+    // at onset — no 8-bit step contours. No Y_illum, no context ratio.
+    #if ENABLE_SPECULAR_BONUS
+    float spec_strength;
+    {
+        float spec_ramp = smoothstep(SPEC_Y_LOW, 1.0, Y_decision_gamma);
+        float spec_chroma_w = 1.0 - smoothstep(SPEC_CHROMA_FLOOR, SPEC_CHROMA_CEIL, chroma_orig_gamma);
+        spec_strength = SPEC_BOOST * spec_ramp * spec_ramp * spec_chroma_w;
+        expansion += spec_strength;
+    }
+    #endif
+
+    #if DEBUG_SHOW_SPECULAR && ENABLE_SPECULAR_BONUS
+    {
+        return vec4(gamma709_to_pq2020(vec3(0.0, spec_strength, spec_strength)), 1.0);
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // EXPANSION CAP
+    // -------------------------------------------------------------------------
+    expansion = min(expansion, MAX_EXPANSION);
+
+    // -------------------------------------------------------------------------
+    // LINEARIZE
+    // -------------------------------------------------------------------------
+    vec3 rgb_linear = eotf_gamma(rgb_gamma);
+    #if ENABLE_GRAIN_STABLE
+    float Y_decision = (color.a > 0.99) ? get_luma(rgb_linear) : eotf_gamma(color.a);
+    #else
+    float Y_decision = get_luma(rgb_linear);
+    #endif
+
+    // -------------------------------------------------------------------------
+    // OKLAB (for chroma detection)
     // -------------------------------------------------------------------------
     vec3 oklab_orig = rgb_to_oklab(rgb_linear);
     float chroma_orig = sqrt(oklab_orig.y * oklab_orig.y + oklab_orig.z * oklab_orig.z);
-    float sat_raw = chroma_orig / 0.35;
-    float sat = pow(smoothstep(SAT_THRESHOLD, 1.0, sat_raw), SAT_POWER);
-
-    #if DEBUG_SHOW_SAT
-        return vec4(gamma709_to_pq2020(vec3(sat, chroma_orig * 3.0, 0.0)), 1.0);
-    #endif
-
-    // -------------------------------------------------------------------------
-    // EXPANSION CURVE (Linear Space)
-    // -------------------------------------------------------------------------
-    float final_steepness = exp_steepness;  // CURVE_STEEPNESS baked in Pass 2
-
-    float master_knee_t = step(master_knee, Y_decision);
-    float master_expand_t = smoothstep(master_knee, 1.0, Y_decision);
-
-    float master_curve = (final_steepness > 0.001)
-        ? (exp(final_steepness * master_expand_t) - 1.0) / exp_denom
-        : master_expand_t;
-
-    float expansion = mix(1.0, mix(1.0, highlight_peak, master_curve), master_knee_t);
-
-    // Saturation rolloff
-    #if ENABLE_SAT_ROLLOFF
-        expansion = mix(expansion, 1.0, sat * SAT_ROLLOFF);
-    #endif
-
-    // Intensity + APL attenuation (scene-level intensity precomputed in Pass 2)
-    float atten_factor = mix(apl_atten, sqrt(apl_atten), master_curve);
-    expansion = 1.0 + (expansion - 1.0) * intensity * atten_factor;
 
     // -------------------------------------------------------------------------
     // WARM TONE COMPENSATION + PALE SKIN PROTECTION
     // -------------------------------------------------------------------------
     #if ENABLE_WARM_PROTECT || ENABLE_PALE_SKIN
-        float wp_hue = atan(oklab_orig.z, oklab_orig.y);
-        float wp_dh = wp_hue - WP_HUE_CENTER;
-        wp_dh -= 6.2831853 * floor((wp_dh + 3.1415927) / 6.2831853);
-        float wp_hue_w = exp(-0.5 * wp_dh * wp_dh / (WP_HUE_SIGMA * WP_HUE_SIGMA));
+        // Dot-product hue detector: cos(angle) between pixel's ab vector and
+        // target hue direction. Replaces atan()+exp() Gaussian (~25 fewer SFU
+        // cycles). pow() controls window width — higher = narrower acceptance.
+        float inv_chroma = (chroma_orig > 1e-6) ? (1.0 / chroma_orig) : 0.0;
+        float cos_dh = (oklab_orig.y * WP_HUE_COS + oklab_orig.z * WP_HUE_SIN) * inv_chroma;
+        float wp_hue_w = pow(max(cos_dh, 0.0), WP_HUE_POWER);
         float wp_gate = smoothstep(WP_BRIGHT_FRAC_LOW, WP_BRIGHT_FRAC_HIGH, smoothed_bright_frac);
     #endif
 
@@ -1136,93 +871,10 @@ vec4 hook() {
                           * (1.0 - smoothstep(0.04, PS_CHROMA_CEIL + 0.04, chroma_orig));
         float ps_bright_w = smoothstep(PS_BRIGHT_FLOOR, PS_BRIGHT_FLOOR + 0.15, Y_decision);
         float ps_w = wp_hue_w * ps_chroma_w * ps_bright_w * wp_gate;
+        #if ENABLE_PS_COMPRESS
         expansion = mix(expansion, 1.0, PS_COMPRESS * ps_w);
+        #endif
         float ps_sat = PS_SAT_BOOST * ps_w;
-    #endif
-
-    // -------------------------------------------------------------------------
-    // SCORCH — bright region hotspot
-    // -------------------------------------------------------------------------
-    #if ENABLE_SCORCH
-    {
-        // B-spline (C2 cubic) upsampling — 4 bilinear fetches, kills 1/4-res grid.
-        // C2 needed because blur_val² amplifies C0/C1 kinks into visible artifacts.
-        vec2 tc = CELFLARE_SCORCH_pos / CELFLARE_SCORCH_pt - 0.5;
-        vec2 f  = fract(tc);
-        tc = (floor(tc) + 0.5) * CELFLARE_SCORCH_pt;
-
-        vec2 f2  = f * f, f3 = f2 * f;
-        vec2 w0  = (1.0 - f) * (1.0 - f) * (1.0 - f) * (1.0 / 6.0);
-        vec2 w1  = (4.0 - 6.0 * f2 + 3.0 * f3) * (1.0 / 6.0);
-        vec2 w2  = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) * (1.0 / 6.0);
-        vec2 w3  = f3 * (1.0 / 6.0);
-
-        vec2 s01 = w0 + w1, s23 = w2 + w3;
-        vec2 p01 = tc + (-1.0 + w1 / s01) * CELFLARE_SCORCH_pt;
-        vec2 p23 = tc + ( 1.0 + w3 / s23) * CELFLARE_SCORCH_pt;
-
-        // Weights sum to exactly 1.0 (B-spline partition of unity) — no division needed.
-        float blur_val =
-            CELFLARE_SCORCH_tex(vec2(p01.x, p01.y)).r * s01.x * s01.y +
-            CELFLARE_SCORCH_tex(vec2(p23.x, p01.y)).r * s23.x * s01.y +
-            CELFLARE_SCORCH_tex(vec2(p01.x, p23.y)).r * s01.x * s23.y +
-            CELFLARE_SCORCH_tex(vec2(p23.x, p23.y)).r * s23.x * s23.y;
-
-        // Occlusion mask: reject dark occluders (trees, buildings against bright sky).
-        // Dark pixels have clean, noise-free luma — sharp threshold is stable.
-        float occlusion = smoothstep(SCORCH_OCCLUDE_FLOOR, SCORCH_OCCLUDE_CEIL, Y_decision);
-
-        float scorch_shutoff = 1.0 - smoothstep(SCORCH_SHUTOFF_BEGIN, SCORCH_SHUTOFF_END, smoothed_scorch_frac);
-        // blur_val² — natural center concentration, no threshold boundary.
-        float raw = blur_val * blur_val * occlusion * scorch_shutoff;
-
-        // Floor kills faint outer fringe, smootherstep (C2) compresses midrange.
-        raw = max(raw - 0.07, 0.0) / 0.93;
-        raw = raw*raw*raw*(raw*(6.0*raw - 15.0) + 10.0);
-
-        expansion += SCORCH_PEAK_BOOST * raw;
-    }
-    #endif
-
-    #if DEBUG_SHOW_SCORCH
-    {
-        // Same B-spline upsample as main path for accurate debug view.
-        vec2 dtc = CELFLARE_SCORCH_pos / CELFLARE_SCORCH_pt - 0.5;
-        vec2 df  = fract(dtc);
-        dtc = (floor(dtc) + 0.5) * CELFLARE_SCORCH_pt;
-        vec2 df2 = df * df, df3 = df2 * df;
-        vec2 dw0 = (1.0 - df) * (1.0 - df) * (1.0 - df) * (1.0 / 6.0);
-        vec2 dw1 = (4.0 - 6.0 * df2 + 3.0 * df3) * (1.0 / 6.0);
-        vec2 dw2 = (1.0 + 3.0 * df + 3.0 * df2 - 3.0 * df3) * (1.0 / 6.0);
-        vec2 dw3 = df3 * (1.0 / 6.0);
-        vec2 ds01 = dw0 + dw1, ds23 = dw2 + dw3;
-        vec2 dp01 = dtc + (-1.0 + dw1 / ds01) * CELFLARE_SCORCH_pt;
-        vec2 dp23 = dtc + ( 1.0 + dw3 / ds23) * CELFLARE_SCORCH_pt;
-        float sd =
-            CELFLARE_SCORCH_tex(vec2(dp01.x, dp01.y)).r * ds01.x * ds01.y +
-            CELFLARE_SCORCH_tex(vec2(dp23.x, dp01.y)).r * ds23.x * ds01.y +
-            CELFLARE_SCORCH_tex(vec2(dp01.x, dp23.y)).r * ds01.x * ds23.y +
-            CELFLARE_SCORCH_tex(vec2(dp23.x, dp23.y)).r * ds23.x * ds23.y;
-        float oc = smoothstep(SCORCH_OCCLUDE_FLOOR, SCORCH_OCCLUDE_CEIL, Y_decision);
-        float boost = sd * sd * oc;
-        // Yellow = raw blur² × occlusion (without shutoff/crush/peak scaling)
-        return vec4(gamma709_to_pq2020(vec3(boost, boost * 0.6, 0.0)), 1.0);
-    }
-    #endif
-
-    // -------------------------------------------------------------------------
-    // BELOW-KNEE CHROMA RAMP + APL LOW-SAT COMPENSATION
-    // -------------------------------------------------------------------------
-    #if ENABLE_SAT_BOOST
-        float sat_knee = max(master_knee - SAT_KNEE_OFFSET, 0.0);
-        float knee_chroma = (SAT_KNEE_OFFSET > 0.0)
-            ? smoothstep(sat_knee, master_knee, Y_decision) * SAT_KNEE_PEAK
-            : 0.0;
-    #endif
-    #if ENABLE_APL_SAT
-        float apl_scene = smoothstep(APL_SAT_FRAC_LOW, APL_SAT_FRAC_HIGH, smoothed_bright_frac) * APL_SAT_MAX;
-        float lowsat_w = 1.0 - smoothstep(0.0, APL_SAT_LOWSAT_CEIL, sat_raw);
-        float apl_sat = apl_scene * lowsat_w;
     #endif
 
     #if DEBUG_SHOW_WP && (ENABLE_WARM_PROTECT || ENABLE_PALE_SKIN)
@@ -1235,92 +887,46 @@ vec4 hook() {
         #if ENABLE_PALE_SKIN
             ps_mag = PS_COMPRESS * ps_w * 10.0;
         #endif
-        vec3 dbg = vec3(ps_mag, wp_mag, 0.0);  // green: warm lift, red: pale compress
-        if (HOOKED_pos.x < 0.06 && HOOKED_pos.y < 0.03) {
-            float bar = smoothstep(0.0, 0.06, HOOKED_pos.x);
-            dbg = (bar < smoothed_bright_frac) ? vec3(0.5, 0.5, 0.0) : vec3(0.1);
-        }
-        return vec4(gamma709_to_pq2020(dbg), color.a);
+        return vec4(gamma709_to_pq2020(vec3(ps_mag, wp_mag, 0.0)), color.a);
     }
     #endif
 
     // -------------------------------------------------------------------------
-    // EARLY EXIT: Skip remaining processing for non-expanded pixels
+    // EARLY EXIT: non-expanded pixels
     // -------------------------------------------------------------------------
     if (expansion < 1.001) {
-        #if ENABLE_SAT_BOOST || ENABLE_APL_SAT
-        {
-            float early_sat = 0.0;
-            #if ENABLE_SAT_BOOST
-                early_sat = knee_chroma;
-            #endif
-            #if ENABLE_APL_SAT
-                early_sat += apl_sat;
-            #endif
-            if (early_sat > 0.001) {
-                float Y_lin = get_luma(rgb_linear);
-                vec3 rgb_out = mix(vec3(Y_lin), rgb_linear, 1.0 + early_sat);
-                return vec4(linear709_to_pq2020(rgb_out), color.a);
-            }
-        }
-        #endif
         return vec4(gamma709_to_pq2020(color.rgb), color.a);
     }
 
-    #if DEBUG_SHOW_MASK
+    #if DEBUG_SHOW_EXPANSION
+    {
         float exp_amount = (expansion - 1.0) / 2.5;
         return vec4(gamma709_to_pq2020(vec3(exp_amount, exp_amount * 0.3, 0.0)), 1.0);
-    #endif
-
-    #if DEBUG_SHOW_EXPANSION
-        if (HOOKED_pos.x > 0.75 && HOOKED_pos.y > 0.9) {
-            float peak_norm = (highlight_peak - 1.5) / 2.0;
-            float steep_norm = (exp_steepness - 1.5) / 2.5;
-            return vec4(gamma709_to_pq2020(vec3(peak_norm, steep_norm, scene_knee_end)), 1.0);
-        }
+    }
     #endif
 
     // -------------------------------------------------------------------------
-    // APPLY EXPANSION + CHROMA PROCESSING (Oklab Space)
+    // APPLY EXPANSION (Oklab Space)
     // -------------------------------------------------------------------------
+    // L always scales by cbrt(expansion) (equivalent to linear RGB multiply).
+    // Chroma scales by a REDUCED amount for saturated pixels — full cbrt
+    // causes saturated colors to gain perceptual brightness from chroma
+    // amplification that desaturated highlights don't get, inverting contrast
+    // (yellow balloon > white specular, blonde hair > white shine).
+    //
+    // CHROMA_SCALE controls the attenuation: 1.0 = full cbrt (v3.2 behavior),
+    // 0.5 = half chroma amplification, 0.0 = no chroma change.
+    // Attenuation weighted by existing saturation — near-neutrals get full
+    // cbrt (they need chroma to stay balanced), saturated pixels get reduced.
     vec3 oklab_exp = oklab_orig;
-    float cbrt_exp = fast_cbrt(expansion);  // pow(x, 1/3) = linear RGB multiply equivalence
+    float cbrt_exp = fast_cbrt(expansion);
     oklab_exp.x *= cbrt_exp;
-    oklab_exp.yz *= cbrt_exp;
-
-    #if ENABLE_SAT_BOOST
-        float sat_boost = min(pow(max(expansion, 0.0), SAT_BOOST_EXPONENT), SAT_BOOST_MAX);
-        sat_boost = max(sat_boost, 1.0 + knee_chroma);
-        #if ENABLE_APL_SAT
-            sat_boost += apl_sat;
-        #endif
-        oklab_exp.yz *= sat_boost;
-
-        #if DEBUG_SHOW_SAT_BOOST
-            float boost_viz = (sat_boost - 1.0) / (SAT_BOOST_MAX - 1.0);
-            float chroma_out = sqrt(oklab_exp.y * oklab_exp.y + oklab_exp.z * oklab_exp.z);
-            return vec4(gamma709_to_pq2020(vec3(boost_viz, chroma_out * 3.0, 0.0)), 1.0);
-        #endif
-    #elif ENABLE_APL_SAT
-        oklab_exp.yz *= (1.0 + apl_sat);
-    #endif
+    float sat_norm = smoothstep(0.10, 0.25, chroma_orig);
+    float chroma_factor = mix(cbrt_exp, mix(1.0, cbrt_exp, CHROMA_SCALE), sat_norm);
+    oklab_exp.yz *= chroma_factor;
 
     #if ENABLE_PALE_SKIN
         oklab_exp.yz *= (1.0 + ps_sat);
-    #endif
-
-    #if ENABLE_BB_WARMTH
-    {
-        float bb_chroma = length(oklab_exp.yz);
-        if (bb_chroma > 0.001) {
-            float warm_ratio = oklab_exp.z / (abs(oklab_exp.y) + bb_chroma);
-            float warm_t = smoothstep(0.15, 0.65, warm_ratio);
-            float exp_t  = smoothstep(0.05, 0.80, expansion - 1.0);
-            oklab_exp.yz += (BB_WARMTH * warm_t * exp_t) * vec2(oklab_exp.z, -oklab_exp.y);
-            float new_chroma = length(oklab_exp.yz);
-            if (new_chroma > 0.001) oklab_exp.yz *= bb_chroma / new_chroma;
-        }
-    }
     #endif
 
     vec3 rgb_expanded = oklab_to_rgb(oklab_exp);
@@ -1330,52 +936,39 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     vec3 rgb_pq = linear709_to_pq2020(rgb_expanded);
 
-    // -------------------------------------------------------------------------
-    // DITHER (PQ Space)
-    // -------------------------------------------------------------------------
-    #if ENABLE_DITHER
-        float expansion_amount = expansion - 1.0;
-
-        if (expansion_amount > 0.05) {
-            float dither_magnitude = (1.0 / 1023.0) * sqrt(expansion_amount) * DITHER_STRENGTH;
-
-            float pq_scale = max(rgb_pq.g, 0.45) / 0.5;
-            float pq_correction = pq_scale * pq_scale * pq_scale;
-            dither_magnitude *= pq_correction;
-
-            vec2 noise_coord = gl_FragCoord.xy;
-
-            #if DITHER_TEMPORAL
-                noise_coord += vec2(float(frame) * 0.7548776662,
-                                    float(frame) * 0.5698402917) * 100.0;
-            #endif
-
-            float noise = triangularNoise(noise_coord) * 0.5;
-            rgb_pq += dither_magnitude * noise;
-
-            #if DEBUG_SHOW_DITHER
-                float mag_viz = dither_magnitude * 100.0;
-                return vec4(gamma709_to_pq2020(vec3(mag_viz, mag_viz * 0.5 + noise * 0.5 + 0.25, 0.0)), 1.0);
-            #endif
+    #if PQ_FAST_APPROX
+    {
+        float onset_blend = smoothstep(1.001, 1.05, expansion);
+        if (onset_blend < 1.0) {
+            vec3 rgb_pq_pass = gamma709_to_pq2020(rgb_gamma);
+            rgb_pq = mix(rgb_pq_pass, rgb_pq, onset_blend);
         }
+    }
     #endif
+
+    // -------------------------------------------------------------------------
+    // PQ-AWARE DITHER — break 8-bit source banding after expansion
+    // -------------------------------------------------------------------------
+    // 8-bit source has 256 gamma steps. After 2-3× expansion, each step is
+    // amplified and becomes visible in 10-bit PQ output. Triangular dither
+    // (sum of two uniforms) randomizes sub-step placement.
+    // Integer hash with frame-based temporal variation (no sin() SFU calls).
+    {
+        uvec2 pixel = uvec2(floor(HOOKED_pos * HOOKED_size));
+        uint seed = pixel.x + pixel.y * uint(HOOKED_size.x) + uint(frame) * 747796405u;
+        // PCG hash (two rounds for two independent uniforms)
+        seed = seed * 747796405u + 2891336453u;
+        uint h1 = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
+        h1 = (h1 >> 22u) ^ h1;
+        seed = seed * 747796405u + 2891336453u;
+        uint h2 = ((seed >> ((seed >> 28u) + 4u)) ^ seed) * 277803737u;
+        h2 = (h2 >> 22u) ^ h2;
+        float n1 = float(h1) / 4294967295.0;
+        float n2 = float(h2) / 4294967295.0;
+        float tri_noise = n1 + n2 - 1.0;  // triangular [-1, 1]
+        // Scale: 1 ten-bit PQ step
+        rgb_pq += tri_noise * (1.0 / 1023.0);
+    }
 
     return vec4(rgb_pq, color.a);
 }
-
-// =============================================================================
-// PQ BT.2020 OUTPUT REFERENCE
-// =============================================================================
-// Input at MAIN: gamma-encoded BT.709 (BT.1886, gamma ~2.4)
-// Output: PQ-encoded BT.2020 (libplacebo applies PQ EOTF to recover linear)
-//
-// | SDR Gamma | Linear | Nits (@100) | PQ Output |
-// |-----------|--------|-------------|-----------|
-// | 1.00      | 1.00   | 100         | ~0.508    |
-// | 0.78      | 0.57   | 57          | ~0.433    |
-// | 0.50      | 0.19   | 19          | ~0.328    |
-// | 0.25      | 0.04   | 4.0         | ~0.191    |
-// | Expanded (linear BT.709 > 1.0):              |
-// | -         | 2.00   | 200         | ~0.558    |
-// | -         | 2.70   | 270         | ~0.590    |
-// =============================================================================

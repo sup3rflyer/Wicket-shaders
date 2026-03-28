@@ -263,9 +263,9 @@ vec4 hook() {
 //!HEIGHT 1
 //!DESC CelFlare: Frame Stats
 
-#define KNEE            0.40
+#define KNEE            0.11    // Linear-space bright threshold (gamma 0.40 ^ 2.4)
 #define ENABLE_SCORCH   0
-#define SCORCH_THRESH   0.80
+#define SCORCH_THRESH   0.59    // Linear-space scorch threshold (gamma 0.80 ^ 2.4)
 
 #define TEMPORAL_ALPHA      0.03
 #define TEMPORAL_ALPHA_FAST 0.9
@@ -275,6 +275,10 @@ vec4 hook() {
 
 float get_luma(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float linearize(float v) {
+    return pow(max(v, 0.0), 2.4);
 }
 
 vec4 hook() {
@@ -295,7 +299,8 @@ vec4 hook() {
             vec2 spos = vec2((float(x) + 0.5) / 4.0,
                              (float(y) + 0.5) / 4.0);
 
-            float illum = dot(CELFLARE_ILLUM_tex(spos).rgb, vec3(0.2126, 0.7152, 0.0722));
+            float illum_gamma = dot(CELFLARE_ILLUM_tex(spos).rgb, vec3(0.2126, 0.7152, 0.0722));
+            float illum = linearize(illum_gamma);
             illum_sum += illum;
             illum_min = min(illum_min, illum);
             illum_max = max(illum_max, illum);
@@ -305,16 +310,17 @@ vec4 hook() {
             if (illum > SCORCH_THRESH) scorch_count += 1.0;
             #endif
 
+            // Scene-cut detection stays gamma (change threshold is perceptual)
             if (frame > 0) {
-                if (abs(illum - prev_illum[idx]) > ILLUM_CHANGE_THRESH)
+                if (abs(illum_gamma - prev_illum[idx]) > ILLUM_CHANGE_THRESH)
                     change_count += 1.0;
             }
-            prev_illum[idx] = illum;
+            prev_illum[idx] = illum_gamma;
 
-            // Log-average from source pixels (skip black bars)
+            // Log-average from source pixels in linear (skip black bars)
             vec3 rgb = HOOKED_tex(spos).rgb;
-            float Y = get_luma(rgb);
-            if (Y > 0.001) {
+            float Y = linearize(get_luma(rgb));
+            if (Y > 0.0001) {
                 log_luma_sum += log(max(Y, 1e-6));
                 valid_luma++;
             }
@@ -324,12 +330,12 @@ vec4 hook() {
     float avg_illum = illum_sum / 16.0;
     float bright_frac = bright_count / 16.0;
 
-    // Contrast: dynamic range from illumination field (stable, noise-free)
-    float contrast = (illum_min > 0.001)
+    // Contrast: dynamic range from linear illumination field (in stops)
+    float contrast = (illum_min > 0.0001)
         ? log2(max(illum_max / illum_min, 1.0))
         : 0.0;
 
-    // Log-average: perceptual brightness key from source pixels
+    // Log-average: perceptual brightness key in linear scene luminance
     float log_avg = (valid_luma > 4)
         ? exp(log_luma_sum / float(valid_luma))
         : avg_illum;
@@ -389,7 +395,6 @@ vec4 hook() {
 #define INTENSITY       1.3     // Global scaling (0.5 subtle · 1.0 normal · 1.5 aggressive)
 #define KNEE_LINEAR     0.10    // Linear-space onset (scene luminance, 0.10≈0.35 gamma, 0.18=mid-gray)
 #define CURVE_GAMMA     2.8     // Curve concentration (1.0=linear ramp, 2.0=highlight-focused)
-#define MAX_EXPANSION   3.5     // Hard ceiling (3.5 = ~406 nits at 116 ref white)
 
 // =============================================
 //  SPATIALLY-MODULATED CURVE — regional adaptation
@@ -412,28 +417,41 @@ vec4 hook() {
 #define BRIGHT_FRAC_REF 0.30    // Bright fraction where scene adaptation plateaus
 
 // =============================================
-//  DYNAMIC INTENSITY — contrast-driven expansion scaling
+//  SCENE ADAPTATION — shape + amplitude modulation
 // =============================================
-// Flat/pastel scenes (low contrast) get softer expansion.
-// Dramatic/high-contrast scenes (deep shadows + bright highlights) get punchier.
-// Driven by smoothed_contrast (log2 dynamic range in stops).
-#define ENABLE_DYNAMIC_INTENSITY 1
-#define DYN_CONTRAST_LOW    2.5     // Below this: flat scene, minimum intensity
-#define DYN_CONTRAST_HIGH   5.5     // Above this: dramatic scene, maximum intensity
-#define DYN_INTENSITY_LOW   0.75    // Multiplier for flat scenes
-#define DYN_INTENSITY_HIGH  1.40    // Multiplier for dramatic scenes
+// Two axes: APL (dark→bright) and contrast (flat→dramatic/specular).
+// Curve gamma controls RW/peak separation: higher gamma concentrates
+// expansion in highlights (RW neutral, peak strong); lower gamma spreads
+// expansion to midtones (RW lifted, peak moderate relative to RW).
+// Amplitude scales overall expansion level.
+//
+//  Scene matrix (RW = reference white shift, PK = peak headroom):
+//              Flat        Normal      Specular
+//  Dark        RW:O PK:+   RW:O PK:++ RW:O PK:+++
+//  Mid         RW:O PK:O   RW:+ PK:+  RW:O PK:++
+//  Bright      RW:- PK:O   RW:- PK:+  RW:+ PK:++
 
-// =============================================
-//  APL MODULATION — brightness-driven expansion scaling
-// =============================================
-// Dark scenes: neutral (gamma handles midtone suppression).
-// Bright scenes: dampened to prevent washing out.
-// Driven by smoothed_log_avg (perceptual brightness key).
-#define ENABLE_APL_MOD      1
-#define APL_KEY_DARK        0.03    // Below this: dark scene multiplier
-#define APL_KEY_BRIGHT      0.30    // Above this: bright scene multiplier
-#define APL_BOOST_DARK      1.00    // Neutral for dark scenes (gamma_dark suppresses midtones)
-#define APL_DAMPEN_BRIGHT   0.70    // Dampen bright scenes
+// --- Scene axes ---
+#define APL_KEY_DARK        0.005   // Linear log-avg below: dark scene (~gamma 0.09)
+#define APL_KEY_BRIGHT      0.06    // Linear log-avg above: bright scene (~gamma 0.30)
+#define DYN_CONTRAST_LOW    6.0     // Linear contrast below: flat scene (stops)
+#define DYN_CONTRAST_HIGH   13.0    // Linear contrast above: dramatic/specular (stops)
+
+// --- Curve gamma offsets (shape) ---
+// Added to CURVE_GAMMA. Higher = more highlight-focused (RW suppressed).
+#define GAMMA_DARK          1.5     // Dark scenes: highlight-focused (RW:O)
+#define GAMMA_BRIGHT        0.5     // Bright scenes: slightly highlight-focused (RW:-)
+#define GAMMA_FLAT          1.0     // Flat scenes: suppress midtone expansion
+#define GAMMA_CONTRAST      0.0     // High contrast: no extra offset (base gamma → RW:+)
+
+// --- Amplitude scaling ---
+#define AMP_APL_DARK        1.40    // Dark scene expansion amplitude
+#define AMP_APL_BRIGHT      0.60    // Bright scene expansion amplitude
+#define AMP_DYN_FLAT        0.75    // Flat scene multiplier
+#define AMP_DYN_CONTRAST    1.30    // High-contrast multiplier
+// Bright specular override: high contrast reduces bright-scene dampening
+// so structural detail and RW are preserved (bright spec → RW:+)
+#define AMP_BRIGHT_SPEC_LIFT 0.70   // How much contrast lifts bright dampening (0=off, 1=full)
 
 // =============================================
 //  SPECULAR BONUS — near-white highlight pop
@@ -450,7 +468,7 @@ vec4 hook() {
 #define SPEC_Y_LOW          0.40    // Ramp onset (wide = gentle 8-bit steps)
 #define SPEC_CHROMA_FLOOR   0.15    // Below this: full bonus (white/near-neutral)
 #define SPEC_CHROMA_CEIL    0.50    // Above this: no bonus (highly saturated only)
-#define SPEC_BOOST          0.90    // Peak expansion bonus at Y=1.0
+#define SPEC_BOOST          1.40    // Peak expansion bonus at Y=1.0
 
 // Clip diffusion: blend near-white toward illum field to soften SDR clip edges
 #define CLIP_DIFFUSION       0.30    // Max blend at Y=1.0 (0.0=off, 0.5=strong)
@@ -476,7 +494,7 @@ vec4 hook() {
 // The sum naturally zeros at invariants AND at midpoints (adjacent
 // invariants cancel). Driven regionally by illumination field.
 #define ENABLE_BB_COMP      1
-#define BB_STRENGTH         0.25    // Amplitude (0.10 subtle, 0.20 moderate, 0.30 strong)
+#define BB_STRENGTH         0.35    // Amplitude (0.10 subtle, 0.20 moderate, 0.30 strong)
 #define BB_EXP_FLOOR        0.05    // expansion-1 below: no compensation
 #define BB_EXP_CEIL         0.80    // above: full (expansion ≥ 1.8)
 #define BB_CHROMA_MIN       0.02    // Below: achromatic, skip
@@ -749,10 +767,17 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // Blend near-clip pixels toward the illumination field. The illum field
     // has the smooth gradient that SDR clipping destroyed — softens harsh
-    // SDR clip diffusion: smooth harsh specular edges via illumination field
-    // Only modifies rgb_gamma — Y_decision_gamma stays grain-stabilized
+    // SDR clip boundaries where pixel brightness far exceeds surroundings.
+    // Two gates prevent detail destruction:
+    //   illum_gate: skip small speculars in dark scenes (low Y_illum)
+    //   clip_edge:  skip broad bright areas with real detail (Y ≈ Y_illum)
+    //              — only activate when pixel is significantly above its
+    //              illumination context (actual SDR clip boundary).
+    // Only modifies rgb_gamma — Y_decision_gamma stays grain-stabilized.
     {
-        float soften = smoothstep(CLIP_DIFFUSION_FLOOR, 1.0, Y_gamma) * CLIP_DIFFUSION;
+        float illum_gate = smoothstep(0.10, 0.40, Y_illum);
+        float clip_edge = smoothstep(0.05, 0.20, Y_gamma - Y_illum);
+        float soften = smoothstep(CLIP_DIFFUSION_FLOOR, 1.0, Y_gamma) * CLIP_DIFFUSION * illum_gate * clip_edge;
         rgb_gamma = mix(rgb_gamma, illum_rgb, soften);
         Y_gamma = get_luma(rgb_gamma);
     }
@@ -764,29 +789,38 @@ vec4 hook() {
     #endif
 
     // -------------------------------------------------------------------------
-    // SPATIALLY-MODULATED PER-PIXEL EXPANSION (linear scene luminance)
+    // SCENE ADAPTATION (uniform per frame, from SSBO)
     // -------------------------------------------------------------------------
-    // Expansion is f(Y_linear) — monotonic remapping in scene-referred domain.
-    // Y_illum modulates PEAK only. Fixed CURVE_GAMMA means same fraction of
-    // peak for same Y_pixel regardless of region — shadows get consistent
-    // treatment, spatial adaptation concentrates in highlights where regional
-    // context matters.
-
-    // Scene-level adaptation (from SSBO — uniform per frame)
+    // Two scene axes: APL (dark→bright) and contrast (flat→dramatic).
+    float apl_t = smoothstep(APL_KEY_DARK, APL_KEY_BRIGHT, smoothed_log_avg);
+    float dyn_t = smoothstep(DYN_CONTRAST_LOW, DYN_CONTRAST_HIGH, smoothed_contrast);
     float bf = smoothstep(0.0, BRIGHT_FRAC_REF, smoothed_bright_frac);
 
-    // Regional adaptation: only PEAK varies with illumination context.
-    // At shadow luminances t is small, so peak variation barely affects
-    // shadows — spatial adaptation concentrates where t is large (highlights).
+    // -------------------------------------------------------------------------
+    // CURVE GAMMA MODULATION — controls RW vs peak separation
+    // -------------------------------------------------------------------------
+    // Higher gamma = highlight-focused (RW neutral/suppressed, peak strong).
+    // Lower gamma = spread to midtones (RW lifted, peak moderate relative).
+    // Dark scenes always highlight-focused (RW:O). Mid-normal gets base gamma
+    // (balanced → RW:+). Bright scenes slightly highlight-focused (RW:-).
+    // Flat scenes add gamma to suppress midtone expansion regardless of APL.
+    float scene_gamma = CURVE_GAMMA
+        + mix(GAMMA_DARK, GAMMA_BRIGHT, apl_t)
+        + mix(GAMMA_FLAT, GAMMA_CONTRAST, dyn_t);
+    scene_gamma = max(scene_gamma, 1.0);
+
+    // -------------------------------------------------------------------------
+    // SPATIALLY-MODULATED PER-PIXEL EXPANSION
+    // -------------------------------------------------------------------------
     float spatial_t = Y_illum;
     float local_peak = mix(PEAK_DARK, PEAK_BRIGHT, spatial_t);
     local_peak *= (1.0 - PEAK_ATTEN * bf);
 
-    // Per-pixel expansion in linear scene luminance
+    // Per-pixel expansion with scene-adaptive gamma
     float Y_curve = eotf_gamma(Y_decision_gamma);
     float t = max(Y_curve - KNEE_LINEAR, 0.0) / (1.0 - KNEE_LINEAR);
-    t = pow(max(t, 0.0), CURVE_GAMMA);
-    t = 1.0 - pow(1.0 - t, PEAK_SHOULDER);
+    t = pow(max(t, 0.0), scene_gamma);
+    t = 1.0 - pow(max(1.0 - t, 0.0), PEAK_SHOULDER);
     float expansion = 1.0 + (local_peak - 1.0) * t * INTENSITY;
 
     #if DEBUG_SHOW_DETAIL
@@ -797,28 +831,19 @@ vec4 hook() {
     #endif
 
     // -------------------------------------------------------------------------
-    // STEP 3: DYNAMIC INTENSITY (contrast-driven scaling)
+    // SCENE AMPLITUDE — overall expansion scaling
     // -------------------------------------------------------------------------
-    // Flat scenes get softer expansion, dramatic scenes get punchier.
-    #if ENABLE_DYNAMIC_INTENSITY
+    // APL: dark → full expansion, bright → dampened.
+    // Contrast: flat → softer, dramatic → punchier.
+    // Bright-specular override: high contrast in bright scenes lifts the
+    // dampening — preserves structural contrast and allows RW:+ (bright spec).
     {
-        float dyn_factor = smoothstep(DYN_CONTRAST_LOW, DYN_CONTRAST_HIGH, smoothed_contrast);
-        float dyn_intensity = mix(DYN_INTENSITY_LOW, DYN_INTENSITY_HIGH, dyn_factor);
-        expansion = 1.0 + (expansion - 1.0) * dyn_intensity;
+        float amp_apl = mix(AMP_APL_DARK, AMP_APL_BRIGHT, apl_t);
+        float amp_dyn = mix(AMP_DYN_FLAT, AMP_DYN_CONTRAST, dyn_t);
+        // High contrast lifts bright-scene dampening toward neutral
+        amp_apl = mix(amp_apl, max(amp_apl, 1.0), dyn_t * apl_t * AMP_BRIGHT_SPEC_LIFT);
+        expansion = 1.0 + (expansion - 1.0) * amp_apl * amp_dyn;
     }
-    #endif
-
-    // -------------------------------------------------------------------------
-    // STEP 4: APL MODULATION (brightness-driven scaling)
-    // -------------------------------------------------------------------------
-    // Dark scenes get more headroom, bright scenes get dampened.
-    #if ENABLE_APL_MOD
-    {
-        float apl_t = smoothstep(APL_KEY_DARK, APL_KEY_BRIGHT, smoothed_log_avg);
-        float apl_factor = mix(APL_BOOST_DARK, APL_DAMPEN_BRIGHT, apl_t);
-        expansion = 1.0 + (expansion - 1.0) * apl_factor;
-    }
-    #endif
 
     // (Bloom moved to after expansion application — colored light, not scalar)
 
@@ -826,13 +851,18 @@ vec4 hook() {
     // SPECULAR BONUS — near-white highlight pop
     // -------------------------------------------------------------------------
     // Purely f(Y_pixel): wide smoothstep ramp squared so derivative is zero
-    // at onset — no 8-bit step contours. No Y_illum, no context ratio.
+    // at onset — no 8-bit step contours.
+    // Gated on Y_illum: in broad bright areas (high illum), the bonus pushes
+    // the entire near-white range to the peak, flattening the expansion
+    // curve and destroying subtle highlight shading. In dark scenes with
+    // isolated speculars (low illum), full bonus adds maximum pop.
     #if ENABLE_SPECULAR_BONUS
     float spec_strength;
     {
         float spec_ramp = smoothstep(SPEC_Y_LOW, 1.0, Y_decision_gamma);
         float spec_chroma_w = 1.0 - smoothstep(SPEC_CHROMA_FLOOR, SPEC_CHROMA_CEIL, chroma_orig_gamma);
-        spec_strength = SPEC_BOOST * spec_ramp * spec_ramp * spec_chroma_w;
+        float spec_illum_gate = 1.0 - smoothstep(0.20, 0.50, Y_illum);
+        spec_strength = SPEC_BOOST * spec_ramp * spec_ramp * spec_chroma_w * spec_illum_gate;
         expansion += spec_strength;
     }
     #endif
@@ -842,11 +872,6 @@ vec4 hook() {
         return vec4(gamma709_to_pq2020(vec3(0.0, spec_strength, spec_strength)), 1.0);
     }
     #endif
-
-    // -------------------------------------------------------------------------
-    // EXPANSION CAP
-    // -------------------------------------------------------------------------
-    expansion = min(expansion, MAX_EXPANSION);
 
     // -------------------------------------------------------------------------
     // LINEARIZE

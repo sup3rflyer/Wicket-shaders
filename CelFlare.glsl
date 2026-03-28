@@ -125,12 +125,13 @@ vec4 hook() {
 }
 
 // =============================================================================
-// PASS 2: LUMINANCE DOWNSAMPLE (1/4 resolution)
+// PASS 2: COLOR DOWNSAMPLE (1/4 resolution)
 // =============================================================================
-// 4-tap bilinear from RAW pixel luma (.rgb), not grain-stabilized alpha.
-// The illumination field is blurred at sigma=25 on 1/4 res — grain is
-// destroyed by the Gaussian. Using stabilized alpha leaked the bilateral
-// pre-filter's asymmetric rejection as visible outlines at feature edges.
+// 4-tap bilinear from RAW pixel RGB (gamma-space), not grain-stabilized alpha.
+// The illumination field is blurred at sigma=20 on 1/4 res — grain is
+// destroyed by the Gaussian. RGB stored for colored bloom; Y extracted
+// downstream via dot product (all existing Y_illum users read .r which
+// now contains the R channel — stats pass updated to compute Y from .rgb).
 
 //!HOOK MAIN
 //!BIND HOOKED
@@ -140,14 +141,13 @@ vec4 hook() {
 //!DESC CelFlare: Downsample 1/4
 
 vec4 hook() {
-    const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
     vec2 pt = HOOKED_pt;
-    float Y  = dot(HOOKED_tex(HOOKED_pos + vec2(-pt.x, -pt.y)).rgb, luma_coeff);
-    Y       += dot(HOOKED_tex(HOOKED_pos + vec2( pt.x, -pt.y)).rgb, luma_coeff);
-    Y       += dot(HOOKED_tex(HOOKED_pos + vec2(-pt.x,  pt.y)).rgb, luma_coeff);
-    Y       += dot(HOOKED_tex(HOOKED_pos + vec2( pt.x,  pt.y)).rgb, luma_coeff);
-    Y *= 0.25;
-    return vec4(Y, 0.0, 0.0, 1.0);
+    vec3 rgb  = HOOKED_tex(HOOKED_pos + vec2(-pt.x, -pt.y)).rgb;
+    rgb      += HOOKED_tex(HOOKED_pos + vec2( pt.x, -pt.y)).rgb;
+    rgb      += HOOKED_tex(HOOKED_pos + vec2(-pt.x,  pt.y)).rgb;
+    rgb      += HOOKED_tex(HOOKED_pos + vec2( pt.x,  pt.y)).rgb;
+    rgb *= 0.25;
+    return vec4(rgb, 1.0);
 }
 
 // =============================================================================
@@ -190,16 +190,16 @@ vec4 hook() {
     vec2 pt = CELFLARE_DS_pt;
     vec2 pos = CELFLARE_DS_pos;
 
-    float s0 = CELFLARE_DS_tex(pos).r;
-    float sum = s0;
+    vec3 s0 = CELFLARE_DS_tex(pos).rgb;
+    vec3 sum = s0;
 
     for (int i = 0; i < 20; i++) {
-        float sp = CELFLARE_DS_tex(pos + vec2(go[i] * pt.x, 0.0)).r;
-        float sn = CELFLARE_DS_tex(pos - vec2(go[i] * pt.x, 0.0)).r;
+        vec3 sp = CELFLARE_DS_tex(pos + vec2(go[i] * pt.x, 0.0)).rgb;
+        vec3 sn = CELFLARE_DS_tex(pos - vec2(go[i] * pt.x, 0.0)).rgb;
         sum += (sp + sn) * gw[i];
     }
 
-    return vec4(sum * BLUR_INV_WSUM, 0.0, 0.0, 1.0);
+    return vec4(sum * BLUR_INV_WSUM, 1.0);
 }
 
 // =============================================================================
@@ -235,16 +235,16 @@ vec4 hook() {
     vec2 pt = CELFLARE_BLUR_H_pt;
     vec2 pos = CELFLARE_BLUR_H_pos;
 
-    float s0 = CELFLARE_BLUR_H_tex(pos).r;
-    float sum = s0;
+    vec3 s0 = CELFLARE_BLUR_H_tex(pos).rgb;
+    vec3 sum = s0;
 
     for (int i = 0; i < 20; i++) {
-        float sp = CELFLARE_BLUR_H_tex(pos + vec2(0.0, go[i] * pt.y)).r;
-        float sn = CELFLARE_BLUR_H_tex(pos - vec2(0.0, go[i] * pt.y)).r;
+        vec3 sp = CELFLARE_BLUR_H_tex(pos + vec2(0.0, go[i] * pt.y)).rgb;
+        vec3 sn = CELFLARE_BLUR_H_tex(pos - vec2(0.0, go[i] * pt.y)).rgb;
         sum += (sp + sn) * gw[i];
     }
 
-    return vec4(sum * BLUR_INV_WSUM, 0.0, 0.0, 1.0);
+    return vec4(sum * BLUR_INV_WSUM, 1.0);
 }
 
 // =============================================================================
@@ -295,7 +295,7 @@ vec4 hook() {
             vec2 spos = vec2((float(x) + 0.5) / 4.0,
                              (float(y) + 0.5) / 4.0);
 
-            float illum = CELFLARE_ILLUM_tex(spos).r;
+            float illum = dot(CELFLARE_ILLUM_tex(spos).rgb, vec3(0.2126, 0.7152, 0.0722));
             illum_sum += illum;
             illum_min = min(illum_min, illum);
             illum_max = max(illum_max, illum);
@@ -381,34 +381,33 @@ vec4 hook() {
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
-//!DESC CelFlare v4.0
+//!DESC CelFlare v4.0 (Illumination-Decomposition SDR->HDR)
 
 // =============================================
 //  MAIN TUNING — start here
 // =============================================
-#define INTENSITY       1.2     // Global scaling (0.5 subtle · 1.0 normal · 1.5 aggressive)
-#define KNEE            0.40    // Expansion onset — midtones below this stay near SDR
+#define INTENSITY       1.3     // Global scaling (0.5 subtle · 1.0 normal · 1.5 aggressive)
+#define KNEE_LINEAR     0.10    // Linear-space onset (scene luminance, 0.10≈0.35 gamma, 0.18=mid-gray)
+#define CURVE_GAMMA     2.8     // Curve concentration (1.0=linear ramp, 2.0=highlight-focused)
 #define MAX_EXPANSION   3.5     // Hard ceiling (3.5 = ~406 nits at 116 ref white)
-#define SCORCH_BOOST    0.00    // Extra lift for near-white highlights (0 = off)
 
 // =============================================
 //  SPATIALLY-MODULATED CURVE — regional adaptation
 // =============================================
-// Expansion is always f(Y_pixel) — monotonic remapping, no 8-bit banding.
-// Y_illum modulates the curve SHAPE: bright regions get gentle/broad curves
-// (preserving face gradients), dark regions get steep/concentrated curves
-// (highlight pop). Uses linear ramp + pow(t, gamma) — no smoothstep
-// inflection point in the face brightness range.
+// Expansion is f(Y_linear) — monotonic remapping in scene-referred domain.
+// Y_illum modulates PEAK only (not curve shape). Fixed CURVE_GAMMA means
+// same Y_pixel always gets the same fraction of peak everywhere — prevents
+// spatial modulation from distorting mid-tone contrast ratios (skin shadows).
 //
-// Nit targets at REFERENCE_WHITE=116:
-//   Reference white (Y≈0.85): 150–200 nits
-//   Highlights (Y≈0.90–0.95): 230–290 nits
-//   Specular (Y≈0.95–1.00):   300–350 nits
-//   Midtones (Y<0.50):         near SDR (~no expansion)
+// Nit targets at REFERENCE_WHITE=116 (peak=3.0–3.5):
+//   Midtones (Y_linear < 0.10):  near SDR (~no expansion)
+//   Upper mid (Y_lin≈0.30):      ~40 nits (subtle lift)
+//   Bright face (Y_lin≈0.60):    ~140–160 nits
+//   Highlight (Y_lin≈0.90):      ~320–360 nits
+//   Specular (Y_lin≈1.00):       ~400 nits (capped)
 #define PEAK_BRIGHT     3.0     // Expansion peak for bright regions
 #define PEAK_DARK       3.5     // Expansion peak for dark regions (highlight headroom)
-#define GAMMA_BRIGHT    1.5     // Curve shape: moderate concentration
-#define GAMMA_DARK      3.0     // Curve shape: strong highlight concentration
+#define PEAK_SHOULDER   1.5     // Peak rolloff (1.0 = off, 1.5 = moderate, 2.0 = strong)
 #define PEAK_ATTEN      0.35    // How much bright_frac further reduces peak (0.0–0.6)
 #define BRIGHT_FRAC_REF 0.30    // Bright fraction where scene adaptation plateaus
 
@@ -421,7 +420,7 @@ vec4 hook() {
 #define ENABLE_DYNAMIC_INTENSITY 1
 #define DYN_CONTRAST_LOW    2.5     // Below this: flat scene, minimum intensity
 #define DYN_CONTRAST_HIGH   5.5     // Above this: dramatic scene, maximum intensity
-#define DYN_INTENSITY_LOW   0.85    // Multiplier for flat scenes
+#define DYN_INTENSITY_LOW   0.75    // Multiplier for flat scenes
 #define DYN_INTENSITY_HIGH  1.40    // Multiplier for dramatic scenes
 
 // =============================================
@@ -451,18 +450,11 @@ vec4 hook() {
 #define SPEC_Y_LOW          0.40    // Ramp onset (wide = gentle 8-bit steps)
 #define SPEC_CHROMA_FLOOR   0.15    // Below this: full bonus (white/near-neutral)
 #define SPEC_CHROMA_CEIL    0.50    // Above this: no bonus (highly saturated only)
-#define SPEC_BOOST          0.40    // Peak expansion bonus at Y=1.0
+#define SPEC_BOOST          0.90    // Peak expansion bonus at Y=1.0
 
-// =============================================
-//  SCORCH — bright region hotspot
-// =============================================
-// Uses min(Y_pixel, Y_illum) as driver — dark pixels near bright regions
-// can never get scorch higher than their own brightness warrants.
-// Eliminates dark-object halos from illumination field bleeding.
-#define ENABLE_SCORCH        0       // must match stats pass
-#define SCORCH_PIXEL_FLOOR   0.85    // Per-pixel gate: only near-white pixels get scorch
-#define SCORCH_SHUTOFF_BEGIN 0.60
-#define SCORCH_SHUTOFF_END   0.90
+// Clip diffusion: blend near-white toward illum field to soften SDR clip edges
+#define CLIP_DIFFUSION       0.30    // Max blend at Y=1.0 (0.0=off, 0.5=strong)
+#define CLIP_DIFFUSION_FLOOR 0.85    // Y_gamma below: no softening
 
 // =============================================
 //  CHROMA — expansion color behavior
@@ -472,23 +464,47 @@ vec4 hook() {
 // desaturated highlights at the same luminance expansion (Helmholtz-Kohlrausch).
 // CHROMA_SCALE reduces this: 1.0 = full cbrt, 0.5 = half, 0.0 = chroma frozen.
 // Only affects already-saturated pixels — near-neutrals always get full cbrt.
-#define CHROMA_SCALE        0.50
+#define CHROMA_SCALE        1.00    // Hunt effect compensation (1.0=colorimetric, 0.0=chroma frozen)
+
+// =============================================
+//  BEZOLD-BRÜCKE — full-spectrum regional hue compensation
+// =============================================
+// At HDR luminances, BB shifts all hues toward three invariant points:
+//   ~572nm yellow (90° Oklab), ~503nm green (175°), ~478nm blue (265°)
+// Compensation uses proximity-weighted attraction: each invariant pulls
+// nearby hues back, weighted by squared cosine of angular distance.
+// The sum naturally zeros at invariants AND at midpoints (adjacent
+// invariants cancel). Driven regionally by illumination field.
+#define ENABLE_BB_COMP      1
+#define BB_STRENGTH         0.25    // Amplitude (0.10 subtle, 0.20 moderate, 0.30 strong)
+#define BB_EXP_FLOOR        0.05    // expansion-1 below: no compensation
+#define BB_EXP_CEIL         0.80    // above: full (expansion ≥ 1.8)
+#define BB_CHROMA_MIN       0.02    // Below: achromatic, skip
+#define BB_CHROMA_MAX       0.08    // Above: full compensation
+// Invariant hue directions in Oklab a,b (unit vectors)
+#define BB_Y_COS  0.0000    // cos(90°)  — yellow invariant ~572nm
+#define BB_Y_SIN  1.0000    // sin(90°)
+#define BB_G_COS -0.9962    // cos(175°) — green invariant ~503nm
+#define BB_G_SIN  0.0872    // sin(175°)
+#define BB_B_COS -0.0872    // cos(265°) — blue invariant ~478nm
+#define BB_B_SIN -0.9962    // sin(265°)
 
 // --- Warm Tone Compensation ---
-#define ENABLE_WARM_PROTECT 1
-#define WP_LUM_BOOST        0.40
+#define ENABLE_WARM_PROTECT 0
+#define WP_LUM_BOOST        0.20
 #define WP_HUE_COS          0.7317  // cos(0.75) — precomputed unit vector for hue center
 #define WP_HUE_SIN          0.6816  // sin(0.75)
 #define WP_HUE_POWER        2.0     // Sharpness of hue window (higher = narrower)
-#define WP_CHROMA_MIN       0.03
+#define WP_CHROMA_MIN       0.08
 #define WP_CHROMA_MAX       0.14
-#define WP_LUM_FLOOR        0.50
+#define WP_LUM_FLOOR        0.40
+#define WP_LUM_CEIL         0.55    // Fade out for near-white skin (linear Y)
 #define WP_BRIGHT_FRAC_LOW  0.05
 #define WP_BRIGHT_FRAC_HIGH 0.30
 
 #define ENABLE_PALE_SKIN 1
-#define ENABLE_PS_COMPRESS  0       // Pale skin expansion compression (0 = off)
-#define PS_COMPRESS         0.00
+#define ENABLE_PS_COMPRESS  1       // Pale skin expansion compression (0 = off)
+#define PS_COMPRESS         0.30
 #define PS_SAT_BOOST        0.10
 #define PS_BRIGHT_FLOOR     0.50
 #define PS_CHROMA_CEIL      0.03
@@ -513,6 +529,8 @@ vec4 hook() {
 #define DEBUG_SHOW_SPECULAR 0   // Specular bonus: cyan = spec strength
 #define DEBUG_SHOW_WP       0   // Warm tone protection
 #define DEBUG_SHOW_STATS    0   // avg_illum + bright_frac + contrast + log_avg bars
+#define DEBUG_SDR_TONEMAP   0   // Hue-preserving tonemap to SDR for comparison screenshots
+#define DEBUG_SHOW_BB       0   // BB compensation: green=drive, red=rotation magnitude
 
 // =============================================================================
 // HELPER FUNCTIONS
@@ -631,7 +649,8 @@ vec3 oklab_to_rgb(vec3 lab) {
 // BSPLINE_UPSAMPLE 0: Hardware bilinear (1 fetch, sufficient for smooth fields)
 #define BSPLINE_UPSAMPLE 0
 
-float upsample_illum() {
+// RGB upsample — used for colored bloom
+vec3 upsample_illum_rgb() {
     #if BSPLINE_UPSAMPLE
     vec2 tc = CELFLARE_ILLUM_pos / CELFLARE_ILLUM_pt - 0.5;
     vec2 f  = fract(tc);
@@ -648,12 +667,12 @@ float upsample_illum() {
     vec2 p23 = tc + ( 1.0 + w3 / s23) * CELFLARE_ILLUM_pt;
 
     return
-        CELFLARE_ILLUM_tex(vec2(p01.x, p01.y)).r * s01.x * s01.y +
-        CELFLARE_ILLUM_tex(vec2(p23.x, p01.y)).r * s23.x * s01.y +
-        CELFLARE_ILLUM_tex(vec2(p01.x, p23.y)).r * s01.x * s23.y +
-        CELFLARE_ILLUM_tex(vec2(p23.x, p23.y)).r * s23.x * s23.y;
+        CELFLARE_ILLUM_tex(vec2(p01.x, p01.y)).rgb * s01.x * s01.y +
+        CELFLARE_ILLUM_tex(vec2(p23.x, p01.y)).rgb * s23.x * s01.y +
+        CELFLARE_ILLUM_tex(vec2(p01.x, p23.y)).rgb * s01.x * s23.y +
+        CELFLARE_ILLUM_tex(vec2(p23.x, p23.y)).rgb * s23.x * s23.y;
     #else
-    return CELFLARE_ILLUM_tex(CELFLARE_ILLUM_pos).r;
+    return CELFLARE_ILLUM_tex(CELFLARE_ILLUM_pos).rgb;
     #endif
 }
 
@@ -668,6 +687,9 @@ vec4 hook() {
     #if DEBUG_BYPASS
         return vec4(gamma709_to_pq2020(color.rgb), color.a);
     #endif
+
+    // DEBUG: uncomment to test — solid red = shader is loading
+    //return vec4(gamma709_to_pq2020(vec3(1.0, 0.0, 0.0)), 1.0);
 
     // -------------------------------------------------------------------------
     // DEBUG: Stats overlay (top-left bars)
@@ -699,7 +721,20 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     float Y_gamma = get_luma(rgb_gamma);
 
-    if (Y_gamma < EARLY_EXIT_GAMMA) return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    // -------------------------------------------------------------------------
+    // ILLUMINATION FIELD (before early exit — bloom needs this for dark pixels)
+    // -------------------------------------------------------------------------
+    vec3 illum_rgb = upsample_illum_rgb();
+    float Y_illum = get_luma(illum_rgb);
+
+    #if DEBUG_SHOW_ILLUM
+        return vec4(gamma709_to_pq2020(illum_rgb), 1.0);
+    #endif
+
+    // Early exit: very dark pixels (bloom only touches Y>0.85, safe to skip)
+    if (Y_gamma < EARLY_EXIT_GAMMA) {
+        return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    }
 
     // -------------------------------------------------------------------------
     // GRAIN STABILIZATION
@@ -710,13 +745,17 @@ vec4 hook() {
     #endif
 
     // -------------------------------------------------------------------------
-    // ILLUMINATION FIELD (B-spline upsampled from 1/4 res)
+    // BLOOM — highlight diffusion (pre-expansion)
     // -------------------------------------------------------------------------
-    float Y_illum = upsample_illum();
-
-    #if DEBUG_SHOW_ILLUM
-        return vec4(gamma709_to_pq2020(vec3(Y_illum)), 1.0);
-    #endif
+    // Blend near-clip pixels toward the illumination field. The illum field
+    // has the smooth gradient that SDR clipping destroyed — softens harsh
+    // SDR clip diffusion: smooth harsh specular edges via illumination field
+    // Only modifies rgb_gamma — Y_decision_gamma stays grain-stabilized
+    {
+        float soften = smoothstep(CLIP_DIFFUSION_FLOOR, 1.0, Y_gamma) * CLIP_DIFFUSION;
+        rgb_gamma = mix(rgb_gamma, illum_rgb, soften);
+        Y_gamma = get_luma(rgb_gamma);
+    }
 
     // Cheap gamma-space chroma for specular detection (max-min channel spread)
     #if ENABLE_SPECULAR_BONUS
@@ -725,29 +764,29 @@ vec4 hook() {
     #endif
 
     // -------------------------------------------------------------------------
-    // SPATIALLY-MODULATED PER-PIXEL EXPANSION
+    // SPATIALLY-MODULATED PER-PIXEL EXPANSION (linear scene luminance)
     // -------------------------------------------------------------------------
-    // Expansion is f(Y_pixel) — monotonic remapping, no 8-bit banding.
-    // Y_illum modulates the curve parameters: bright regions get gentle/broad
-    // curves (preserving face gradients), dark regions get steep/concentrated
-    // curves (highlight pop in dark scenes).
-    //
-    // Linear ramp + pow(t, gamma): no smoothstep inflection. For gamma >= 1,
-    // the derivative is monotonically increasing — no local maximum in the
-    // face brightness range that would create visible contours.
+    // Expansion is f(Y_linear) — monotonic remapping in scene-referred domain.
+    // Y_illum modulates PEAK only. Fixed CURVE_GAMMA means same fraction of
+    // peak for same Y_pixel regardless of region — shadows get consistent
+    // treatment, spatial adaptation concentrates in highlights where regional
+    // context matters.
 
     // Scene-level adaptation (from SSBO — uniform per frame)
     float bf = smoothstep(0.0, BRIGHT_FRAC_REF, smoothed_bright_frac);
 
-    // Regional adaptation (from illumination field — varies per pixel)
+    // Regional adaptation: only PEAK varies with illumination context.
+    // At shadow luminances t is small, so peak variation barely affects
+    // shadows — spatial adaptation concentrates where t is large (highlights).
     float spatial_t = Y_illum;
     float local_peak = mix(PEAK_DARK, PEAK_BRIGHT, spatial_t);
-    local_peak *= (1.0 - PEAK_ATTEN * bf);  // scene-level dampening on top
-    float local_gamma = mix(GAMMA_DARK, GAMMA_BRIGHT, spatial_t);
+    local_peak *= (1.0 - PEAK_ATTEN * bf);
 
-    // Per-pixel expansion curve: linear ramp from KNEE, shaped by pow(gamma)
-    float t = max(Y_decision_gamma - KNEE, 0.0) / (1.0 - KNEE);
-    t = pow(max(t, 0.0), local_gamma);
+    // Per-pixel expansion in linear scene luminance
+    float Y_curve = eotf_gamma(Y_decision_gamma);
+    float t = max(Y_curve - KNEE_LINEAR, 0.0) / (1.0 - KNEE_LINEAR);
+    t = pow(max(t, 0.0), CURVE_GAMMA);
+    t = 1.0 - pow(1.0 - t, PEAK_SHOULDER);
     float expansion = 1.0 + (local_peak - 1.0) * t * INTENSITY;
 
     #if DEBUG_SHOW_DETAIL
@@ -781,27 +820,7 @@ vec4 hook() {
     }
     #endif
 
-    // -------------------------------------------------------------------------
-    // SCORCH — near-white highlight boost
-    // -------------------------------------------------------------------------
-    #if ENABLE_SCORCH
-    {
-        float scorch_drive = min(Y_decision_gamma, Y_illum);
-        float scorch_region = smoothstep(0.70, 0.92, scorch_drive);
-        float scorch_pixel = smoothstep(SCORCH_PIXEL_FLOOR, SCORCH_PIXEL_FLOOR + 0.10, Y_decision_gamma);
-        float scorch_t = scorch_region * scorch_pixel;
-        scorch_t *= scorch_t;
-        float scorch_shutoff = 1.0 - smoothstep(SCORCH_SHUTOFF_BEGIN, SCORCH_SHUTOFF_END, smoothed_scorch_frac);
-        expansion += SCORCH_BOOST * scorch_t * scorch_shutoff;
-
-        #if DEBUG_SHOW_SCORCH
-        {
-            float sc = scorch_t * scorch_shutoff;
-            return vec4(gamma709_to_pq2020(vec3(sc, sc * 0.6, 0.0)), 1.0);
-        }
-        #endif
-    }
-    #endif
+    // (Bloom moved to after expansion application — colored light, not scalar)
 
     // -------------------------------------------------------------------------
     // SPECULAR BONUS — near-white highlight pop
@@ -861,7 +880,8 @@ vec4 hook() {
     #if ENABLE_WARM_PROTECT
         float wp_chroma_w = smoothstep(WP_CHROMA_MIN - 0.03, WP_CHROMA_MIN + 0.03, chroma_orig)
                           * (1.0 - smoothstep(WP_CHROMA_MAX, WP_CHROMA_MAX + 0.08, chroma_orig));
-        float wp_lum_w = smoothstep(0.0, WP_LUM_FLOOR, Y_decision);
+        float wp_lum_w = smoothstep(0.0, WP_LUM_FLOOR, Y_decision)
+                       * (1.0 - smoothstep(WP_LUM_CEIL, WP_LUM_CEIL + 0.20, Y_decision));
         float wp_w = wp_hue_w * wp_chroma_w * wp_lum_w;
         expansion += WP_LUM_BOOST * wp_w * wp_gate;
     #endif
@@ -892,7 +912,7 @@ vec4 hook() {
     #endif
 
     // -------------------------------------------------------------------------
-    // EARLY EXIT: non-expanded pixels
+    // EARLY EXIT: non-expanded pixels (unless bloom is active)
     // -------------------------------------------------------------------------
     if (expansion < 1.001) {
         return vec4(gamma709_to_pq2020(color.rgb), color.a);
@@ -906,30 +926,109 @@ vec4 hook() {
     #endif
 
     // -------------------------------------------------------------------------
-    // APPLY EXPANSION (Oklab Space)
+    // APPLY EXPANSION
     // -------------------------------------------------------------------------
-    // L always scales by cbrt(expansion) (equivalent to linear RGB multiply).
-    // Chroma scales by a REDUCED amount for saturated pixels — full cbrt
-    // causes saturated colors to gain perceptual brightness from chroma
-    // amplification that desaturated highlights don't get, inverting contrast
-    // (yellow balloon > white specular, blonde hair > white shine).
+    // Two-step: desaturate at original luminance, then expand uniformly.
     //
-    // CHROMA_SCALE controls the attenuation: 1.0 = full cbrt (v3.2 behavior),
-    // 0.5 = half chroma amplification, 0.0 = no chroma change.
-    // Attenuation weighted by existing saturation — near-neutrals get full
-    // cbrt (they need chroma to stay balanced), saturated pixels get reduced.
-    vec3 oklab_exp = oklab_orig;
+    // Step 1: Reduce chroma in Oklab with L UNCHANGED. The LMS cube operates
+    // at normal luminance where Oklab is well-behaved — minimal RGB hue shift.
+    // Pre-compensates for the cbrt(k) chroma amplification that uniform RGB
+    // expansion adds, keeping only the CHROMA_SCALE fraction for saturated
+    // pixels (near-neutrals keep full cbrt to stay balanced).
+    //
+    // Step 2: Uniform RGB multiply — chromaticity-preserving by construction.
+    //
+    // Previous approach (L*cbrt, chroma*reduced_cbrt simultaneously in Oklab)
+    // created hue shift through the LMS cube at extended luminance — visible
+    // as yellow→green on warm highlights.
     float cbrt_exp = fast_cbrt(expansion);
-    oklab_exp.x *= cbrt_exp;
-    float sat_norm = smoothstep(0.10, 0.25, chroma_orig);
-    float chroma_factor = mix(cbrt_exp, mix(1.0, cbrt_exp, CHROMA_SCALE), sat_norm);
-    oklab_exp.yz *= chroma_factor;
+    float sat_norm = smoothstep(0.03, 0.12, chroma_orig);
+    float target_chroma = mix(1.0, cbrt_exp, mix(1.0, CHROMA_SCALE, sat_norm));
+    float pre_desat = target_chroma / cbrt_exp;
+
+    vec3 oklab_desat = oklab_orig;
+    oklab_desat.yz *= pre_desat;
 
     #if ENABLE_PALE_SKIN
-        oklab_exp.yz *= (1.0 + ps_sat);
+        oklab_desat.yz *= (1.0 + ps_sat);
     #endif
 
-    vec3 rgb_expanded = oklab_to_rgb(oklab_exp);
+    // -------------------------------------------------------------------------
+    // BEZOLD-BRÜCKE COMPENSATION — expansion-driven hue stabilization
+    // -------------------------------------------------------------------------
+    // Driven by per-pixel expansion. Expanded pixels experience BB shift on
+    // the display — hues converge toward three invariant points. Pre-rotate
+    // AWAY from nearest invariant to counteract. In flat regions, uniform
+    // compensation is invisible (viewer adapts to uniform shift). The visible
+    // artifact is only in contrast regions — and expansion naturally scales
+    // with luminance, giving more compensation where BB shift is stronger.
+    #if ENABLE_BB_COMP
+    {
+        float bb_drive = smoothstep(BB_EXP_FLOOR, BB_EXP_CEIL, expansion - 1.0);
+        float bb_chroma_w = smoothstep(BB_CHROMA_MIN, BB_CHROMA_MAX, chroma_orig);
+
+        // Normalized hue direction (avoid atan2)
+        float bb_inv_c = (chroma_orig > 1e-4) ? (1.0 / chroma_orig) : 0.0;
+        float a_n = oklab_orig.y * bb_inv_c;
+        float b_n = oklab_orig.z * bb_inv_c;
+
+        // Angular distance to each invariant (dot = cos, cross = sin)
+        float cos_dy = a_n * BB_Y_COS + b_n * BB_Y_SIN;
+        float sin_dy = b_n * BB_Y_COS - a_n * BB_Y_SIN;
+        float cos_dg = a_n * BB_G_COS + b_n * BB_G_SIN;
+        float sin_dg = b_n * BB_G_COS - a_n * BB_G_SIN;
+        float cos_db = a_n * BB_B_COS + b_n * BB_B_SIN;
+        float sin_db = b_n * BB_B_COS - a_n * BB_B_SIN;
+
+        // Proximity weights (squared cosine, hemisphere-clamped)
+        float w_y = cos_dy > 0.0 ? cos_dy * cos_dy : 0.0;
+        float w_g = cos_dg > 0.0 ? cos_dg * cos_dg : 0.0;
+        float w_b = cos_db > 0.0 ? cos_db * cos_db : 0.0;
+
+        // Shift AWAY from nearest invariant (compensates BB shift on display)
+        float bb_rot = -(w_y * sin_dy + w_g * sin_dg + w_b * sin_db);
+        bb_rot *= BB_STRENGTH * bb_drive * bb_chroma_w;
+
+        // Exact hue rotation (chroma-preserving)
+        float cos_bb = cos(bb_rot);
+        float sin_bb = sin(bb_rot);
+        float bb_a = oklab_desat.y * cos_bb - oklab_desat.z * sin_bb;
+        float bb_b = oklab_desat.y * sin_bb + oklab_desat.z * cos_bb;
+        oklab_desat.y = bb_a;
+        oklab_desat.z = bb_b;
+
+        #if DEBUG_SHOW_BB
+        {
+            float d = bb_drive * 3.0;            // green = drive active
+            float r = abs(bb_rot) * 20.0;        // red = rotation magnitude
+            float c = bb_chroma_w;               // blue = chroma gate passes
+            return vec4(gamma709_to_pq2020(vec3(r, d, c)), 1.0);
+        }
+        #endif
+    }
+    #endif
+
+    vec3 rgb_expanded = oklab_to_rgb(oklab_desat) * expansion;
+
+    // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // DEBUG: Luminance-preserving tonemap to SDR
+    // -------------------------------------------------------------------------
+    // For hue-accurate screenshot comparisons. Tonemaps expanded content back
+    // to SDR range using C_out = C_in * (Y_out / Y_in) — preserves chromaticity
+    // exactly, unlike per-channel tonemappers (Windows HDR screenshots) which
+    // shift warm hues toward green via Jensen's inequality.
+    #if DEBUG_SDR_TONEMAP
+    {
+        // Tonemap luminance, scale all channels by the same ratio (hue-preserving)
+        float Y_hdr = max(get_luma(rgb_expanded), 1e-6);
+        float Y_sdr = Y_hdr / (1.0 + Y_hdr);
+        vec3 rgb_tm = max(rgb_expanded * (Y_sdr / Y_hdr), 0.0);
+        // Return through the exact passthrough path (gamma709_to_pq2020)
+        // — bypasses onset blend, fast PQ approx, and dither
+        return vec4(gamma709_to_pq2020(pow(rgb_tm, vec3(1.0 / EOTF_GAMMA))), color.a);
+    }
+    #endif
 
     // -------------------------------------------------------------------------
     // ENCODE PQ BT.2020 OUTPUT

@@ -13,7 +13,7 @@
 
 //!BUFFER SCENE_STATE
 //!VAR float smoothed_bright_frac
-//!VAR float smoothed_scorch_frac
+//!VAR float smoothed_spec_signal
 //!VAR float smoothed_contrast
 //!VAR float smoothed_log_avg
 //!VAR float scene_cut_lockout
@@ -263,8 +263,13 @@ vec4 hook() {
 //!DESC CelFlare: Frame Stats
 
 #define KNEE            0.40
-#define ENABLE_SCORCH   0
-#define SCORCH_THRESH   0.80
+
+// Specular detection (source brightness tiers, no illum field)
+#define HIGHLIGHT_THRESH    0.75    // Source highlight tier
+#define SPECULAR_THRESH     0.92    // Source specular tier
+#define SPEC_FRAC_MIN       0.007   // ~1/144 noise floor
+#define SPEC_FRAC_MAX       0.10    // Fade begins (sparkle clusters can reach 12-15%)
+#define SPEC_FRAC_CEIL      0.16    // Full shutoff (large bright skies)
 
 #define TEMPORAL_ALPHA      0.03
 #define TEMPORAL_ALPHA_FAST 0.9
@@ -279,49 +284,42 @@ float get_luma(vec3 c) {
 vec4 hook() {
     float illum_sum = 0.0;
     float bright_count = 0.0;
-    float change_count = 0.0;
     float illum_min = 1.0;
     float illum_max = 0.0;
     float log_luma_sum = 0.0;
     int valid_luma = 0;
-    #if ENABLE_SCORCH
-    float scorch_count = 0.0;
-    #endif
+    float spec_count = 0.0;
+    float highlight_src_count = 0.0;
 
-    for (int y = 0; y < 4; y++) {
-        for (int x = 0; x < 4; x++) {
-            int idx = y * 4 + x;
-            vec2 spos = vec2((float(x) + 0.5) / 4.0,
-                             (float(y) + 0.5) / 4.0);
+    // ---- 16×9 grid (144 samples, matches display aspect) ----
+    for (int y = 0; y < 9; y++) {
+        for (int x = 0; x < 16; x++) {
+            vec2 spos = vec2((float(x) + 0.5) / 16.0,
+                             (float(y) + 0.5) / 9.0);
 
-            float illum = dot(CELFLARE_ILLUM_tex(spos).rgb, vec3(0.2126, 0.7152, 0.0722));
-            illum_sum += illum;
-            illum_min = min(illum_min, illum);
-            illum_max = max(illum_max, illum);
+            // Illumination field — scene metrics
+            float Y_ill = get_luma(CELFLARE_ILLUM_tex(spos).rgb);
+            illum_sum += Y_ill;
+            illum_min = min(illum_min, Y_ill);
+            illum_max = max(illum_max, Y_ill);
+            if (Y_ill > KNEE) bright_count += 1.0;
 
-            if (illum > KNEE) bright_count += 1.0;
-            #if ENABLE_SCORCH
-            if (illum > SCORCH_THRESH) scorch_count += 1.0;
-            #endif
-
-            if (frame > 0) {
-                if (abs(illum - prev_illum[idx]) > ILLUM_CHANGE_THRESH)
-                    change_count += 1.0;
-            }
-            prev_illum[idx] = illum;
-
-            // Log-average from source pixels (skip black bars)
-            vec3 rgb = HOOKED_tex(spos).rgb;
-            float Y = get_luma(rgb);
-            if (Y > 0.001) {
-                log_luma_sum += log(max(Y, 1e-6));
+            // Source pixels — tier detection + log average
+            float Y_src = get_luma(HOOKED_tex(spos).rgb);
+            if (Y_src > 0.001) {
+                log_luma_sum += log(max(Y_src, 1e-6));
                 valid_luma++;
             }
+
+            // Highlight and specular tier counting (pure source, no illum)
+            if (Y_src > HIGHLIGHT_THRESH) highlight_src_count += 1.0;
+            if (Y_src > SPECULAR_THRESH) spec_count += 1.0;
         }
     }
 
-    float avg_illum = illum_sum / 16.0;
-    float bright_frac = bright_count / 16.0;
+    const float N_SAMPLES = 144.0;
+    float avg_illum = illum_sum / N_SAMPLES;
+    float bright_frac = bright_count / N_SAMPLES;
 
     // Contrast: dynamic range from illumination field (stable, noise-free)
     float contrast = (illum_min > 0.001)
@@ -333,8 +331,35 @@ vec4 hook() {
         ? exp(log_luma_sum / float(valid_luma))
         : avg_illum;
 
-    // Scene cut detection
+    // Specular signal: present when small fraction at specular tier
+    float spec_frac = spec_count / N_SAMPLES;
+    float highlight_frac_src = highlight_src_count / N_SAMPLES;
+    float spec_onset = smoothstep(0.0, SPEC_FRAC_MIN, spec_frac);
+    float spec_shutoff = 1.0 - smoothstep(SPEC_FRAC_MAX, SPEC_FRAC_CEIL, spec_frac);
+    // Tier separation: specular must be rarer than highlights
+    float tier_ratio = 1.0 - spec_frac / max(highlight_frac_src, 0.001);
+    float tier_gate = smoothstep(0.3, 0.7, tier_ratio);
+    float spec_raw = spec_onset * spec_shutoff * tier_gate;
+
+    // ---- Scene cut detection: 4×4 grid (prev_illum[16]) ----
+    float change_count = 0.0;
     scene_cut_lockout = max(scene_cut_lockout - 1.0, 0.0);
+
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            int idx = y * 4 + x;
+            vec2 spos = vec2((float(x) + 0.5) / 4.0,
+                             (float(y) + 0.5) / 4.0);
+
+            float illum = get_luma(CELFLARE_ILLUM_tex(spos).rgb);
+            if (frame > 0) {
+                if (abs(illum - prev_illum[idx]) > ILLUM_CHANGE_THRESH)
+                    change_count += 1.0;
+            }
+            prev_illum[idx] = illum;
+        }
+    }
+
     float change_pct = change_count / 16.0;
     bool scene_cut = (change_pct > SCENE_CUT_PCT) && (scene_cut_lockout <= 0.0);
 
@@ -345,20 +370,15 @@ vec4 hook() {
 
     if (frame == 0) {
         smoothed_bright_frac = 0.0;
+        smoothed_spec_signal = 0.0;
         smoothed_contrast = contrast;
         smoothed_log_avg = log_avg;
         scene_cut_lockout = 0.0;
-        #if ENABLE_SCORCH
-        smoothed_scorch_frac = 0.0;
-        #endif
     } else {
         smoothed_bright_frac = mix(smoothed_bright_frac, bright_frac, alpha);
+        smoothed_spec_signal = mix(smoothed_spec_signal, spec_raw, alpha);
         smoothed_contrast = mix(smoothed_contrast, contrast, alpha);
         smoothed_log_avg = mix(smoothed_log_avg, log_avg, alpha);
-        #if ENABLE_SCORCH
-        float scorch_frac = scorch_count / 16.0;
-        smoothed_scorch_frac = mix(smoothed_scorch_frac, scorch_frac, alpha);
-        #endif
     }
 
     return vec4(0);
@@ -387,8 +407,7 @@ vec4 hook() {
 // =============================================
 #define INTENSITY       1.3     // Global scaling (0.5 subtle · 1.0 normal · 1.5 aggressive)
 #define KNEE            0.40    // Expansion onset — midtones below this stay near SDR
-#define MAX_EXPANSION   3.5     // Hard ceiling (3.5 = ~406 nits at 116 ref white)
-#define SCORCH_BOOST    0.00    // Extra lift for near-white highlights (0 = off)
+
 
 // =============================================
 //  SPATIALLY-MODULATED CURVE — regional adaptation
@@ -436,25 +455,28 @@ vec4 hook() {
 #define APL_DAMPEN_BRIGHT   0.70    // Dampen bright scenes
 
 // =============================================
-//  SPECULAR BONUS — near-white highlight pop
+//  SPECULAR BONUS — scene-detected, spatially-modulated
 // =============================================
-// Extra expansion for near-white, low-saturation pixels (specular
-// reflections, bright sky, white objects). Purely per-pixel f(Y) — no
-// illumination field involvement (which caused spatial shadow contours).
+// Stats pass samples 16×9 grid, counting source pixels in highlight
+// (>0.75) and specular (>0.92) tiers. Specular signal fires when a
+// small fraction qualifies AND specular is rarer than highlights
+// (tier separation = real specular, not just a bright scene).
 //
-// Wide smoothstep ramp (SPEC_Y_LOW to 1.0) + squaring ensures the bonus
-// onset is vanishingly gentle: derivative is zero at SPEC_Y_LOW, and the
-// per-8-bit-step expansion change stays sub-visible across the ramp.
-// The bonus concentrates naturally toward Y=1.0.
+// Per-pixel ramp selects WHICH pixels (smoothstep on Y_pixel).
+// Y_illum modulates HOW MUCH (peak, gamma) — same pattern as the base
+// curve. Adds continuous spatial variation that breaks 8-bit quantization
+// steps. No chroma gate — specular/highlights can be colored.
+// Bypasses APL/dynamic intensity dampening.
 #define ENABLE_SPECULAR_BONUS 0
-#define SPEC_Y_LOW          0.40    // Ramp onset (wide = gentle 8-bit steps)
-#define SPEC_CHROMA_FLOOR   0.15    // Below this: full bonus (white/near-neutral)
-#define SPEC_CHROMA_CEIL    0.50    // Above this: no bonus (highly saturated only)
-#define SPEC_BOOST          0.90    // Peak expansion bonus at Y=1.0
+#define SPEC_Y_LOW          0.80    // Ramp onset
+#define SPEC_PEAK_DARK      2.0     // Specular boost in dark regions (highlight pop)
+#define SPEC_PEAK_BRIGHT    1.0     // Specular boost in bright regions (controlled)
+#define SPEC_GAMMA_DARK     3.0     // Concentration in dark regions (sharp peaks)
+#define SPEC_GAMMA_BRIGHT   1.0     // Concentration in bright regions (broader)
 
 // Clip diffusion: blend near-white toward illum field to soften SDR clip edges
-#define CLIP_DIFFUSION       0.30    // Max blend at Y=1.0 (0.0=off, 0.5=strong)
-#define CLIP_DIFFUSION_FLOOR 0.85    // Y_gamma below: no softening
+#define CLIP_DIFFUSION       0.00    // Max blend at Y=1.0 (0.0=off, 0.5=strong)
+#define CLIP_DIFFUSION_FLOOR 0.95    // Y_gamma below: no softening
 
 // =============================================
 //  CHROMA — expansion color behavior
@@ -500,7 +522,6 @@ vec4 hook() {
 #define DEBUG_BYPASS        0
 #define DEBUG_SHOW_ILLUM    0   // Illumination field as grayscale
 #define DEBUG_SHOW_EXPANSION 0  // Expansion amount as heat map
-#define DEBUG_SHOW_SCORCH   0   // Scorch contribution
 #define DEBUG_SHOW_DETAIL   0   // Spatial vs per-pixel: green=spatial, red=per-pixel fallback
 #define DEBUG_SHOW_SPECULAR 0   // Specular bonus: cyan = spec strength
 #define DEBUG_SHOW_WP       0   // Warm tone protection
@@ -667,19 +688,22 @@ vec4 hook() {
     #if DEBUG_SHOW_STATS
     {
         vec2 pos = HOOKED_pos;
-        if (pos.x < 0.15 && pos.y < 0.10) {
+        if (pos.x < 0.15 && pos.y < 0.12) {
             float bar_x = pos.x / 0.15;
             vec3 dbg = vec3(0.05);
-            float row = pos.y / 0.10;
-            if (row < 0.333) {
+            float row = pos.y / 0.12;
+            if (row < 0.25) {
                 // Row 1: bright_frac (yellow)
                 if (bar_x < smoothed_bright_frac) dbg = vec3(0.6, 0.6, 0.0);
-            } else if (row < 0.666) {
+            } else if (row < 0.50) {
                 // Row 2: contrast / 8 stops (orange)
                 if (bar_x < smoothed_contrast / 8.0) dbg = vec3(0.7, 0.4, 0.0);
-            } else {
+            } else if (row < 0.75) {
                 // Row 3: log_avg (green)
                 if (bar_x < smoothed_log_avg) dbg = vec3(0.0, 0.6, 0.0);
+            } else {
+                // Row 4: spec_signal (cyan)
+                if (bar_x < smoothed_spec_signal) dbg = vec3(0.0, 0.6, 0.6);
             }
             return vec4(gamma709_to_pq2020(dbg), 1.0);
         }
@@ -721,12 +745,6 @@ vec4 hook() {
         Y_gamma = get_luma(rgb_gamma);
     }
 
-    // Cheap gamma-space chroma for specular detection (max-min channel spread)
-    #if ENABLE_SPECULAR_BONUS
-        float chroma_orig_gamma = max(rgb_gamma.r, max(rgb_gamma.g, rgb_gamma.b))
-                                - min(rgb_gamma.r, min(rgb_gamma.g, rgb_gamma.b));
-    #endif
-
     // -------------------------------------------------------------------------
     // SPATIALLY-MODULATED PER-PIXEL EXPANSION
     // -------------------------------------------------------------------------
@@ -750,7 +768,7 @@ vec4 hook() {
 
     // Per-pixel expansion curve: linear ramp from KNEE, shaped by pow(gamma)
     float t = max(Y_decision_gamma - KNEE, 0.0) / (1.0 - KNEE);
-    t = pow(max(t, 0.0), local_gamma);
+    t = pow(min(t, 1.0), local_gamma);  // clamp for upscaler super-whites
     float expansion = 1.0 + (local_peak - 1.0) * t * INTENSITY;
 
     #if DEBUG_SHOW_DETAIL
@@ -785,38 +803,21 @@ vec4 hook() {
     #endif
 
     // -------------------------------------------------------------------------
-    // SCORCH — near-white highlight boost
+    // SPECULAR BONUS — scene-detected, spatially-modulated
     // -------------------------------------------------------------------------
-    #if ENABLE_SCORCH
-    {
-        float scorch_drive = min(Y_decision_gamma, Y_illum);
-        float scorch_region = smoothstep(0.70, 0.92, scorch_drive);
-        float scorch_pixel = smoothstep(SCORCH_PIXEL_FLOOR, SCORCH_PIXEL_FLOOR + 0.10, Y_decision_gamma);
-        float scorch_t = scorch_region * scorch_pixel;
-        scorch_t *= scorch_t;
-        float scorch_shutoff = 1.0 - smoothstep(SCORCH_SHUTOFF_BEGIN, SCORCH_SHUTOFF_END, smoothed_scorch_frac);
-        expansion += SCORCH_BOOST * scorch_t * scorch_shutoff;
-
-        #if DEBUG_SHOW_SCORCH
-        {
-            float sc = scorch_t * scorch_shutoff;
-            return vec4(gamma709_to_pq2020(vec3(sc, sc * 0.6, 0.0)), 1.0);
-        }
-        #endif
-    }
-    #endif
-
-    // -------------------------------------------------------------------------
-    // SPECULAR BONUS — near-white highlight pop
-    // -------------------------------------------------------------------------
-    // Purely f(Y_pixel): wide smoothstep ramp squared so derivative is zero
-    // at onset — no 8-bit step contours. No Y_illum, no context ratio.
+    // Scene gate: smoothed_spec_signal from stats pass (16×9 tier detection).
+    // Per-pixel ramp: smoothstep on Y selects which pixels get boost.
+    // Y_illum modulates peak and gamma (same pattern as base curve) —
+    // adds continuous spatial variation that breaks 8-bit quantization.
+    // Added AFTER APL/dynamic intensity — not subject to those dampeners.
     #if ENABLE_SPECULAR_BONUS
     float spec_strength;
     {
-        float spec_ramp = smoothstep(SPEC_Y_LOW, 1.0, Y_decision_gamma);
-        float spec_chroma_w = 1.0 - smoothstep(SPEC_CHROMA_FLOOR, SPEC_CHROMA_CEIL, chroma_orig_gamma);
-        spec_strength = SPEC_BOOST * spec_ramp * spec_ramp * spec_chroma_w;
+        float spec_peak = mix(SPEC_PEAK_DARK, SPEC_PEAK_BRIGHT, Y_illum);
+        float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, Y_illum);
+        float t = smoothstep(SPEC_Y_LOW, 1.0, Y_decision_gamma);
+        float spec_ramp = pow(t, spec_gamma);
+        spec_strength = spec_peak * spec_ramp * smoothed_spec_signal;
         expansion += spec_strength;
     }
     #endif
@@ -826,11 +827,6 @@ vec4 hook() {
         return vec4(gamma709_to_pq2020(vec3(0.0, spec_strength, spec_strength)), 1.0);
     }
     #endif
-
-    // -------------------------------------------------------------------------
-    // EXPANSION CAP
-    // -------------------------------------------------------------------------
-    expansion = min(expansion, MAX_EXPANSION);
 
     // -------------------------------------------------------------------------
     // LINEARIZE

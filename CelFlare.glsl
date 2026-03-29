@@ -415,6 +415,7 @@ vec4 hook() {
 #define PEAK_SHOULDER   1.5     // Peak rolloff (1.0 = off, 1.5 = moderate, 2.0 = strong)
 #define PEAK_ATTEN      0.35    // How much bright_frac further reduces peak (0.0–0.6)
 #define BRIGHT_FRAC_REF 0.30    // Bright fraction where scene adaptation plateaus
+#define ILLUM_BRIGHT_BIAS 0.25  // Soften dark-object blur spill (0.0=off, 0.5=strong)
 
 // =============================================
 //  SCENE ADAPTATION — shape + amplitude modulation
@@ -445,10 +446,10 @@ vec4 hook() {
 #define GAMMA_CONTRAST      0.0     // High contrast: no extra offset (base gamma → RW:+)
 
 // --- Amplitude scaling ---
-#define AMP_APL_DARK        1.40    // Dark scene expansion amplitude
-#define AMP_APL_BRIGHT      0.60    // Bright scene expansion amplitude
+#define AMP_APL_DARK        1.20    // Dark scene expansion amplitude
+#define AMP_APL_BRIGHT      0.85    // Bright scene expansion amplitude
 #define AMP_DYN_FLAT        0.75    // Flat scene multiplier
-#define AMP_DYN_CONTRAST    1.30    // High-contrast multiplier
+#define AMP_DYN_CONTRAST    1.10    // High-contrast multiplier
 // Bright specular override: high contrast reduces bright-scene dampening
 // so structural detail and RW are preserved (bright spec → RW:+)
 #define AMP_BRIGHT_SPEC_LIFT 0.70   // How much contrast lifts bright dampening (0=off, 1=full)
@@ -465,13 +466,13 @@ vec4 hook() {
 // per-8-bit-step expansion change stays sub-visible across the ramp.
 // The bonus concentrates naturally toward Y=1.0.
 #define ENABLE_SPECULAR_BONUS 1
-#define SPEC_Y_LOW          0.40    // Ramp onset (wide = gentle 8-bit steps)
+#define SPEC_Y_LOW          0.70    // Ramp onset (wide = gentle 8-bit steps)
 #define SPEC_CHROMA_FLOOR   0.15    // Below this: full bonus (white/near-neutral)
 #define SPEC_CHROMA_CEIL    0.50    // Above this: no bonus (highly saturated only)
-#define SPEC_BOOST          1.40    // Peak expansion bonus at Y=1.0
+#define SPEC_BOOST          0.65    // Peak expansion bonus at Y=1.0
 
 // Clip diffusion: blend near-white toward illum field to soften SDR clip edges
-#define CLIP_DIFFUSION       0.30    // Max blend at Y=1.0 (0.0=off, 0.5=strong)
+#define CLIP_DIFFUSION       0.50    // Max blend at Y=1.0 (0.0=off, 0.5=strong)
 #define CLIP_DIFFUSION_FLOOR 0.85    // Y_gamma below: no softening
 
 // =============================================
@@ -493,8 +494,8 @@ vec4 hook() {
 // nearby hues back, weighted by squared cosine of angular distance.
 // The sum naturally zeros at invariants AND at midpoints (adjacent
 // invariants cancel). Driven regionally by illumination field.
-#define ENABLE_BB_COMP      1
-#define BB_STRENGTH         0.35    // Amplitude (0.10 subtle, 0.20 moderate, 0.30 strong)
+#define ENABLE_BB_COMP      0
+#define BB_STRENGTH         0.85    // Amplitude (0.10 subtle, 0.20 moderate, 0.30 strong)
 #define BB_EXP_FLOOR        0.05    // expansion-1 below: no compensation
 #define BB_EXP_CEIL         0.80    // above: full (expansion ≥ 1.8)
 #define BB_CHROMA_MIN       0.02    // Below: achromatic, skip
@@ -522,8 +523,8 @@ vec4 hook() {
 
 #define ENABLE_PALE_SKIN 1
 #define ENABLE_PS_COMPRESS  1       // Pale skin expansion compression (0 = off)
-#define PS_COMPRESS         0.30
-#define PS_SAT_BOOST        0.10
+#define PS_COMPRESS         0.00
+#define PS_SAT_BOOST        0.20
 #define PS_BRIGHT_FLOOR     0.50
 #define PS_CHROMA_CEIL      0.03
 
@@ -745,6 +746,11 @@ vec4 hook() {
     vec3 illum_rgb = upsample_illum_rgb();
     float Y_illum = get_luma(illum_rgb);
 
+    // Bright bias: when a bright pixel's illum is dragged down by dark-object
+    // blur spill, pull Y_illum back toward the pixel. Affects spatial_t (peak
+    // modulation) and clip diffusion gates, not the illum_rgb blend target.
+    Y_illum = mix(Y_illum, max(Y_illum, Y_gamma), ILLUM_BRIGHT_BIAS);
+
     #if DEBUG_SHOW_ILLUM
         return vec4(gamma709_to_pq2020(illum_rgb), 1.0);
     #endif
@@ -850,19 +856,16 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // SPECULAR BONUS — near-white highlight pop
     // -------------------------------------------------------------------------
-    // Purely f(Y_pixel): wide smoothstep ramp squared so derivative is zero
-    // at onset — no 8-bit step contours.
-    // Gated on Y_illum: in broad bright areas (high illum), the bonus pushes
-    // the entire near-white range to the peak, flattening the expansion
-    // curve and destroying subtle highlight shading. In dark scenes with
-    // isolated speculars (low illum), full bonus adds maximum pop.
+    // Purely per-pixel f(Y): wide smoothstep ramp squared so derivative is
+    // zero at onset — no 8-bit step contours. No scene gating, no illumination
+    // field. The squared ramp concentrates bonus toward Y=1.0 naturally;
+    // chroma gate filters saturated pixels.
     #if ENABLE_SPECULAR_BONUS
     float spec_strength;
     {
         float spec_ramp = smoothstep(SPEC_Y_LOW, 1.0, Y_decision_gamma);
         float spec_chroma_w = 1.0 - smoothstep(SPEC_CHROMA_FLOOR, SPEC_CHROMA_CEIL, chroma_orig_gamma);
-        float spec_illum_gate = 1.0 - smoothstep(0.20, 0.50, Y_illum);
-        spec_strength = SPEC_BOOST * spec_ramp * spec_ramp * spec_chroma_w * spec_illum_gate;
+        spec_strength = SPEC_BOOST * spec_ramp * spec_ramp * spec_chroma_w;
         expansion += spec_strength;
     }
     #endif

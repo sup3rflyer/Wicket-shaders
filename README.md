@@ -21,18 +21,19 @@ The keybindings above use a Lua script for mpv. Ask an AI assistant to write you
 
 **Scene-adaptive SDR-to-HDR highlight expansion** with PQ BT.2020 output.
 
-Analyzes each frame's brightness, contrast, and highlight distribution to classify the scene and applies a tailored expansion curve. Highlights are expanded to a ~200-300 nits range while trying to stay mostly faithful to the SDR grade. Does not touch low-mid range and shadows. Shader has been tuned for classic anime but works fine for various content.
+Uses a spatially-modulated expansion curve driven by an illumination field (bright-biased Gaussian blur of regional luminance). All pixels in a region share the same curve parameters — local contrast preserved by construction through multiplicative application. Frame-level scene metrics (APL, contrast, bright fraction) provide gentle adaptation. Highlights expand to ~300 nits with specular pop on top, while midtones stay close to the SDR grade. Works with anime and live-action content.
 
-Use INTENSITY and CURVE_STEEPNESS for tuning. Other tweaks are at your own peril.
+Use INTENSITY and KNEE for tuning. Other tweaks are at your own peril.
 
 Features:
-- 7 scene types with smooth blending
+- Illumination-field driven expansion (per-pixel curve, regionally adapted)
+- Scene adaptation via continuous metrics (APL, contrast, bright fraction)
 - Scene cut detection with fast adaptation lockout
-- Grain stabilization via bilateral log-luma filter (prevents grain from flickering in expanded regions)
-- Perceptual saturation boost in Oklab (counters the silvery look from luminance-only expansion)
-- Magnitude-preserving hue correction (prevents yellow→green shift on warm highlights and fires)
-- Bezold-Brücke warmth compensation (pre-compensates for perceptual hue shift at higher luminances)
-- Chroma-adaptive expansion (Helmholtz-Kohlrausch compensation — pale and warm skin tones expand more proportionally)
+- Grain stabilization via bilateral log-luma filter
+- Specular bonus with scene-detected highlight pop (tier separation gating)
+- Bezold-Brücke hue compensation (regional warm-to-red rotation in Oklab — fixes warm-to-green shift on fire, sunsets, skin)
+- Pale skin saturation protection
+- Expansion in Oklab with chroma attenuation for saturated pixels
 - PQ-aware temporal dither to mask 8-bit banding in expanded highlights
 - Direct PQ BT.2020 output bypasses libplacebo's SDR peak clipping
 - Multiple debug visualizations for tuning

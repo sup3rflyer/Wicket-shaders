@@ -405,8 +405,8 @@ vec4 hook() {
 // =============================================
 //  MAIN TUNING — start here
 // =============================================
-#define INTENSITY       1.3     // Global scaling (0.5 subtle · 1.0 normal · 1.5 aggressive)
-#define KNEE            0.40    // Expansion onset — midtones below this stay near SDR
+#define INTENSITY       1.0     // Global scaling — PEAK defines expansion directly at 1.0
+#define KNEE            0.30    // Expansion onset — midtones below this stay near SDR
 
 
 // =============================================
@@ -414,45 +414,49 @@ vec4 hook() {
 // =============================================
 // Expansion is always f(Y_pixel) — monotonic remapping, no 8-bit banding.
 // Y_illum modulates the curve SHAPE: bright regions get gentle/broad curves
-// (preserving face gradients), dark regions get steep/concentrated curves
-// (highlight pop). Uses linear ramp + pow(t, gamma) — no smoothstep
-// inflection point in the face brightness range.
+// (preserving highlight gradients), dark regions get steep/concentrated curves
+// (highlight pop). Linear ramp + pow(t, gamma) — derivative monotonically
+// increasing for gamma >= 1, no inflection in the face brightness range.
 //
-// Nit targets at REFERENCE_WHITE=116:
-//   Reference white (Y≈0.85): 150–200 nits
-//   Highlights (Y≈0.90–0.95): 230–290 nits
-//   Specular (Y≈0.95–1.00):   300–350 nits
-//   Midtones (Y<0.50):         near SDR (~no expansion)
-#define PEAK_BRIGHT     3.0     // Expansion peak for bright regions
-#define PEAK_DARK       3.5     // Expansion peak for dark regions (highlight headroom)
-#define GAMMA_BRIGHT    1.5     // Curve shape: moderate concentration
-#define GAMMA_DARK      3.0     // Curve shape: strong highlight concentration
-#define PEAK_ATTEN      0.35    // How much bright_frac further reduces peak (0.0–0.6)
-#define BRIGHT_FRAC_REF 0.30    // Bright fraction where scene adaptation plateaus
+// Gradient-preservation principle: the spatial curve is the primary authority
+// on tonal relationships. APL and Dynamic are gentle scene adjustments (~10%),
+// not aggressive dampeners. Specular bonus adds HDR pop on top.
+//
+// Nit targets at REFERENCE_WHITE=116 (spatial curve only, pre-specular):
+//   Peak (Y=1.00):             ~300–335 nits
+//   Highlights (Y≈0.90–0.95):  195–255 nits
+//   Reference white (Y≈0.85):  155–175 nits
+//   Midtones (Y≤0.50):         near SDR (~2% lift)
+#define PEAK_BRIGHT     2.6     // Expansion peak for bright regions (~302 nits)
+#define PEAK_DARK       2.9     // Expansion peak for dark regions (~336 nits)
+#define GAMMA_BRIGHT    1.8     // Curve shape: moderate, preserves highlight gradient
+#define GAMMA_DARK      2.5     // Curve shape: stronger highlight concentration
+#define PEAK_ATTEN      0.12    // Gentle bright_frac dampening (spatial curve adapts)
+#define BRIGHT_FRAC_REF 0.40    // Bright fraction where scene adaptation plateaus
 
 // =============================================
 //  DYNAMIC INTENSITY — contrast-driven expansion scaling
 // =============================================
-// Flat/pastel scenes (low contrast) get softer expansion.
-// Dramatic/high-contrast scenes (deep shadows + bright highlights) get punchier.
+// Narrow range — gentle scene adaptation that preserves gradient relationships.
+// Flat/pastel scenes get slightly softer, dramatic scenes slightly punchier.
 // Driven by smoothed_contrast (log2 dynamic range in stops).
 #define ENABLE_DYNAMIC_INTENSITY 1
 #define DYN_CONTRAST_LOW    2.5     // Below this: flat scene, minimum intensity
 #define DYN_CONTRAST_HIGH   5.5     // Above this: dramatic scene, maximum intensity
-#define DYN_INTENSITY_LOW   0.75    // Multiplier for flat scenes
-#define DYN_INTENSITY_HIGH  1.10    // Multiplier for dramatic scenes
+#define DYN_INTENSITY_LOW   0.92    // Multiplier for flat scenes (gentle)
+#define DYN_INTENSITY_HIGH  1.05    // Multiplier for dramatic scenes (gentle)
 
 // =============================================
 //  APL MODULATION — brightness-driven expansion scaling
 // =============================================
 // Dark scenes: neutral (gamma handles midtone suppression).
-// Bright scenes: dampened to prevent washing out.
+// Bright scenes: gently reduced to preserve gradient while avoiding washout.
 // Driven by smoothed_log_avg (perceptual brightness key).
 #define ENABLE_APL_MOD      1
 #define APL_KEY_DARK        0.03    // Below this: dark scene multiplier
 #define APL_KEY_BRIGHT      0.30    // Above this: bright scene multiplier
 #define APL_BOOST_DARK      1.00    // Neutral for dark scenes (gamma_dark suppresses midtones)
-#define APL_DAMPEN_BRIGHT   0.70    // Dampen bright scenes
+#define APL_DAMPEN_BRIGHT   0.88    // Gently reduce bright scenes
 
 // =============================================
 //  SPECULAR BONUS — scene-detected, spatially-modulated
@@ -467,12 +471,14 @@ vec4 hook() {
 // curve. Adds continuous spatial variation that breaks 8-bit quantization
 // steps. No chroma gate — specular/highlights can be colored.
 // Bypasses APL/dynamic intensity dampening.
-#define ENABLE_SPECULAR_BONUS 0
+#define ENABLE_SPECULAR_BONUS 1
 #define SPEC_Y_LOW          0.80    // Ramp onset
-#define SPEC_PEAK_DARK      2.0     // Specular boost in dark regions (highlight pop)
-#define SPEC_PEAK_BRIGHT    1.0     // Specular boost in bright regions (controlled)
-#define SPEC_GAMMA_DARK     3.0     // Concentration in dark regions (sharp peaks)
+#define SPEC_PEAK_DARK      1.0     // Specular boost in dark regions (highlight pop)
+#define SPEC_PEAK_BRIGHT    0.5     // Specular boost in bright regions (controlled)
+#define SPEC_GAMMA_DARK     2.0     // Concentration in dark regions (sharp peaks)
 #define SPEC_GAMMA_BRIGHT   1.0     // Concentration in bright regions (broader)
+#define SPEC_LOCAL_LOW      0.08    // Local contrast gate onset (Y_pixel - Y_illum)
+#define SPEC_LOCAL_HIGH     0.22    // Local contrast gate full
 
 // Clip diffusion: blend near-white toward illum field to soften SDR clip edges
 #define CLIP_DIFFUSION       0.00    // Max blend at Y=1.0 (0.0=off, 0.5=strong)
@@ -488,22 +494,31 @@ vec4 hook() {
 // Only affects already-saturated pixels — near-neutrals always get full cbrt.
 #define CHROMA_SCALE        1.00
 
-// --- Warm Tone Compensation ---
-#define ENABLE_WARM_PROTECT 0
-#define WP_LUM_BOOST        0.20
-#define WP_HUE_COS          0.7317  // cos(0.75) — precomputed unit vector for hue center
-#define WP_HUE_SIN          0.6816  // sin(0.75)
-#define WP_HUE_POWER        2.0     // Sharpness of hue window (higher = narrower)
-#define WP_CHROMA_MIN       0.08
-#define WP_CHROMA_MAX       0.14
-#define WP_LUM_FLOOR        0.40
-#define WP_BRIGHT_FRAC_LOW  0.05
-#define WP_BRIGHT_FRAC_HIGH 0.30
+// --- Warm Shift: Bezold-Brücke Hue Compensation ---
+// Rotates warm hues (yellow-green to near-red) toward red in Oklab to
+// compensate for the psychovisual green shift at higher luminance.
+// Driven by illumination field (regional, not per-pixel Y) — nearby dark
+// pixels in bright warm regions get compensated because the B-B shift is
+// a spatial perceptual effect. b_norm scaling (sine of hue from +a axis)
+// prevents overshoot: near-red pixels barely rotate, yellows rotate fully.
+#define ENABLE_WARM_SHIFT    1
+#define WS_HUE_COS          0.3420  // cos(70°) — center of warm range in Oklab
+#define WS_HUE_SIN          0.9397  // sin(70°)
+#define WS_HUE_POWER        1.2     // Hue window width (lower = wider, ~50° each side)
+#define WS_STRENGTH          0.08   // Max rotation in radians (~7° at full drive)
+#define WS_ILLUM_LOW         0.35   // Y_illum below: no shift (dark region)
+#define WS_ILLUM_HIGH        0.80   // Y_illum above: full shift
+#define WS_CHROMA_FLOOR      0.015  // Skip near-neutrals (unstable hue)
 
 #define ENABLE_PALE_SKIN 1
-#define ENABLE_PS_COMPRESS  0       // Pale skin expansion compression (0 = off)
+#define ENABLE_PS_COMPRESS  1
+#define PS_HUE_COS          0.7317  // cos(43°) — warm hue center for skin detection
+#define PS_HUE_SIN          0.6816  // sin(43°)
+#define PS_HUE_POWER        2.0     // Sharpness of hue window
+#define PS_BRIGHT_FRAC_LOW  0.05
+#define PS_BRIGHT_FRAC_HIGH 0.30
 #define PS_COMPRESS         0.00
-#define PS_SAT_BOOST        0.10
+#define PS_SAT_BOOST        0.20
 #define PS_BRIGHT_FLOOR     0.50
 #define PS_CHROMA_CEIL      0.03
 
@@ -524,7 +539,7 @@ vec4 hook() {
 #define DEBUG_SHOW_EXPANSION 0  // Expansion amount as heat map
 #define DEBUG_SHOW_DETAIL   0   // Spatial vs per-pixel: green=spatial, red=per-pixel fallback
 #define DEBUG_SHOW_SPECULAR 0   // Specular bonus: cyan = spec strength
-#define DEBUG_SHOW_WP       0   // Warm tone protection
+#define DEBUG_SHOW_WP       0   // Warm shift + pale skin
 #define DEBUG_SHOW_STATS    0   // avg_illum + bright_frac + contrast + log_avg bars
 
 // =============================================================================
@@ -817,7 +832,8 @@ vec4 hook() {
         float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, Y_illum);
         float t = smoothstep(SPEC_Y_LOW, 1.0, Y_decision_gamma);
         float spec_ramp = pow(t, spec_gamma);
-        spec_strength = spec_peak * spec_ramp * smoothed_spec_signal;
+        float local_spec = smoothstep(SPEC_LOCAL_LOW, SPEC_LOCAL_HIGH, Y_decision_gamma - Y_illum);
+        spec_strength = spec_peak * spec_ramp * local_spec * smoothed_spec_signal;
         expansion += spec_strength;
     }
     #endif
@@ -845,48 +861,54 @@ vec4 hook() {
     float chroma_orig = sqrt(oklab_orig.y * oklab_orig.y + oklab_orig.z * oklab_orig.z);
 
     // -------------------------------------------------------------------------
-    // WARM TONE COMPENSATION + PALE SKIN PROTECTION
+    // WARM SHIFT — Bezold-Brücke hue compensation (detection)
     // -------------------------------------------------------------------------
-    #if ENABLE_WARM_PROTECT || ENABLE_PALE_SKIN
-        // Dot-product hue detector: cos(angle) between pixel's ab vector and
-        // target hue direction. Replaces atan()+exp() Gaussian (~25 fewer SFU
-        // cycles). pow() controls window width — higher = narrower acceptance.
-        float inv_chroma = (chroma_orig > 1e-6) ? (1.0 / chroma_orig) : 0.0;
-        float cos_dh = (oklab_orig.y * WP_HUE_COS + oklab_orig.z * WP_HUE_SIN) * inv_chroma;
-        float wp_hue_w = pow(max(cos_dh, 0.0), WP_HUE_POWER);
-        float wp_gate = smoothstep(WP_BRIGHT_FRAC_LOW, WP_BRIGHT_FRAC_HIGH, smoothed_bright_frac);
+    // Rotation angle computed here (before early exit for debug overlay).
+    // Applied after early exit — only expanded pixels need hue compensation.
+    #if ENABLE_WARM_SHIFT
+    float ws_angle = 0.0;
+    {
+        float ws_inv_chroma = (chroma_orig > WS_CHROMA_FLOOR)
+            ? (1.0 / chroma_orig) : 0.0;
+        float ws_cos_dh = (oklab_orig.y * WS_HUE_COS + oklab_orig.z * WS_HUE_SIN)
+                        * ws_inv_chroma;
+        float ws_hue_w = pow(max(ws_cos_dh, 0.0), WS_HUE_POWER);
+        float ws_drive = smoothstep(WS_ILLUM_LOW, WS_ILLUM_HIGH, Y_illum);
+        float b_norm = max(oklab_orig.z * ws_inv_chroma, 0.0);
+        ws_angle = WS_STRENGTH * ws_drive * ws_hue_w * b_norm;
+    }
     #endif
 
-    #if ENABLE_WARM_PROTECT
-        float wp_chroma_w = smoothstep(WP_CHROMA_MIN - 0.03, WP_CHROMA_MIN + 0.03, chroma_orig)
-                          * (1.0 - smoothstep(WP_CHROMA_MAX, WP_CHROMA_MAX + 0.08, chroma_orig));
-        float wp_lum_w = smoothstep(0.0, WP_LUM_FLOOR, Y_decision);
-        float wp_w = wp_hue_w * wp_chroma_w * wp_lum_w;
-        expansion += WP_LUM_BOOST * wp_w * wp_gate;
-    #endif
-
+    // -------------------------------------------------------------------------
+    // PALE SKIN PROTECTION
+    // -------------------------------------------------------------------------
     #if ENABLE_PALE_SKIN
+        float ps_inv_chroma = (chroma_orig > 1e-6) ? (1.0 / chroma_orig) : 0.0;
+        float ps_cos_dh = (oklab_orig.y * PS_HUE_COS + oklab_orig.z * PS_HUE_SIN)
+                        * ps_inv_chroma;
+        float ps_hue_w = pow(max(ps_cos_dh, 0.0), PS_HUE_POWER);
+        float ps_gate = smoothstep(PS_BRIGHT_FRAC_LOW, PS_BRIGHT_FRAC_HIGH, smoothed_bright_frac);
         float ps_chroma_w = smoothstep(0.015, 0.06, chroma_orig)
                           * (1.0 - smoothstep(0.04, PS_CHROMA_CEIL + 0.04, chroma_orig));
         float ps_bright_w = smoothstep(PS_BRIGHT_FLOOR, PS_BRIGHT_FLOOR + 0.15, Y_decision);
-        float ps_w = wp_hue_w * ps_chroma_w * ps_bright_w * wp_gate;
+        float ps_w = ps_hue_w * ps_chroma_w * ps_bright_w * ps_gate;
         #if ENABLE_PS_COMPRESS
         expansion = mix(expansion, 1.0, PS_COMPRESS * ps_w);
         #endif
         float ps_sat = PS_SAT_BOOST * ps_w;
     #endif
 
-    #if DEBUG_SHOW_WP && (ENABLE_WARM_PROTECT || ENABLE_PALE_SKIN)
+    #if DEBUG_SHOW_WP && (ENABLE_WARM_SHIFT || ENABLE_PALE_SKIN)
     {
-        float wp_mag = 0.0;
+        float ws_mag = 0.0;
         float ps_mag = 0.0;
-        #if ENABLE_WARM_PROTECT
-            wp_mag = WP_LUM_BOOST * wp_w * wp_gate * 10.0;
+        #if ENABLE_WARM_SHIFT
+            ws_mag = ws_angle * 50.0;
         #endif
         #if ENABLE_PALE_SKIN
-            ps_mag = PS_COMPRESS * ps_w * 10.0;
+            ps_mag = ps_w * 10.0;
         #endif
-        return vec4(gamma709_to_pq2020(vec3(ps_mag, wp_mag, 0.0)), color.a);
+        return vec4(gamma709_to_pq2020(vec3(ps_mag, ws_mag, 0.0)), color.a);
     }
     #endif
 
@@ -901,6 +923,20 @@ vec4 hook() {
     {
         float exp_amount = (expansion - 1.0) / 2.5;
         return vec4(gamma709_to_pq2020(vec3(exp_amount, exp_amount * 0.3, 0.0)), 1.0);
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // APPLY WARM SHIFT (only expanded pixels — after early exit)
+    // -------------------------------------------------------------------------
+    // Small-angle rotation in Oklab (a,b) plane — clockwise toward red.
+    // cos(θ) ≈ 1, sin(θ) ≈ θ for θ < 0.12 rad. Chroma preserved to ~0.7%.
+    #if ENABLE_WARM_SHIFT
+    if (ws_angle > 0.0) {
+        float a_shifted = oklab_orig.y + oklab_orig.z * ws_angle;
+        float b_shifted = oklab_orig.z - oklab_orig.y * ws_angle;
+        oklab_orig.y = a_shifted;
+        oklab_orig.z = b_shifted;
     }
     #endif
 

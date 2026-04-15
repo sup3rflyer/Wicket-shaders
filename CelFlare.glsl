@@ -430,7 +430,7 @@ vec4 hook() {
 #define PEAK_BRIGHT     2.6     // Expansion peak for bright regions (~302 nits)
 #define PEAK_DARK       2.9     // Expansion peak for dark regions (~336 nits)
 #define GAMMA_BRIGHT    1.8     // Curve shape: moderate, preserves highlight gradient
-#define GAMMA_DARK      2.5     // Curve shape: stronger highlight concentration
+#define GAMMA_DARK      2.0     // Curve shape: stronger highlight concentration
 #define PEAK_ATTEN      0.12    // Gentle bright_frac dampening (spatial curve adapts)
 #define BRIGHT_FRAC_REF 0.40    // Bright fraction where scene adaptation plateaus
 
@@ -459,7 +459,7 @@ vec4 hook() {
 #define APL_DAMPEN_BRIGHT   0.88    // Gently reduce bright scenes
 
 // =============================================
-//  SPECULAR BONUS — scene-detected, spatially-modulated
+//  SPECULAR BONUS — scene-detected, per-pixel bloom
 // =============================================
 // Stats pass samples 16×9 grid, counting source pixels in highlight
 // (>0.75) and specular (>0.92) tiers. Specular signal fires when a
@@ -467,18 +467,18 @@ vec4 hook() {
 // (tier separation = real specular, not just a bright scene).
 //
 // Per-pixel ramp selects WHICH pixels (smoothstep on Y_pixel).
-// Y_illum modulates HOW MUCH (peak, gamma) — same pattern as the base
-// curve. Adds continuous spatial variation that breaks 8-bit quantization
-// steps. No chroma gate — specular/highlights can be colored.
-// Bypasses APL/dynamic intensity dampening.
+// Scene-level APL drives peak/gamma — dark scenes get more pop,
+// bright scenes stay controlled. No per-pixel Y_illum modulation
+// (caused edge halos where bright met dark instead of bloom-like
+// center-out falloff). Bypasses APL/dynamic intensity dampening.
 #define ENABLE_SPECULAR_BONUS 1
-#define SPEC_Y_LOW          0.80    // Ramp onset
-#define SPEC_PEAK_DARK      1.0     // Specular boost in dark regions (highlight pop)
-#define SPEC_PEAK_BRIGHT    0.5     // Specular boost in bright regions (controlled)
-#define SPEC_GAMMA_DARK     2.0     // Concentration in dark regions (sharp peaks)
-#define SPEC_GAMMA_BRIGHT   1.0     // Concentration in bright regions (broader)
-#define SPEC_LOCAL_LOW      0.08    // Local contrast gate onset (Y_pixel - Y_illum)
-#define SPEC_LOCAL_HIGH     0.22    // Local contrast gate full
+#define SPEC_Y_LOW          0.88    // Ramp onset
+#define SPEC_PEAK_DARK      1.4     // Specular boost in dark scenes (highlight pop)
+#define SPEC_PEAK_BRIGHT    0.8     // Specular boost in bright scenes (controlled)
+#define SPEC_GAMMA_DARK     1.6     // Concentration in dark scenes (sharp peaks)
+#define SPEC_GAMMA_BRIGHT   0.8     // Concentration in bright scenes (broader)
+#define SPEC_APL_LOW        0.03    // Scene APL below → dark-scene specular params
+#define SPEC_APL_HIGH       0.30    // Scene APL above → bright-scene specular params
 
 // Clip diffusion: blend near-white toward illum field to soften SDR clip edges
 #define CLIP_DIFFUSION       0.00    // Max blend at Y=1.0 (0.0=off, 0.5=strong)
@@ -534,13 +534,13 @@ vec4 hook() {
 // =============================================
 //  DEBUG
 // =============================================
-#define DEBUG_BYPASS        0
-#define DEBUG_SHOW_ILLUM    0   // Illumination field as grayscale
+#define DEBUG_BYPASS         0
+#define DEBUG_SHOW_ILLUM     0   // Illumination field as grayscale
 #define DEBUG_SHOW_EXPANSION 0  // Expansion amount as heat map
-#define DEBUG_SHOW_DETAIL   0   // Spatial vs per-pixel: green=spatial, red=per-pixel fallback
-#define DEBUG_SHOW_SPECULAR 0   // Specular bonus: cyan = spec strength
-#define DEBUG_SHOW_WP       0   // Warm shift + pale skin
-#define DEBUG_SHOW_STATS    0   // avg_illum + bright_frac + contrast + log_avg bars
+#define DEBUG_SHOW_DETAIL    0   // Spatial vs per-pixel: green=spatial, red=per-pixel fallback
+#define DEBUG_SHOW_SPECULAR  0   // Specular bonus: cyan = spec strength
+#define DEBUG_SHOW_WP        0   // Warm shift + pale skin
+#define DEBUG_SHOW_STATS     0   // avg_illum + bright_frac + contrast + log_avg bars
 
 // =============================================================================
 // HELPER FUNCTIONS
@@ -828,12 +828,14 @@ vec4 hook() {
     #if ENABLE_SPECULAR_BONUS
     float spec_strength;
     {
-        float spec_peak = mix(SPEC_PEAK_DARK, SPEC_PEAK_BRIGHT, Y_illum);
-        float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, Y_illum);
+        // Scene-level APL drives peak/gamma — dark *scenes* get more pop,
+        // but no spatial edge bias within a single bright region.
+        float spec_apl = smoothstep(SPEC_APL_LOW, SPEC_APL_HIGH, smoothed_log_avg);
+        float spec_peak = mix(SPEC_PEAK_DARK, SPEC_PEAK_BRIGHT, spec_apl);
+        float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, spec_apl);
         float t = smoothstep(SPEC_Y_LOW, 1.0, Y_decision_gamma);
         float spec_ramp = pow(t, spec_gamma);
-        float local_spec = smoothstep(SPEC_LOCAL_LOW, SPEC_LOCAL_HIGH, Y_decision_gamma - Y_illum);
-        spec_strength = spec_peak * spec_ramp * local_spec * smoothed_spec_signal;
+        spec_strength = spec_peak * spec_ramp * smoothed_spec_signal;
         expansion += spec_strength;
     }
     #endif

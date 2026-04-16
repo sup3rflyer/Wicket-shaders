@@ -1,10 +1,14 @@
-// CelFlare v4.0 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v4.7 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
-// Expansion driven by regional illumination context (bright-biased blur of
-// the luminance field) rather than per-pixel luminance. All pixels in a
-// region get the same expansion multiplier — local contrast preserved by
-// construction via multiplicative application.
+// Two-layer architecture:
+//  1. Base curve: per-pixel monotonic f(Y) with shape (peak, gamma)
+//     modulated by an illumination field (sigma ~80px Gaussian of regional
+//     luminance). Gradient-preserving — local contrast survives by
+//     construction via multiplicative expansion in Oklab.
+//  2. Specular bonus: additive, scene-detected, per-pixel ramp on the peak
+//     channel V = max(R,G,B). Restores HDR pop where SDR compressed most
+//     (saturated primaries at signal ceiling, bright specular highlights).
 //
 // You MUST set REFERENCE_WHITE to match your SDR white and hdr-reference-white
 // in mpv.conf.
@@ -24,16 +28,33 @@
 //!BIND HOOKED
 //!DESC CelFlare: Grain Pre-filter
 
+// Role: stabilize EXPANSION DECISIONS across grainy pixels sharing a common
+// underlying luma — NOT to clean the image. Goal is that SDR grain, after
+// expansion, looks like SDR grain scaled by the regional expansion factor
+// (same character, just brighter). Equal-luma neighbors must get equal
+// expansion so grain passes through the multiplicative curve intact.
+//
+// Kept inside "one semantic patch" by a moderate radius + dense angular
+// sampling (12 taps in a 36 px-diameter disc). Larger radii cross into
+// adjacent features that happen to share luma and start *averaging* the
+// expansion decision across unrelated regions, which visibly steps the
+// expansion at feature boundaries.
 #define STABILIZE_OPACITY   0.85
 #define GRAIN_THRESHOLD     0.28
-#define GRAIN_BLUR_RADIUS   24.0
+#define GRAIN_BLUR_RADIUS   18.0   // 9 px inner / 18 px outer — stays inside one patch
 #define GRAIN_RANGE_MIN     0.35
 #define GRAIN_RANGE_MAX     0.95
 #define GRAIN_EDGE_LOW      0.20
 #define GRAIN_EDGE_HIGH     0.45
-#define GRAIN_EARLY_EXIT    0.25
+// Matches the lower edge of range_mask's smoothstep; below this range_mask
+// is identically 0 so stabilization would no-op anyway.
+#define GRAIN_EARLY_EXIT    0.30
 #define BILATERAL_SHARPNESS 6.0
-#define INNER_RING_BOOST    3.0
+#define INNER_RING_BOOST    2.0    // Inner carries 2:1 weight over outer (inner 12 : outer 6)
+// Empirical edge normalization. Brings first-moment gradient magnitude
+// (gx,gy) from ~0.4*luma_contrast into the GRAIN_EDGE_LOW..HIGH range.
+// Lower value -> more pixels marked as edges (stabilization suppressed).
+#define GRAIN_EDGE_NORM     2.7
 
 vec4 hook() {
     vec4 original = HOOKED_tex(HOOKED_pos);
@@ -61,8 +82,13 @@ vec4 hook() {
         vec2(-1.000, 0.000), vec2(-0.500, -0.866), vec2( 0.500, -0.866)
     );
 
-    const vec2 inner[3] = vec2[3](
-        vec2( 0.866, 0.500), vec2(-0.866, 0.500), vec2( 0.000, -1.000)
+    // 6 inner samples at half radius, 30°/90°/150°/210°/270°/330° — fills
+    // every outer-ring gap. Previous inner[3] left half the compass without
+    // near-field coverage (after per-pixel rotation, this smeared into
+    // directional noise in stabilization rather than being fixed).
+    const vec2 inner[6] = vec2[6](
+        vec2( 0.866,  0.500), vec2( 0.000,  1.000), vec2(-0.866,  0.500),
+        vec2(-0.866, -0.500), vec2( 0.000, -1.000), vec2( 0.866, -0.500)
     );
 
     float asym_scale = mix(1.0, 7.0, smoothstep(0.55, 0.98, Y_gamma));
@@ -70,9 +96,14 @@ vec4 hook() {
 
     float total_w = 1.0;
     float blurred = Y_gamma;
+    // First-moment gradient estimator. Project the ZERO-MEAN diff onto
+    // cos/sin(theta) so DC cancels even under asymmetric bilateral weights
+    // (the asym_scale crush on darker-side samples used to leak DC into
+    // gx/gy at light/dark boundaries, triggering or missing edges on bias
+    // rather than actual structure).
     float gx = 0.0, gy = 0.0, grad_w = 0.0;
 
-    float raw_diff, asym, diff, w, s, d2, t;
+    float raw_diff, asym, diff, w, w_base, s, d2, t;
     vec2 rotated, offset;
 
     for (int i = 0; i < 6; i++) {
@@ -89,16 +120,14 @@ vec4 hook() {
         blurred += s * w;
         total_w += w;
 
-        gx += s * w * rotated.x;
-        gy += s * w * rotated.y;
+        // Outer ring at radius R: raw_diff scales with R, cos-projection
+        // yields ~a*R/2 for linear gradient a.
+        gx += raw_diff * w * rotated.x;
+        gy += raw_diff * w * rotated.y;
         grad_w += w;
     }
 
-    float inv_grad_w = grad_w > 0.0 ? 1.0 / grad_w : 0.0;
-    gx *= inv_grad_w;
-    gy *= inv_grad_w;
-
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 6; i++) {
         vec2 h = inner[i];
         rotated = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
         offset = HOOKED_pt * GRAIN_BLUR_RADIUS * 0.5 * rotated;
@@ -108,17 +137,33 @@ vec4 hook() {
         diff = (raw_diff * asym) / GRAIN_THRESHOLD;
         d2 = effective_sharpness * diff * diff;
         t = 1.0 - d2 * 0.25;
-        w = (t > 0.0 ? t * t : 0.0) * INNER_RING_BOOST;
+        w_base = t > 0.0 ? t * t : 0.0;
+        w = w_base * INNER_RING_BOOST;
         blurred += s * w;
         total_w += w;
+
+        // Inner ring at half radius: raw_diff is already half for the same
+        // gradient, so we scale up by 2 to match outer-ring units. Use the
+        // un-boosted weight so the boost only amplifies blur trust, not the
+        // gradient estimate (which wants unbiased angular coverage).
+        gx += raw_diff * w_base * rotated.x * 2.0;
+        gy += raw_diff * w_base * rotated.y * 2.0;
+        grad_w += w_base;
     }
+
+    float inv_grad_w = grad_w > 0.0 ? 1.0 / grad_w : 0.0;
+    gx *= inv_grad_w;
+    gy *= inv_grad_w;
 
     blurred /= total_w;
 
-    float edge = sqrt(gx * gx + gy * gy) / 2.7;
+    float edge = sqrt(gx * gx + gy * gy) / GRAIN_EDGE_NORM;
     float edge_mask = smoothstep(GRAIN_EDGE_LOW, GRAIN_EDGE_HIGH, edge);
 
-    float Y_stabilized = mix(blurred, Y_gamma, edge_mask * 0.97);
+    // Full per-pixel authority at detected edges (edge_mask=1 -> pure Y_gamma).
+    // smoothstep gives C1 continuity at the threshold already, so no need to
+    // leak blur with the old 0.97 factor.
+    float Y_stabilized = mix(blurred, Y_gamma, edge_mask);
     float Y_decision = mix(Y_gamma, Y_stabilized, range_mask * STABILIZE_OPACITY);
 
     return vec4(original.rgb, Y_decision);
@@ -270,6 +315,13 @@ vec4 hook() {
 #define SPEC_FRAC_MIN       0.007   // ~1/144 noise floor
 #define SPEC_FRAC_MAX       0.10    // Fade begins (sparkle clusters can reach 12-15%)
 #define SPEC_FRAC_CEIL      0.16    // Full shutoff (large bright skies)
+#define SPARSE_SPEC_CEIL    0.02    // Below this spec_frac, "sparse points against dark" fires alongside tier_gate — catches candles/LEDs/stars
+
+// Saturated-channel spec detection. Count pixels using V = max(R,G,B) rather
+// than Y so pure saturated primaries (red LED Y=0.21 but V=1.0) qualify as
+// specular tier. V >= Y always, so neutrals behave identically. Scene-level
+// gating (tier_ratio, shutoff) still suppresses red-dominated scenes.
+#define ENABLE_SATURATED_SPEC 1
 
 #define TEMPORAL_ALPHA      0.03
 #define TEMPORAL_ALPHA_FAST 0.9
@@ -305,15 +357,24 @@ vec4 hook() {
             if (Y_ill > KNEE) bright_count += 1.0;
 
             // Source pixels — tier detection + log average
-            float Y_src = get_luma(HOOKED_tex(spos).rgb);
+            vec3 rgb_src = HOOKED_tex(spos).rgb;
+            float Y_src = get_luma(rgb_src);
             if (Y_src > 0.001) {
                 log_luma_sum += log(max(Y_src, 1e-6));
                 valid_luma++;
             }
 
-            // Highlight and specular tier counting (pure source, no illum)
-            if (Y_src > HIGHLIGHT_THRESH) highlight_src_count += 1.0;
-            if (Y_src > SPECULAR_THRESH) spec_count += 1.0;
+            // Highlight and specular tier counting.
+            // V-based counting allows saturated primaries (R=1.0 pure red) to
+            // qualify as specular — their peak channel is at signal ceiling,
+            // which is exactly what the spec bonus exists to restore.
+            #if ENABLE_SATURATED_SPEC
+            float intensity_src = max(max(rgb_src.r, rgb_src.g), rgb_src.b);
+            #else
+            float intensity_src = Y_src;
+            #endif
+            if (intensity_src > HIGHLIGHT_THRESH) highlight_src_count += 1.0;
+            if (intensity_src > SPECULAR_THRESH) spec_count += 1.0;
         }
     }
 
@@ -336,10 +397,18 @@ vec4 hook() {
     float highlight_frac_src = highlight_src_count / N_SAMPLES;
     float spec_onset = smoothstep(0.0, SPEC_FRAC_MIN, spec_frac);
     float spec_shutoff = 1.0 - smoothstep(SPEC_FRAC_MAX, SPEC_FRAC_CEIL, spec_frac);
-    // Tier separation: specular must be rarer than highlights
+    // Tier separation: specular must be rarer than highlights.
+    // Works for "bright point in bright surround" (candle with glow, chrome on
+    // mid-bright surface) but fails when specular points have no sub-specular
+    // halo (isolated candle flame in dark room, stars, distant LEDs).
     float tier_ratio = 1.0 - spec_frac / max(highlight_frac_src, 0.001);
     float tier_gate = smoothstep(0.3, 0.7, tier_ratio);
-    float spec_raw = spec_onset * spec_shutoff * tier_gate;
+    // Sparse-points-against-dark fallback: fires when specular pixels are
+    // very rare in the frame, regardless of tier ratio. Gated separately by
+    // spec_onset so pure noise floor doesn't trigger.
+    float sparse_bonus = 1.0 - smoothstep(0.0, SPARSE_SPEC_CEIL, spec_frac);
+    float tier_mode = max(tier_gate, sparse_bonus);
+    float spec_raw = spec_onset * spec_shutoff * tier_mode;
 
     // ---- Scene cut detection: 4×4 grid (prev_illum[16]) ----
     float change_count = 0.0;
@@ -443,8 +512,8 @@ vec4 hook() {
 #define ENABLE_DYNAMIC_INTENSITY 1
 #define DYN_CONTRAST_LOW    2.5     // Below this: flat scene, minimum intensity
 #define DYN_CONTRAST_HIGH   5.5     // Above this: dramatic scene, maximum intensity
-#define DYN_INTENSITY_LOW   0.92    // Multiplier for flat scenes (gentle)
-#define DYN_INTENSITY_HIGH  1.05    // Multiplier for dramatic scenes (gentle)
+#define DYN_INTENSITY_LOW   0.90    // Multiplier for flat scenes (gentle)
+#define DYN_INTENSITY_HIGH  1.15    // Multiplier for dramatic scenes (gentle)
 
 // =============================================
 //  APL MODULATION — brightness-driven expansion scaling
@@ -455,8 +524,8 @@ vec4 hook() {
 #define ENABLE_APL_MOD      1
 #define APL_KEY_DARK        0.03    // Below this: dark scene multiplier
 #define APL_KEY_BRIGHT      0.30    // Above this: bright scene multiplier
-#define APL_BOOST_DARK      1.00    // Neutral for dark scenes (gamma_dark suppresses midtones)
-#define APL_DAMPEN_BRIGHT   0.88    // Gently reduce bright scenes
+#define APL_BOOST_DARK      1.30    // Neutral for dark scenes (gamma_dark suppresses midtones)
+#define APL_DAMPEN_BRIGHT   0.75    // Gently reduce bright scenes
 
 // =============================================
 //  SPECULAR BONUS — scene-detected, per-pixel bloom
@@ -473,14 +542,21 @@ vec4 hook() {
 // center-out falloff). Bypasses APL/dynamic intensity dampening.
 #define ENABLE_SPECULAR_BONUS 1
 #define SPEC_Y_LOW          0.88    // Ramp onset
-#define SPEC_PEAK_DARK      1.4     // Specular boost in dark scenes (highlight pop)
-#define SPEC_PEAK_BRIGHT    0.8     // Specular boost in bright scenes (controlled)
+#define SPEC_PEAK_DARK      1.7     // Specular boost in dark scenes (highlight pop)
+#define SPEC_PEAK_BRIGHT    0.7     // Specular boost in bright scenes (controlled)
 #define SPEC_GAMMA_DARK     1.6     // Concentration in dark scenes (sharp peaks)
 #define SPEC_GAMMA_BRIGHT   0.8     // Concentration in bright scenes (broader)
 #define SPEC_APL_LOW        0.03    // Scene APL below → dark-scene specular params
 #define SPEC_APL_HIGH       0.30    // Scene APL above → bright-scene specular params
+// Super-white bonus: upscaler Y_gamma>1.0 is direct signal evidence that the
+// source was compressed — reward it proportionally. Gain is conservative;
+// ceil caps runaway on extreme super-white. At default settings, peak
+// nits (dark scene, full signal, Y=1.2) rises from ~534 to ~545.
+#define SPEC_OVERSHOOT_GAIN 0.3
+#define SPEC_RAMP_CEIL      1.10    // Hard cap on ramp; safety against extreme overshoot
 
 // Clip diffusion: blend near-white toward illum field to soften SDR clip edges
+#define ENABLE_CLIP_DIFFUSION 0      // GLSL #if needs integer — toggle this when tuning CLIP_DIFFUSION > 0
 #define CLIP_DIFFUSION       0.00    // Max blend at Y=1.0 (0.0=off, 0.5=strong)
 #define CLIP_DIFFUSION_FLOOR 0.95    // Y_gamma below: no softening
 
@@ -505,19 +581,19 @@ vec4 hook() {
 #define WS_HUE_COS          0.3420  // cos(70°) — center of warm range in Oklab
 #define WS_HUE_SIN          0.9397  // sin(70°)
 #define WS_HUE_POWER        1.2     // Hue window width (lower = wider, ~50° each side)
-#define WS_STRENGTH          0.08   // Max rotation in radians (~7° at full drive)
+#define WS_STRENGTH          0.06   // Max rotation in radians (~7° at full drive)
 #define WS_ILLUM_LOW         0.35   // Y_illum below: no shift (dark region)
 #define WS_ILLUM_HIGH        0.80   // Y_illum above: full shift
 #define WS_CHROMA_FLOOR      0.015  // Skip near-neutrals (unstable hue)
 
-#define ENABLE_PALE_SKIN 1
-#define ENABLE_PS_COMPRESS  1
+#define ENABLE_PALE_SKIN    1
+#define ENABLE_PS_COMPRESS  0       // GLSL #if needs integer — toggle this when tuning PS_COMPRESS > 0
 #define PS_HUE_COS          0.7317  // cos(43°) — warm hue center for skin detection
 #define PS_HUE_SIN          0.6816  // sin(43°)
 #define PS_HUE_POWER        2.0     // Sharpness of hue window
 #define PS_BRIGHT_FRAC_LOW  0.05
 #define PS_BRIGHT_FRAC_HIGH 0.30
-#define PS_COMPRESS         0.00
+#define PS_COMPRESS         0.00    // Expansion compression strength (applied when ENABLE_PS_COMPRESS=1)
 #define PS_SAT_BOOST        0.20
 #define PS_BRIGHT_FLOOR     0.50
 #define PS_CHROMA_CEIL      0.03
@@ -592,8 +668,14 @@ vec3 pq_oetf_fast(vec3 L) {
 #endif
 
 vec3 gamma709_to_pq2020(vec3 rgb_gamma) {
+    // Passthrough + early-exit path — black floor critical. ALWAYS use
+    // exact pq_oetf: the fast polynomial's constant term evaluates to
+    // ~0.068 at L=0, which decodes to ~0.12 nits, lifting letterbox bars
+    // and true blacks. See v3.0.1 changelog. The sub-1-LSB asymmetry this
+    // creates with linear709_to_pq2020 in the onset_blend 1.001..1.05
+    // region is imperceptible.
     vec3 linear = eotf_gamma(rgb_gamma);
-    vec3 bt2020 = bt709_to_bt2020(linear);
+    vec3 bt2020 = max(bt709_to_bt2020(linear), 0.0);
     return pq_oetf(bt2020 * (REFERENCE_WHITE / 10000.0));
 }
 
@@ -726,9 +808,14 @@ vec4 hook() {
     #endif
 
     // -------------------------------------------------------------------------
-    // PIXEL LUMA
+    // PIXEL LUMA / PEAK CHANNEL
     // -------------------------------------------------------------------------
     float Y_gamma = get_luma(rgb_gamma);
+    #if ENABLE_SATURATED_SPEC
+    // V = max channel. Used to let saturated primaries (red LED with Y=0.21
+    // but V=1.0) escape the Y-based early exit and qualify for spec ramp.
+    float V_gamma = max(max(rgb_gamma.r, rgb_gamma.g), rgb_gamma.b);
+    #endif
 
     // -------------------------------------------------------------------------
     // ILLUMINATION FIELD (before early exit — clip diffusion needs this)
@@ -740,7 +827,15 @@ vec4 hook() {
         return vec4(gamma709_to_pq2020(illum_rgb), 1.0);
     #endif
 
+    // Early exit: no base expansion (Y < knee) AND no saturated-channel
+    // signal worth the spec ramp either.
+    #if ENABLE_SATURATED_SPEC
+    if (Y_gamma < EARLY_EXIT_GAMMA && V_gamma < SPEC_Y_LOW) {
+        return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    }
+    #else
     if (Y_gamma < EARLY_EXIT_GAMMA) return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    #endif
 
     // -------------------------------------------------------------------------
     // GRAIN STABILIZATION
@@ -754,11 +849,13 @@ vec4 hook() {
     // CLIP DIFFUSION — soften SDR clip edges via illumination field
     // -------------------------------------------------------------------------
     // Only modifies rgb_gamma — Y_decision_gamma stays grain-stabilized.
+    #if ENABLE_CLIP_DIFFUSION
     {
         float soften = smoothstep(CLIP_DIFFUSION_FLOOR, 1.0, Y_gamma) * CLIP_DIFFUSION;
         rgb_gamma = mix(rgb_gamma, illum_rgb, soften);
         Y_gamma = get_luma(rgb_gamma);
     }
+    #endif
 
     // -------------------------------------------------------------------------
     // SPATIALLY-MODULATED PER-PIXEL EXPANSION
@@ -833,8 +930,25 @@ vec4 hook() {
         float spec_apl = smoothstep(SPEC_APL_LOW, SPEC_APL_HIGH, smoothed_log_avg);
         float spec_peak = mix(SPEC_PEAK_DARK, SPEC_PEAK_BRIGHT, spec_apl);
         float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, spec_apl);
-        float t = smoothstep(SPEC_Y_LOW, 1.0, Y_decision_gamma);
-        float spec_ramp = pow(t, spec_gamma);
+        // Drive signal: max(stabilized Y, peak channel). Neutrals use the
+        // grain-stabilized luma (no per-frame flicker). Saturated primaries
+        // at peak channel (V=1.0) qualify even when Y is low, so red LEDs
+        // and blue lasers get emissive pop. V is per-pixel — grain on
+        // saturated peaks is small in gamma space, temporal flicker is
+        // damped by smoothed_spec_signal at the scene level.
+        #if ENABLE_SATURATED_SPEC
+        float spec_driver = max(Y_decision_gamma, V_gamma);
+        #else
+        float spec_driver = Y_decision_gamma;
+        #endif
+        float t = smoothstep(SPEC_Y_LOW, 1.0, spec_driver);
+        // Super-white overshoot: upscaler can produce signal > 1.0. Treat
+        // it as evidence that the source was SDR-clipped — add linear bonus
+        // on top of the saturated ramp, scene-signal-gated as everything
+        // else. Hard-capped so extreme overshoot can't blow the nit budget.
+        float overshoot = max(spec_driver - 1.0, 0.0);
+        float spec_ramp = min(pow(t, spec_gamma) + overshoot * SPEC_OVERSHOOT_GAIN,
+                              SPEC_RAMP_CEIL);
         spec_strength = spec_peak * spec_ramp * smoothed_spec_signal;
         expansion += spec_strength;
     }
@@ -847,14 +961,71 @@ vec4 hook() {
     #endif
 
     // -------------------------------------------------------------------------
+    // DEBUG: Warm-shift / pale-skin visualization
+    // -------------------------------------------------------------------------
+    // Self-contained compute so the production path can defer linearize +
+    // Oklab until after the early-exit below.
+    #if DEBUG_SHOW_WP && (ENABLE_WARM_SHIFT || ENABLE_PALE_SKIN)
+    {
+        vec3 rl_dbg = eotf_gamma(rgb_gamma);
+        vec3 ok_dbg = rgb_to_oklab(rl_dbg);
+        float cr_dbg = sqrt(ok_dbg.y * ok_dbg.y + ok_dbg.z * ok_dbg.z);
+        float ws_mag = 0.0;
+        float ps_mag = 0.0;
+        #if ENABLE_WARM_SHIFT
+        {
+            float inv_c = (cr_dbg > WS_CHROMA_FLOOR) ? (1.0 / cr_dbg) : 0.0;
+            float cdh = (ok_dbg.y * WS_HUE_COS + ok_dbg.z * WS_HUE_SIN) * inv_c;
+            float hw = pow(max(cdh, 0.0), WS_HUE_POWER);
+            float drv = smoothstep(WS_ILLUM_LOW, WS_ILLUM_HIGH, Y_illum);
+            float bn = max(ok_dbg.z * inv_c, 0.0);
+            ws_mag = WS_STRENGTH * drv * hw * bn * 50.0;
+        }
+        #endif
+        #if ENABLE_PALE_SKIN
+        {
+            float inv_c = (cr_dbg > 1e-6) ? (1.0 / cr_dbg) : 0.0;
+            float cdh = (ok_dbg.y * PS_HUE_COS + ok_dbg.z * PS_HUE_SIN) * inv_c;
+            float hw = pow(max(cdh, 0.0), PS_HUE_POWER);
+            float gate = smoothstep(PS_BRIGHT_FRAC_LOW, PS_BRIGHT_FRAC_HIGH, smoothed_bright_frac);
+            float chw = smoothstep(0.015, 0.06, cr_dbg)
+                      * (1.0 - smoothstep(0.04, PS_CHROMA_CEIL + 0.04, cr_dbg));
+            #if ENABLE_GRAIN_STABLE
+            float Yd = (color.a > 0.99) ? get_luma(rl_dbg) : eotf_gamma(color.a);
+            #else
+            float Yd = get_luma(rl_dbg);
+            #endif
+            float bw = smoothstep(PS_BRIGHT_FLOOR, PS_BRIGHT_FLOOR + 0.15, Yd);
+            ps_mag = hw * chw * bw * gate * 10.0;
+        }
+        #endif
+        return vec4(gamma709_to_pq2020(vec3(ps_mag, ws_mag, 0.0)), color.a);
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // EARLY EXIT: non-expanded pixels
+    // -------------------------------------------------------------------------
+    // Warm-shift rotation and pale-skin chroma boost only apply to expanded
+    // pixels, so we defer Oklab + linearize + detection to after the early
+    // exit. If PS_COMPRESS > 0 is tuned on, a narrow corner of pixels near
+    // expansion ≈ 1.001 will now pay the Oklab cost only to be clamped back
+    // below threshold — accepted.
+    if (expansion < 1.001) {
+        return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    }
+
+    #if DEBUG_SHOW_EXPANSION
+    {
+        float exp_amount = (expansion - 1.0) / 2.5;
+        return vec4(gamma709_to_pq2020(vec3(exp_amount, exp_amount * 0.3, 0.0)), 1.0);
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
     // LINEARIZE
     // -------------------------------------------------------------------------
     vec3 rgb_linear = eotf_gamma(rgb_gamma);
-    #if ENABLE_GRAIN_STABLE
-    float Y_decision = (color.a > 0.99) ? get_luma(rgb_linear) : eotf_gamma(color.a);
-    #else
-    float Y_decision = get_luma(rgb_linear);
-    #endif
 
     // -------------------------------------------------------------------------
     // OKLAB (for chroma detection)
@@ -865,8 +1036,6 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // WARM SHIFT — Bezold-Brücke hue compensation (detection)
     // -------------------------------------------------------------------------
-    // Rotation angle computed here (before early exit for debug overlay).
-    // Applied after early exit — only expanded pixels need hue compensation.
     #if ENABLE_WARM_SHIFT
     float ws_angle = 0.0;
     {
@@ -885,6 +1054,13 @@ vec4 hook() {
     // PALE SKIN PROTECTION
     // -------------------------------------------------------------------------
     #if ENABLE_PALE_SKIN
+        // Linear-space Y_decision is only needed for the pale-skin bright gate.
+        #if ENABLE_GRAIN_STABLE
+        float Y_decision = (color.a > 0.99) ? get_luma(rgb_linear) : eotf_gamma(color.a);
+        #else
+        float Y_decision = get_luma(rgb_linear);
+        #endif
+
         float ps_inv_chroma = (chroma_orig > 1e-6) ? (1.0 / chroma_orig) : 0.0;
         float ps_cos_dh = (oklab_orig.y * PS_HUE_COS + oklab_orig.z * PS_HUE_SIN)
                         * ps_inv_chroma;
@@ -898,34 +1074,6 @@ vec4 hook() {
         expansion = mix(expansion, 1.0, PS_COMPRESS * ps_w);
         #endif
         float ps_sat = PS_SAT_BOOST * ps_w;
-    #endif
-
-    #if DEBUG_SHOW_WP && (ENABLE_WARM_SHIFT || ENABLE_PALE_SKIN)
-    {
-        float ws_mag = 0.0;
-        float ps_mag = 0.0;
-        #if ENABLE_WARM_SHIFT
-            ws_mag = ws_angle * 50.0;
-        #endif
-        #if ENABLE_PALE_SKIN
-            ps_mag = ps_w * 10.0;
-        #endif
-        return vec4(gamma709_to_pq2020(vec3(ps_mag, ws_mag, 0.0)), color.a);
-    }
-    #endif
-
-    // -------------------------------------------------------------------------
-    // EARLY EXIT: non-expanded pixels
-    // -------------------------------------------------------------------------
-    if (expansion < 1.001) {
-        return vec4(gamma709_to_pq2020(color.rgb), color.a);
-    }
-
-    #if DEBUG_SHOW_EXPANSION
-    {
-        float exp_amount = (expansion - 1.0) / 2.5;
-        return vec4(gamma709_to_pq2020(vec3(exp_amount, exp_amount * 0.3, 0.0)), 1.0);
-    }
     #endif
 
     // -------------------------------------------------------------------------

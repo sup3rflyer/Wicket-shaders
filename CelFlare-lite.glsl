@@ -136,7 +136,6 @@ vec4 hook() {
 #define BB_WARMTH 0.03             // Rotation in radians; try 0.03–0.10
 
 // --- Grain Stabilization ---
-// Reads pre-filtered luma from CelFlare-blur.glsl (alpha channel).
 #define ENABLE_GRAIN_STABLE 1
 
 // --- Dither ---
@@ -158,8 +157,6 @@ vec4 hook() {
 // ADVANCED TUNING
 // =============================================================================
 
-// --- Grain Stabilization ---
-// Reads pre-filtered luma from CelFlare-blur.glsl (alpha channel).
 #define EARLY_EXIT_GAMMA 0.25      // Skip dark pixels where chroma processing is imperceptible (~3 nits)
 
 // --- Saturation Rolloff ---
@@ -372,9 +369,10 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // GRAIN STABILIZATION (Pre-filter Alpha Read)
     // -------------------------------------------------------------------------
-    // CelFlare-blur.glsl pre-computes stabilized gamma luma and packs it into
-    // MAIN's alpha channel. We just read it here — zero extra texture fetches.
-    // If blur shader is not loaded, alpha = 1.0 (opaque video) — fall back to raw luma.
+    // The grain pre-filter pass (first hook in this file) packs stabilized
+    // gamma luma into MAIN's alpha channel. We just read it here — zero extra
+    // texture fetches. If alpha looks unmodified (~1.0, e.g. pre-filter
+    // bypassed), fall back to raw luma.
     #if ENABLE_GRAIN_STABLE
         Y_decision_gamma = (color.a > 0.99) ? Y_gamma : color.a;
 

@@ -524,8 +524,8 @@ vec4 hook() {
 #define ENABLE_APL_MOD      1
 #define APL_KEY_DARK        0.03    // Below this: dark scene multiplier
 #define APL_KEY_BRIGHT      0.30    // Above this: bright scene multiplier
-#define APL_BOOST_DARK      1.30    // Neutral for dark scenes (gamma_dark suppresses midtones)
-#define APL_DAMPEN_BRIGHT   0.75    // Gently reduce bright scenes
+#define APL_BOOST_DARK      1.25    // Neutral for dark scenes (gamma_dark suppresses midtones)
+#define APL_DAMPEN_BRIGHT   0.65    // Gently reduce bright scenes
 
 // =============================================
 //  SPECULAR BONUS — scene-detected, per-pixel bloom
@@ -542,10 +542,10 @@ vec4 hook() {
 // center-out falloff). Bypasses APL/dynamic intensity dampening.
 #define ENABLE_SPECULAR_BONUS 1
 #define SPEC_Y_LOW          0.88    // Ramp onset
-#define SPEC_PEAK_DARK      1.7     // Specular boost in dark scenes (highlight pop)
-#define SPEC_PEAK_BRIGHT    0.7     // Specular boost in bright scenes (controlled)
+#define SPEC_PEAK_DARK      1.9     // Specular boost in dark scenes (highlight pop)
+#define SPEC_PEAK_BRIGHT    0.9     // Specular boost in bright scenes (controlled)
 #define SPEC_GAMMA_DARK     1.6     // Concentration in dark scenes (sharp peaks)
-#define SPEC_GAMMA_BRIGHT   0.8     // Concentration in bright scenes (broader)
+#define SPEC_GAMMA_BRIGHT   1.0     // Concentration in bright scenes (broader)
 #define SPEC_APL_LOW        0.03    // Scene APL below → dark-scene specular params
 #define SPEC_APL_HIGH       0.30    // Scene APL above → bright-scene specular params
 // Super-white bonus: upscaler Y_gamma>1.0 is direct signal evidence that the

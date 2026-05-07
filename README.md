@@ -1,8 +1,8 @@
 # Wicket Shaders
 
-Custom GLSL shaders for [mpv](https://mpv.io/) video player. 
+Custom shaders for [mpv](https://mpv.io/) and [ReShade](https://reshade.me/).
 
-Requires **mpv** with `vo=gpu-next` (libplacebo backend).
+mpv shaders require `vo=gpu-next` (libplacebo backend).
 
 **My personal setup:** TextureClarity + Film Grain Light (auto SDR/HDR) on everything. CelFlare for anime.
 
@@ -147,12 +147,39 @@ Available files:
 - `filmgrain-smooth-HDR-medium.glsl`
 - `filmgrain-smooth-HDR-heavy.glsl`
 
+#### ReShade Port
+
+A single-file ReShade port is available at [`ReShade/FilmGrainSmooth.fx`](ReShade/FilmGrainSmooth.fx). All six mpv variants are consolidated as selectable presets with additional tuning controls:
+
+| Control | Description |
+|---------|-------------|
+| **Preset** | SDR/HDR x Light/Medium/Heavy |
+| **Intensity** | Multiplier on preset intensity |
+| **Grain Scale** | Grain spatial size (0 = per-pixel sharpest, 1 = preset default). Resolution-scaled to 2160p reference. |
+| **Color Saturation** | Chroma saturation multiplier (0 = monochrome) |
+| **Grain Mid** | Shifts where grain is most visible (response midpoint) |
+| **Grain Rate** | Animation rate in target fps. Auto-snaps to integer divisor of display refresh. |
+| **Match Blur** | Softens image at grain scale, emulating the film resolution limit |
+
+HDR-signal-safe: never clamps the backbuffer. Works on SDR (sRGB), HDR10 (PQ BT.2020), and scRGB (RGBA16F) backbuffers.
+
+**Usage:** Copy `FilmGrainSmooth.fx` to your ReShade `Shaders` folder.
+
+---
+
 ## Installation
+
+### mpv
 
 1. Copy the desired `.glsl` files to your mpv shader directory (typically `~~/shaders/`)
 2. Add `glsl-shaders-append=~~/shaders/<filename>.glsl` to your `mpv.conf`
 
 On Windows, `~~` refers to the mpv config directory (e.g. `%APPDATA%/mpv/` or `portable_config/` for portable installs).
+
+### ReShade
+
+1. Copy `.fx` files from the `ReShade/` folder to your ReShade installation's `Shaders` directory
+2. Enable the shader in the ReShade overlay
 
 ## Shader Load Order
 

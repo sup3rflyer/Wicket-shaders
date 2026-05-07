@@ -160,6 +160,7 @@ A single-file ReShade port is available at [`ReShade/FilmGrainSmooth.fx`](ReShad
 | **Grain Mid** | Shifts where grain is most visible (response midpoint) |
 | **Grain Rate** | Animation rate in target fps. Auto-snaps to integer divisor of display refresh. |
 | **Match Blur** | Softens image at grain scale, emulating the film resolution limit |
+| **Match Bind** | Grain pattern gates which image detail survives the blur — binds grain and blur into one coherent texture (requires Match Blur) |
 
 HDR-signal-safe: never clamps the backbuffer. Works on SDR (sRGB), HDR10 (PQ BT.2020), and scRGB (RGBA16F) backbuffers.
 

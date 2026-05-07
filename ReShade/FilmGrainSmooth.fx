@@ -67,6 +67,17 @@ uniform bool MatchBlur <
                  "becomes the apparent detail floor.";
 > = false;
 
+uniform float MatchBind <
+    ui_type = "slider";
+    ui_label = "Match Bind";
+    ui_min = 0.0; ui_max = 1.0; ui_step = 0.05;
+    ui_tooltip = "Requires Match Blur. Grain pattern gates which image detail "
+                 "survives the blur — where grain is active, original detail bleeds "
+                 "through; where grain is quiet, the blur wins. Binds grain and blur "
+                 "into a single coherent texture.\n"
+                 "0 = independent layers (blur + grain), 1 = full detail-gating.";
+> = 0.5;
+
 uniform float frame_time  < source = "frametime";  >;
 uniform int   frame_count < source = "framecount"; >;
 
@@ -252,6 +263,13 @@ float4 PS_FilmGrain(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
             }
         }
         src = blurred / wsum_img;
+
+        if (MatchBind > 0.0)
+        {
+            float3 detail = color - src;
+            float grain_energy = abs(dot(float3(sum_r, sum_g, sum_b), float3(0.299, 0.587, 0.114)));
+            src += detail * grain_energy * MatchBind;
+        }
     }
 
     // Tukey response with grain peak shift

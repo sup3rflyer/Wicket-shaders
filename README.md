@@ -21,24 +21,26 @@ The keybindings above use a Lua script for mpv. Ask an AI assistant to write you
 
 **Scene-adaptive SDR-to-HDR highlight expansion** with PQ BT.2020 output.
 
-Uses a spatially-modulated expansion curve driven by an illumination field (bright-biased Gaussian blur of regional luminance). All pixels in a region share the same curve parameters — local contrast preserved by construction through multiplicative application. Frame-level scene metrics (APL, contrast, bright fraction) provide gentle adaptation. Highlights expand to ~300 nits with specular pop on top, while midtones stay close to the SDR grade. Works with anime and live-action content.
+Uses a spatially-modulated expansion curve driven by an illumination field (bright-biased Gaussian blur of regional luminance). All pixels in a region share the same curve parameters — local contrast preserved by construction through multiplicative application. Frame-level scene metrics (APL, contrast, bright fraction) drive continuous adaptation rather than discrete scene-type classification. Highlights expand to ~265–335 nits with specular pop on top, while midtones stay close to the SDR grade. Works with anime and live-action content.
 
-Use INTENSITY and KNEE for tuning. Other tweaks are at your own peril.
+Use INTENSITY for overall strength and KNEE for where expansion onsets. `SPEC_PEAK_DARK` and `SPEC_PEAK_BRIGHT` control the strength of specular pop in dark vs bright scenes. Other internals are at your own peril.
 
 Features:
-- Illumination-field driven expansion (per-pixel curve, regionally adapted)
-- Scene adaptation via continuous metrics (APL, contrast, bright fraction)
-- Scene cut detection with fast adaptation lockout
-- Grain stabilization via bilateral log-luma filter
-- Specular bonus with scene-detected highlight pop (tier separation gating)
+- Spatially-modulated expansion curve (per-pixel, regionally adapted by an illumination field)
+- Continuous scene adaptation (APL, contrast, bright fraction) — no discrete scene-type classifier
+- Velocity-adaptive temporal smoothing: still scenes get stable averages, gradual lighting changes adapt faster, scene cuts lock on near-instantly
+- Growing-object detection — explosions, fire, backlit reveals, and similar expanding-bright events keep their HDR pop instead of being progressively dampened as they grow
+- Bright-scene specular recovery — chrome, sun glints, headlights, and snowfield highlights still pop in daylight where normal detection would shut off
+- Specular bonus with per-pixel ramp, scene-aware peak/gamma, and saturation gating (genuine highlights pop, bright colored surfaces don't)
 - Bezold-Brücke hue compensation (regional warm-to-red rotation in Oklab — fixes warm-to-green shift on fire, sunsets, skin)
 - Pale skin saturation protection
-- Expansion in Oklab with chroma attenuation for saturated pixels
+- Grain stabilization via compute-shader bilateral log-luma filter with shared-memory tile load
+- Expansion in Oklab with chroma attenuation for saturated pixels; fast-path bypass for near-neutrals
 - PQ-aware temporal dither to mask 8-bit banding in expanded highlights
 - Direct PQ BT.2020 output bypasses libplacebo's SDR peak clipping
-- Multiple debug visualizations for tuning
+- Multiple debug visualizations for tuning (including in-frame stats overlay)
 
-**Requirements:** mpv v0.41.0+ with `vo=gpu-next`
+**Requirements:** mpv v0.41.0+ with `vo=gpu-next`. Uses compute shaders (GLSL 4.30+) — works on the default Vulkan and D3D11 backends; OpenGL backend requires 4.3+ for native compute.
 
 **Usage:**
 

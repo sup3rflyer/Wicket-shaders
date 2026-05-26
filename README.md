@@ -21,7 +21,7 @@ The keybindings above use a Lua script for mpv. Ask an AI assistant to write you
 
 **Scene-adaptive SDR-to-HDR highlight expansion** with PQ BT.2020 output.
 
-Uses a spatially-modulated expansion curve driven by an illumination field (bright-biased Gaussian blur of regional luminance). All pixels in a region share the same curve parameters — local contrast preserved by construction through multiplicative application. Frame-level scene metrics (APL, contrast, bright fraction) drive continuous adaptation rather than discrete scene-type classification. Highlights expand to ~265–335 nits with specular pop on top, while midtones stay close to the SDR grade. Works with anime and live-action content.
+Uses a spatially-modulated expansion curve driven by an illumination field (bright-biased Gaussian blur of regional luminance). All pixels in a region share the same curve parameters — local contrast preserved by construction through multiplicative application. Frame-level scene metrics (APL, contrast, bright fraction) drive continuous adaptation rather than discrete scene-type classification. Highlights expand to ~200–310 nits with specular pop on top, while midtones stay close to the SDR grade. Works with anime and live-action content.
 
 Use INTENSITY for overall strength and KNEE for where expansion onsets. `SPEC_PEAK_DARK` and `SPEC_PEAK_BRIGHT` control the strength of specular pop in dark vs bright scenes. Other internals are at your own peril.
 

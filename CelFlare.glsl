@@ -438,13 +438,15 @@ vec4 hook() {
 #define BRIGHT_SPEC_THRESH    0.97  // Super-specular threshold for bright scenes
 #define BRIGHT_SCENE_LOW      0.20  // smoothed_log_avg below: normal detection only
 #define BRIGHT_SCENE_HIGH     0.35  // smoothed_log_avg above: bright fallback active
-// Recovery's own scene-fraction shutoff. Wider than the normal SPEC_FRAC_*
-// because the >0.97 tier targets "large bright body" content (sky, snow,
-// chrome) which can legitimately fill the majority of the frame; only kill
-// recovery at near-total whiteout where the discriminator runs out of
-// reference dark.
-#define BRIGHT_SPEC_FRAC_MAX  0.50  // Recovery starts fading at 50% of cells > 0.97
-#define BRIGHT_SPEC_FRAC_CEIL 0.85  // Recovery fully off at 85% of cells > 0.97
+// Recovery's own scene-fraction shutoff. Tightened to discriminate "sparse
+// specular against bright" (chrome at noon, headlights against daylight,
+// sun glints on water — bs_frac ≤ ~0.10) from "broad white surface" (cel-art
+// shirts/walls at Y=1.0, snow vistas — bs_frac ≥ ~0.20). The earlier wide
+// window (0.50–0.85) treated cel-art whites as legitimate specular bodies
+// and lifted them ~20–40 nits via SPEC_PEAK_BRIGHT, which read as "too hot"
+// on anime even though the spatial curve alone was on target.
+#define BRIGHT_SPEC_FRAC_MAX  0.15  // Recovery starts fading at 15% of cells > 0.97
+#define BRIGHT_SPEC_FRAC_CEIL 0.40  // Recovery fully off at 40% of cells > 0.97
 
 // Saturated-channel spec detection. Count pixels using V = max(R,G,B) rather
 // than Y so pure saturated primaries (red LED Y=0.21 but V=1.0) qualify as
@@ -743,15 +745,15 @@ void hook() {
 // on tonal relationships. APL and Dynamic are gentle scene adjustments (~10%),
 // not aggressive dampeners. Specular bonus adds HDR pop on top.
 //
-// Nit targets at REFERENCE_WHITE=116 (spatial curve only, pre-specular):
-//   Peak (Y=1.00):             ~300–335 nits
-//   Highlights (Y≈0.90–0.95):  195–255 nits
-//   Reference white (Y≈0.85):  155–175 nits
-//   Midtones (Y≤0.50):         near SDR (~2% lift)
-#define PEAK_BRIGHT     2.6     // Expansion peak for bright regions (~302 nits)
-#define PEAK_DARK       2.9     // Expansion peak for dark regions (~336 nits)
-#define GAMMA_BRIGHT    1.8     // Curve shape: moderate, preserves highlight gradient
-#define GAMMA_DARK      2.0     // Curve shape: stronger highlight concentration
+// Nit targets at REFERENCE_WHITE=116 (spatial curve only, pre-APL/spec):
+//   Peak (Y=1.00):             ~278–313 nits
+//   Highlights (Y≈0.90–0.95):  180–250 nits
+//   Reference white (Y≈0.85):  145–155 nits
+//   Midtones (Y≤0.50):         near SDR (negligible lift)
+#define PEAK_BRIGHT     2.4     // Expansion peak for bright regions (~278 nits pre-APL)
+#define PEAK_DARK       2.7     // Expansion peak for dark regions (~313 nits pre-APL)
+#define GAMMA_BRIGHT    2.1     // Gentler ramp through 0.85–0.95 — peak preserved at Y=1.0
+#define GAMMA_DARK      2.3     // Matching gradualness in dark scenes
 #define PEAK_ATTEN      0.12    // Gentle bright_frac dampening (spatial curve adapts)
 #define BRIGHT_FRAC_REF 0.40    // Bright fraction where scene adaptation plateaus
 
@@ -777,7 +779,7 @@ void hook() {
 #define APL_KEY_DARK        0.03    // Below this: dark scene multiplier
 #define APL_KEY_BRIGHT      0.30    // Above this: bright scene multiplier
 #define APL_BOOST_DARK      1.25    // Neutral for dark scenes (gamma_dark suppresses midtones)
-#define APL_DAMPEN_BRIGHT   0.85    // Mild reduction of bright scenes — full white ≈ 230 nits at REFERENCE_WHITE=116
+#define APL_DAMPEN_BRIGHT   0.65    // Bright-scene reduction — full white ≈ 206 nits at REFERENCE_WHITE=116 (Y_illum≈0.7, bf=1)
 // Mid-scene notch: parabolic dampener peaking at apl_t=0.5 (smoothed_log_avg
 // ≈ 0.16 — normally-lit interiors, mid-key cinematic). Prevents pale skin /
 // fabric / hair from looking "illuminated" in those scenes by trimming a few

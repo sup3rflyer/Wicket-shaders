@@ -1,0 +1,16 @@
+# --- Wicket-shaders : PUBLIC release repo ---
+# Only published shaders + README belong here. This actively blocks dev material
+# from ever reaching the public repo (defense-in-depth after the 2026-06 leak,
+# where dev tooling on a public branch exposed local media-library paths).
+
+# Never publish the dev tree, tooling, or fixtures
+dev/
+groundtruth.json
+*.local.json
+paths.local.*
+
+# Python / junk
+__pycache__/
+*.pyc
+*.bak
+*.bak-*

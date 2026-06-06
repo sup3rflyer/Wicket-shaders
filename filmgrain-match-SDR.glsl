@@ -114,6 +114,12 @@
 //!MAXIMUM 4.0
 0.0
 
+//!PARAM chroma_amp
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
 //!PARAM grain_sharpness
 //!TYPE float
 //!MINIMUM 0.0
@@ -223,27 +229,14 @@
 //!COMPUTE 32 32
 //!DESC Film Grain Match: LUMA measure
 
-#define GRAIN_RATE 0.25
 #define MAX_TAPS 3
 
-#define INT_FLOOR    0.10
-#define INT_CEIL     0.65
 #define MID_FLOOR    0.15
 #define STEEP_FLOOR  2.6
-#define SATURATION   0.25
-
-#define CONF_LOW     0.10
-#define CONF_HIGH    0.35
-#define DENSITY_GAIN 1.0
 
 
-#define RED_VARIANCE_SCALE 1.0
-#define GREEN_VARIANCE_SCALE 1.0
-#define BLUE_VARIANCE_SCALE 1.0
 
-#define RED_SATURATION 0.6
-#define GREEN_SATURATION 0.5
-#define BLUE_SATURATION 0.4
+
 
 #define TUKEY_SCALE 0.459
 
@@ -301,14 +294,6 @@
 #define SPATIAL_STATIC_RATIO_LO 0.45
 #define SPATIAL_STATIC_RATIO_HI 0.80
 #define CONTENT_HELD_EPS   0.0025
-#define SOFTEN_TEMPORAL_RATIO_LO 1.20
-#define SOFTEN_TEMPORAL_RATIO_HI 2.50
-#define SOFTEN_INTENSITY_HI 0.24
-#define SOFTEN_MAX_BLEND 0.35
-#define TEMPORAL_TONE_STEEPEN 1.75
-#define SHAPE_AMP_LOW     0.08
-#define SHAPE_AMP_HIGH    0.25
-#define SHAPE_MAX_BLEND   0.40
 #define SAT_LO_CEIL       0.18
 #define SAT_HI_FLOOR      0.45
 #define SAT_MIN_CELLS     96.0
@@ -316,13 +301,6 @@
 // the held-cel temporal-grain curve above the dither floor. Overlay grain fires
 // via held_run directly; film grain fires via spatial amplitude but only when
 // held_run corroborates (so busy-paper spatial can't ride the bypass).
-#define HELD_RUN_BIN_FLOOR 0.0021
-#define HELD_RUN_LO        2.0
-#define HELD_RUN_HI        5.0
-#define HELD_CORROB_LO     1.0
-#define HELD_CORROB_HI     3.0
-#define SPAT_PRESENCE_LO   0.0050
-#define SPAT_PRESENCE_HI   0.0080
 // FILM-grain firing path (the high-value target: genuine camera grain compression
 // smoothed unevenly -- Goku Midnight Eye / Cyber City Oedo 808). Driven by the
 // flat-temporal LEVEL (band-median of the p25 transition-temporal curve), which
@@ -336,8 +314,6 @@
 // equilibrium (mgt_gate_table.py, pooled taxonomy): clean/texture settle
 // 1.9-2.8e-3 (floor, ZERO false positives), film settles 4.4e-3 (fires ~0.55).
 // LO sits 1.0e-3 above the highest clean equilibrium -> the false-positive margin.
-#define FILM_LEVEL_LO 0.0038
-#define FILM_LEVEL_HI 0.0050
 #define FILM_ATTACK   0.015
 #define FILM_DECAY    0.05
 #define FILM_LEVEL_CEIL 0.008
@@ -1251,37 +1227,10 @@ vec4 hook() { return HOOKED_tex(HOOKED_pos); }
 
 #define TUKEY_SCALE 0.459
 
-#define NBINS     16
-#define GRID_W    96
-#define GRID_H    96
-#define GRID_N    (GRID_W * GRID_H)
-#define AMP_BINS  64
-#define AMP_MAX   0.05
 
-#define NOISE_STD_PER_INTENSITY 0.030
-#define BLACK_FLOOR   0.02
-#define WHITE_CEIL    0.985
-#define MIN_BIN_CELLS 48.0
 #define GRAIN_LO_BIN  2
 #define GRAIN_HI_BIN  14
-#define PLAUSIBLE_BRIGHT_LO 0.88
-#define PLAUSIBLE_BRIGHT_HI 0.985
-#define HELD_EPS      0.0001
-#define CUT_SAT_FRAC  0.60
-#define SAT_BIN       (AMP_BINS * 3 / 4)
 
-#define P25_TO_GRAINSTD (1.0 / 0.3186 / 1.41421356)
-#define P50_TO_GRAINSTD (1.0 / 0.67448975 / 1.41421356)
-#define SPATIAL_EDGE_GATE 0.015
-#define SPATIAL_VAR_MAX   0.02
-#define SPATIAL_PCTL      0.25
-#define TEMPORAL_EDGE_GATE 0.006
-#define TEMPORAL_PCTL      0.50
-#define TEMPORAL_BIN_FLOOR 0.003
-#define TEMPORAL_MIN_BINS  5
-#define TEMPORAL_GAIN      1.25
-#define TEMPORAL_RUN_MIN   4
-#define TEMPORAL_RUN_FULL  7
 // Spatial-incoherence motion gate. Grain is spatially incoherent; coherent motion
 // (smoke, pans) and global luma drift are not. We measure the temporal change of
 // the local spatial micro-gradient between a pixel and one COH_OFFSET_PX away:
@@ -1292,19 +1241,6 @@ vec4 hook() { return HOOKED_tex(HOOKED_pos); }
 // COH_OFFSET_PX must exceed the grain correlation length (so even coarse/blocky
 // grain reads incoherent) yet stay under the motion coherence length.
 #define COH_OFFSET_PX 12.0
-#define COH_CLAMP     0.07
-#define COH_SQ_SCALE  1.0e7
-#define COH_MIN_NORM  20000.0
-#define COH_LO        0.45
-#define COH_HI        0.75
-#define COH_ALPHA     0.25
-#define TEMPORAL_SPATIAL_CEIL 0.004
-#define TEMPORAL_NEEDS_SPATIAL_LO 0.0018
-#define TEMPORAL_NEEDS_SPATIAL_HI 0.0028
-#define SPATIAL_STATIC_GATE 0.004
-#define SPATIAL_STATIC_RATIO_LO 0.45
-#define SPATIAL_STATIC_RATIO_HI 0.80
-#define CONTENT_HELD_EPS   0.0025
 #define SOFTEN_TEMPORAL_RATIO_LO 1.20
 #define SOFTEN_TEMPORAL_RATIO_HI 2.50
 #define SOFTEN_INTENSITY_HI 0.24
@@ -1315,7 +1251,6 @@ vec4 hook() { return HOOKED_tex(HOOKED_pos); }
 #define SHAPE_MAX_BLEND   0.40
 #define SAT_LO_CEIL       0.18
 #define SAT_HI_FLOOR      0.45
-#define SAT_MIN_CELLS     96.0
 // STEP 2 held-cel firing gate (texture-safe). held_run = contiguous luma bins of
 // the held-cel temporal-grain curve above the dither floor. Overlay grain fires
 // via held_run directly; film grain fires via spatial amplitude but only when
@@ -1342,9 +1277,6 @@ vec4 hook() { return HOOKED_tex(HOOKED_pos); }
 // LO sits 1.0e-3 above the highest clean equilibrium -> the false-positive margin.
 #define FILM_LEVEL_LO 0.0038
 #define FILM_LEVEL_HI 0.0050
-#define FILM_ATTACK   0.015
-#define FILM_DECAY    0.05
-#define FILM_LEVEL_CEIL 0.008
 
 // PAN-FREEZE gate (canvas-pan overfire fix). A baked artistic texture (e.g. the
 // distressed-paint wall in Days with My Stepsister) translating under a pan is a
@@ -1365,17 +1297,8 @@ vec4 hook() { return HOOKED_tex(HOOKED_pos); }
 // sources that read high are themselves panning, where freeze only HOLDS the level.
 // (In-shader magnitudes are ~6x below the offline area-grid LK -- aliased texture
 // dilutes Gxx on the point grid -- but the static-vs-pan separation is what matters.)
-#define PAN_FREEZE_LO 0.07
-#define PAN_FREEZE_HI 0.16
-#define LK_SCALE      2.0e5
 
-#define ALPHA_SLOW    0.03
-#define ALPHA_FAST    0.20
-#define ALPHA_MISSING 0.35
-#define CUT_REREADY   8.0
-#define STATE_MAGIC   0.5567819
 
-#define STEEP_MIN     0.6
 #define STEEP_MAX     9.0
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
@@ -1393,6 +1316,7 @@ shared float dyn_wb2[2 * MAX_TAPS + 1];
 shared float bp_norm[3];                   // per-channel analytic RMS norm (amplitude-stable)
 shared float vsum_sigma[3];                // per-channel RMS of vsum (= GRAIN_STD*s1c), for value_warp
 shared float warp_renorm;                  // 1/sqrt(E[tanh^2(value_warp*Z)]) -- amplitude-preserving
+shared float chroma_scale[3];              // per-channel chroma layer scale (CHROMA layer, uniform)
 
 
 uint pcg_hash(uint s) {
@@ -1667,6 +1591,20 @@ void hook() {
         } else {
             warp_renorm = 1.0;
         }
+        // CHROMA layer scale (uniform, once/frame). The chroma is a coarse, INDEPENDENT,
+        // blue-biased, luma-removed per-channel field that REUSES the DoG outer weights
+        // (dyn_*2, already per-channel blue-biased coarse) -> no extra weight math. Normalize
+        // the outer-blur RMS (chroma noise RMS 0.2498 * s2c[c]) to unit, then scale to
+        // chroma_amp x luma-grain-RMS, blue-biased by CHROMA_W. GATED by gs_fire*match_grain
+        // (mono unless grain confidently fires). chroma_amp=0 -> 0 -> exact mono (A/B-safe).
+        // Amplitude/blue-bias match the offline-validated render_grain_rgb (vs the t3 GT).
+        const vec3 CHROMA_W = vec3(0.8, 0.9, 1.4);
+        float luma_rms = dot(luma_coeff, vec3(vsum_sigma[0], vsum_sigma[1], vsum_sigma[2]));
+        float chroma_eff = chroma_amp * match_grain * gs_fire;
+        for (int cc = 0; cc < 3; cc++) {
+            chroma_scale[cc] = (s2c[cc] > 1e-8)
+                ? chroma_eff * luma_rms * CHROMA_W[cc] / (0.2498 * s2c[cc]) : 0.0;
+        }
     }
     barrier();
 
@@ -1748,6 +1686,50 @@ void hook() {
         }
     }
 
+    // --- CHROMA layer: a coarse, INDEPENDENT, blue-biased per-channel field. REUSES the DoG
+    // outer weights (dyn_*2 -- already per-channel blue-biased coarse) so no extra weight math;
+    // the only new cost is one noise-gen + h/v blur. Per-channel-INDEPENDENT noise (distinct
+    // seeds, also independent of the luma grain above) -> the cross-channel decorrelation that
+    // makes it chroma. Added LUMA-REMOVED after the warp so the luma grain is untouched.
+    // Unconditional (barriers can't sit in varying flow); chroma_scale=0 (chroma_amp=0 or
+    // not firing) -> zero contribution -> exact mono. ---
+    float chroma_raw_r = 0.0, chroma_raw_g = 0.0, chroma_raw_b = 0.0;
+    barrier();
+    {
+        for (uint i = lid; i < isize.y * isize.x; i += num_threads) {
+            uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
+            ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy)
+                                 + ivec2(local_pos) - ivec2(MAX_TAPS);
+            uvec2 global_pos = uvec2(global_coord_i);
+            uint cbase = (global_pos.x * 1664525u) + (global_pos.y * 22695477u)
+                       + (frame_seed * 314159265u);
+            uint cr_s = cbase + 0x68bc21ebu;     // 3 INDEPENDENT per-channel streams (distinct
+            uint cg_s = cbase + 0x02e5be93u;     // seeds -> decorrelated chroma, also distinct
+            uint cb_s = cbase + 0x967a889bu;     // from the luma grain -> pure chroma layer)
+            grain_r[local_pos.y][local_pos.x] = rand_triangular(cr_s, 1.0);
+            grain_g[local_pos.y][local_pos.x] = rand_triangular(cg_s, 1.0);
+            grain_b[local_pos.y][local_pos.x] = rand_triangular(cb_s, 1.0);
+        }
+        barrier();
+        for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
+            float hsum_r = 0.0, hsum_g = 0.0, hsum_b = 0.0;
+            for (int x = 0; x < 2 * MAX_TAPS + 1; x++) {
+                hsum_r += dyn_wr2[x] * grain_r[y][gl_LocalInvocationID.x + x];
+                hsum_g += dyn_wg2[x] * grain_g[y][gl_LocalInvocationID.x + x];
+                hsum_b += dyn_wb2[x] * grain_b[y][gl_LocalInvocationID.x + x];
+            }
+            grain_r[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_r;
+            grain_g[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_g;
+            grain_b[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_b;
+        }
+        barrier();
+        for (int y = 0; y < 2 * MAX_TAPS + 1; y++) {
+            chroma_raw_r += dyn_wr2[y] * grain_r[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
+            chroma_raw_g += dyn_wg2[y] * grain_g[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
+            chroma_raw_b += dyn_wb2[y] * grain_b[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
+        }
+    }
+
     // bandpass combine (DoG = blur(s1) - a*blur(s2)), RMS-normalized so strength holds.
     float vsum_r = bp_norm[0] * (vsum1_r - bp_alpha * vsum2_r);
     float vsum_g = bp_norm[1] * (vsum1_g - bp_alpha * vsum2_g);
@@ -1762,6 +1744,19 @@ void hook() {
         vsum_r = vsum_sigma[0] * warp_renorm * tanh(value_warp * vsum_r / max(vsum_sigma[0], 1e-6));
         vsum_g = vsum_sigma[1] * warp_renorm * tanh(value_warp * vsum_g / max(vsum_sigma[1], 1e-6));
         vsum_b = vsum_sigma[2] * warp_renorm * tanh(value_warp * vsum_b / max(vsum_sigma[2], 1e-6));
+    }
+
+    // Add the CHROMA layer to the per-channel grain, LUMA-REMOVED: subtract the chroma's luma
+    // part cl so REC709(vsum) is UNCHANGED -> the validated luma grain is untouched (chroma is
+    // pure hue fluctuation). chroma_scale=0 (chroma_amp=0 / not firing) -> exact no-op.
+    {
+        float cs_r = chroma_raw_r * chroma_scale[0];
+        float cs_g = chroma_raw_g * chroma_scale[1];
+        float cs_b = chroma_raw_b * chroma_scale[2];
+        float cl = dot(luma_coeff, vec3(cs_r, cs_g, cs_b));
+        vsum_r += cs_r - cl;
+        vsum_g += cs_g - cl;
+        vsum_b += cs_b - cl;
     }
 
     vec4 color = GRAIN_SRC_tex(GRAIN_SRC_pos);

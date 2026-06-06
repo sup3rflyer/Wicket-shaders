@@ -27,21 +27,49 @@
 //   PASS 3 - Compute 32x32 at OUTPUT: renders grain from GRAIN_SRC using the
 //            LUMA-measured GRAIN_STATE.
 //
-// Runtime params (toggled live via glsl-shader-opts; see shader-toggle.lua):
-//   match_grain   F3       0 = pure Light floor (bit-identical to the tier),
-//                          1 = matched. mix() between, so A/B is non-destructive.
-//   debug_match   Ctrl+F3  machine-readable state readout.
-//   grain_sharpness Alt+F3  per-source grain sharpness ("sandpaper"<->soft) from
-//                          the measured source character; 0 = prior fixed size.
-//   restore_gain           upward extrapolation past surviving grain (the
-//                          compensatory knob). 1.0 = match only what survived.
-//   pan_freeze             1 = freeze the grain-amplitude RISE during a real global
-//                          pan (kills the canvas-pan overfire build-up; grain already
-//                          established HOLDS). 0 = prior behaviour. A/B-safe.
-//   grain_restore_taper    1 = taper restore_gain->1 as measured amplitude rises
-//                          (Lain over-apply fix). 0 = off (default).
-//   density_combine        0 = additive, 1 = multiplicative density (default).
-//   state_epoch            harness reset token; bump once per source file.
+// Runtime params. Only match_grain / debug_match / value_warp are on keys (F3 / Ctrl+F3 /
+// Alt+F3 via shader-toggle.lua); the rest are tuned by editing the DEFAULT value under each
+// param block below and reloading (the lua no longer overrides them). The param blocks are
+// ordered to match these groups. (Comments cannot sit between the param blocks -- the parser
+// rejects it -- so every param is documented HERE.)
+//
+//  == CONTROL ===============================================================
+//   match_grain      0 = pure Light floor (bit-identical to the tier), 1 = matched; mix()
+//                    between, so the on/off A/B is non-destructive.            [F3]
+//   debug_match      machine-readable state-readout overlay.                   [Ctrl+F3]
+//   state_epoch      harness reset token; bump once per source file.
+//
+//  == GRAIN LOOK (the dials to tune by eye) =================================
+//   grain_gain       overall grain AMOUNT/strength (1 = calibrated; up to 12).
+//   grain_size       grain SIZE: <1 finer, >1 coarser (1 = calibrated).
+//   grain_contrast   spectral hardness: 0 = soft/lowpass, 1 = sandpaper bandpass, up to 2 =
+//                    more DC removed / peppery (difference-of-Gaussians).
+//   value_warp       VALUE-domain contrast: 0 = Gaussian (bit-identical), ~2 hard, ~3 extreme
+//                    = bimodal/high-per-grain-contrast (CyberCity "harsh"). Amplitude-
+//                    preserving; the value-domain cousin of grain_contrast.    [Alt+F3]
+//   grain_sharpness  GLOBAL crispness dial: 1 = crisp 4K-film-scan (matched to plates),
+//                    0 = BIT-IDENTICAL to the old soft Light look.
+//
+//  == RESTORATION (how much grain to rebuild on degraded sources) ===========
+//   restore_gain     upward extrapolation past surviving grain (compensatory). 1 = match only
+//                    what survived; higher = rebuild more of the grain compression ate.
+//   restore_floor    how readily low-confidence / uncertain areas still get grained.
+//   grain_restore_taper  1 = taper restore_gain->1 as measured amplitude rises (the Lain
+//                    over-apply fix). 0 = off (default).
+//
+//  == PIPELINE / SIZING =====================================================
+//   density_combine  0 = additive, 1 = multiplicative density (grain rides brightness; default).
+//   grid_snap        1 = snap the SIZE-measurement grid to whole pixels so the gated fineR
+//                    matches the clean-field fineR the size law is tuned on (removes the
+//                    half-pixel prefilter) + use the autotuned law. 0 = old half-pixel grid +
+//                    old hand-set law (the exact pre-snap look). Default 1.
+//
+//  == TEMPORAL DYNAMICS / FIRING (behaviour, not look) ======================
+//   grain_attack     EMA attack rate (how fast the grain level rises to a new scene).
+//   grain_decay      EMA decay rate (how fast it falls; faster than attack = cut-safe).
+//   hardcut_frac     fraction-of-frame-changed that counts as a HARD cut (re-converge).
+//   pan_freeze       1 = freeze the grain-amplitude RISE during a real global pan (kills the
+//                    canvas-pan overfire; established grain HOLDS). 0 = prior. A/B-safe.
 // ============================================================================
 
 //!PARAM match_grain
@@ -56,11 +84,59 @@
 //!MAXIMUM 1.0
 0.0
 
+//!PARAM state_epoch
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 65535.0
+0.0
+
+//!PARAM grain_gain
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 12.0
+2.0
+
+//!PARAM grain_size
+//!TYPE float
+//!MINIMUM 0.3
+//!MAXIMUM 2.5
+1.0
+
+//!PARAM grain_contrast
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 2.0
+1.0
+
+//!PARAM value_warp
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 4.0
+0.0
+
+//!PARAM grain_sharpness
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
+
 //!PARAM restore_gain
 //!TYPE float
 //!MINIMUM 0.0
 //!MAXIMUM 4.0
-3.3
+4.0
+
+//!PARAM restore_floor
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.40
+
+//!PARAM grain_restore_taper
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
 
 //!PARAM density_combine
 //!TYPE float
@@ -68,11 +144,11 @@
 //!MAXIMUM 1.0
 1.0
 
-//!PARAM state_epoch
+//!PARAM grid_snap
 //!TYPE float
 //!MINIMUM 0.0
-//!MAXIMUM 65535.0
-0.0
+//!MAXIMUM 1.0
+1.0
 
 //!PARAM grain_attack
 //!TYPE float
@@ -91,24 +167,6 @@
 //!MINIMUM 0.40
 //!MAXIMUM 1.0
 0.85
-
-//!PARAM restore_floor
-//!TYPE float
-//!MINIMUM 0.0
-//!MAXIMUM 1.0
-0.40
-
-//!PARAM grain_sharpness
-//!TYPE float
-//!MINIMUM 0.0
-//!MAXIMUM 1.0
-1.0
-
-//!PARAM grain_restore_taper
-//!TYPE float
-//!MINIMUM 0.0
-//!MAXIMUM 1.0
-0.0
 
 //!PARAM pan_freeze
 //!TYPE float
@@ -165,7 +223,7 @@
 //!COMPUTE 32 32
 //!DESC Film Grain Match: LUMA measure
 
-#define GRAIN_RATE 0.5
+#define GRAIN_RATE 0.25
 #define MAX_TAPS 3
 
 #define INT_FLOOR    0.10
@@ -176,7 +234,7 @@
 
 #define CONF_LOW     0.10
 #define CONF_HIGH    0.35
-#define DENSITY_GAIN 2.0
+#define DENSITY_GAIN 1.0
 
 
 #define RED_VARIANCE_SCALE 1.0
@@ -474,22 +532,41 @@ void hook() {
                 // spreads it to 3px. Reuses the flat (non-edge) gate above; the 1e6
                 // scale keeps the uint atomics in range (per-sample clamp guards
                 // heavy grain). The fine/coarse ratio is formed in the reduction.
-                float x3m = measure_luma(uv - vec2(3.0 * HOOKED_pt.x, 0.0));
-                float x3p = measure_luma(uv + vec2(3.0 * HOOKED_pt.x, 0.0));
-                float y3m = measure_luma(uv - vec2(0.0, 3.0 * HOOKED_pt.y));
-                float y3p = measure_luma(uv + vec2(0.0, 3.0 * HOOKED_pt.y));
+                // SIZE measurement on a PIXEL-SNAPPED grid (grid_snap). The 96-grid
+                // centres land at sub-pixel positions (half-pixel in x @4K), so the
+                // bilinear measure_luma() softens the 1px lap MORE than the 3px lap and
+                // the gated fineR reads ~2x too coarse at the fine end -- mismatching
+                // the clean-field fineR the size law is tuned on (offline replica:
+                // log-affine slope 0.73 unsnapped -> 0.996 snapped, R2 0.9999). Snapping
+                // uv to the texel CENTRE makes measure_luma return the exact texel (no
+                // prefilter); the +/-1px,+/-3px taps inherit exact texels. ONLY the size
+                // path is snapped -- the shared tslope gate, the histogram and all
+                // amplitude/temporal sampling keep the original uv (bit-identical, so the
+                // validated look is preserved; grid_snap=0 restores it exactly). The
+                // measure runs on a SINGLE workgroup, so the extra fetches are ~free.
+                vec2 suv = (grid_snap > 0.5)
+                         ? (floor(uv * HOOKED_size) + 0.5) * HOOKED_pt : uv;
+                float cur_s = measure_luma(suv);
+                float xms = measure_luma(suv - vec2(HOOKED_pt.x, 0.0));
+                float xps = measure_luma(suv + vec2(HOOKED_pt.x, 0.0));
+                float yms = measure_luma(suv - vec2(0.0, HOOKED_pt.y));
+                float yps = measure_luma(suv + vec2(0.0, HOOKED_pt.y));
+                float x3m = measure_luma(suv - vec2(3.0 * HOOKED_pt.x, 0.0));
+                float x3p = measure_luma(suv + vec2(3.0 * HOOKED_pt.x, 0.0));
+                float y3m = measure_luma(suv - vec2(0.0, 3.0 * HOOKED_pt.y));
+                float y3p = measure_luma(suv + vec2(0.0, 3.0 * HOOKED_pt.y));
                 // Grain-energy gate: skip grain-poor flat samples (compression
                 // smooths grain in flats), so the ratio reflects grain, not residual.
-                float e1 = (cur_luma - xp) * (cur_luma - xp) + (cur_luma - xm) * (cur_luma - xm)
-                         + (cur_luma - yp) * (cur_luma - yp) + (cur_luma - ym) * (cur_luma - ym);
+                float e1 = (cur_s - xps) * (cur_s - xps) + (cur_s - xms) * (cur_s - xms)
+                         + (cur_s - yps) * (cur_s - yps) + (cur_s - yms) * (cur_s - yms);
                 if (e1 > 1.6e-5) {
                     // LAPLACIAN (2nd difference) at 1px vs 3px. The 2nd difference
                     // cancels the smooth linear gradient that biased a raw diff
                     // ratio coarse, isolating grain. ratio lap1^2/lap3^2 (formed in
                     // the reduction): HIGH = fine/sharp (sandpaper), LOW = coarse/
                     // soft. Validated offline (lap_g, Spearman +0.90 vs 16-bit GT).
-                    float lap1 = 4.0 * cur_luma - (xm + xp + ym + yp);
-                    float lap3 = 4.0 * cur_luma - (x3m + x3p + y3m + y3p);
+                    float lap1 = 4.0 * cur_s - (xms + xps + yms + yps);
+                    float lap3 = 4.0 * cur_s - (x3m + x3p + y3m + y3p);
                     atomicAdd(s_size_fine,   uint(min(lap1 * lap1 * 1.0e6, 2.0e5)));
                     atomicAdd(s_size_coarse, uint(min(lap3 * lap3 * 1.0e6, 2.0e5)));
                 }
@@ -1112,7 +1189,7 @@ vec4 hook() { return HOOKED_tex(HOOKED_pos); }
 //!COMPUTE 32 32
 //!DESC Film Grain Match: OUTPUT render + debug
 
-#define GRAIN_RATE 1.0
+#define GRAIN_RATE 0.5
 // 9-tap support (was 7): the blue channel's base sigma (1.20) reaches ~1.15 even at
 // the crisp neutral and higher when coarse, where 7 taps (clean only to sigma ~1.0)
 // truncate the Gaussian into a box and ripple the spectrum. 9 taps hold sigma up to
@@ -1121,7 +1198,7 @@ vec4 hook() { return HOOKED_tex(HOOKED_pos); }
 #define MAX_TAPS 4
 
 #define INT_FLOOR    0.10
-#define INT_CEIL     0.65
+#define INT_CEIL     0.85
 #define MID_FLOOR    0.15
 #define STEEP_FLOOR  2.6
 #define SATURATION   0.25
@@ -1141,6 +1218,18 @@ vec4 hook() { return HOOKED_tex(HOOKED_pos); }
 // ideal at that extreme) rather than ripple the spectrum. The actual film range
 // (fine digital .. ~16mm) stays under it, so this never touches normal operation.
 #define SIGMA_MAX    1.5
+// CONTRAST / "sandpaper" axis (2026-06-05). The generator (white noise -> ONE Gaussian
+// blur) is LOWPASS (DC-peaked = soft cloud); real film grain is BANDPASS (suppressed DC,
+// mid-freq peak) per the offline profiler + ITU-T H.274's frequency-filtering grain model.
+// Fix = difference-of-Gaussians: grain = blur(s1) - a*blur(s1*BP_RATIO), which suppresses
+// DC -> bandpass. s1 = the per-channel render sigma (size lever); a = BP_ALPHA*grain_contrast
+// (the hardness/sandpaper dial). grain_contrast=0 -> a=0 -> grain=blur(s1) = BIT-IDENTICAL
+// to the old lowpass (A/B-safe). The 2nd (wider) blur reuses the 9-tap machinery by
+// REGENERATING the (reproducible) noise; s2 is capped at SIGMA_MAX so 9 taps still hold it.
+// An analytic RMS norm (from the blur weights) keeps grain STRENGTH constant as contrast
+// rises. Offline-locked to CyberCity (tools/mgt_bandpass_design.py): BP_RATIO 1.8, A0 0.60.
+#define BP_RATIO     1.8
+#define BP_ALPHA     0.60
 // Lain restore-gain taper thresholds on m_intensity_raw: below LO = full compensatory
 // restore_gain; above HI = ~x1 (grain already heavy/intact, don't over-restore).
 // Only active when grain_restore_taper>0. Needs feel-test tuning.
@@ -1149,7 +1238,7 @@ vec4 hook() { return HOOKED_tex(HOOKED_pos); }
 
 #define CONF_LOW     0.10
 #define CONF_HIGH    0.35
-#define DENSITY_GAIN 2.0
+#define DENSITY_GAIN 1.0
 
 
 #define RED_VARIANCE_SCALE 1.0
@@ -1298,6 +1387,12 @@ shared float grain_b[isize.y][isize.x];
 shared float dyn_wr[2 * MAX_TAPS + 1];
 shared float dyn_wg[2 * MAX_TAPS + 1];
 shared float dyn_wb[2 * MAX_TAPS + 1];
+shared float dyn_wr2[2 * MAX_TAPS + 1];   // bandpass DoG outer-blur weights (s2 = BP_RATIO*s1)
+shared float dyn_wg2[2 * MAX_TAPS + 1];
+shared float dyn_wb2[2 * MAX_TAPS + 1];
+shared float bp_norm[3];                   // per-channel analytic RMS norm (amplitude-stable)
+shared float vsum_sigma[3];                // per-channel RMS of vsum (= GRAIN_STD*s1c), for value_warp
+shared float warp_renorm;                  // 1/sqrt(E[tanh^2(value_warp*Z)]) -- amplitude-preserving
 
 
 uint pcg_hash(uint s) {
@@ -1407,6 +1502,10 @@ void hook() {
     float eff_gain = mix(restore_gain, gain_taper, grain_restore_taper);
     float tgt_int = clamp(m_intensity_raw * eff_gain, INT_FLOOR, INT_CEIL);
     float eff_render = mix(INT_FLOOR, tgt_int, w);
+    // grain_gain: unclamped post-clamp intensity dial (restore_gain saturates at
+    // INT_CEIL, so it can't push past it; this can). 1.0 = calibrated; raise to make
+    // grain strongly visible for evaluation, then dial back. Scales image + debug patches.
+    eff_render *= grain_gain;
     float shape_ratio = (shape_min > 0.0) ? shape_max / shape_min : 1.0;
     float shape_conf = smoothstep(1.2, 2.0, shape_ratio);
 
@@ -1467,7 +1566,16 @@ void hook() {
     // stock), not just 35mm. Zero-blur isn't reached in practice but the RANGE is
     // there (white-noise fineR~1.0 -> k~0.43 -> sigma ~0.43 green @4K).
     float gs_fineR = clamp(m_grain_fine, 0.03, 1.0);
-    float gs_k_tgt = clamp(pow(0.099 / gs_fineR, 0.364), 0.40, 1.60);
+    // Size law  sigma = (R0 / fineR)^EXP, clamped [KLO,KHI]. With grid_snap the gated
+    // fineR matches the clean-field fineR the autotune tuned against, so use the TUNED
+    // law (mgt_autotune: R0 .135 EXP .317 clamp .639,1.571; size error -66%, LOSO 7/8
+    // sizes). grid_snap=0 -> old half-pixel fineR -> the OLD hand-set law = the exact
+    // pre-snap validated look (A/B; the two move together so neither half is orphaned).
+    float law_R0  = (grid_snap > 0.5) ? 0.135 : 0.099;
+    float law_EXP = (grid_snap > 0.5) ? 0.317 : 0.364;
+    float law_KLO = (grid_snap > 0.5) ? 0.639 : 0.40;
+    float law_KHI = (grid_snap > 0.5) ? 1.571 : 1.60;
+    float gs_k_tgt = clamp(pow(law_R0 / gs_fineR, law_EXP), law_KLO, law_KHI);
     float gs_fire = smoothstep(0.12, 0.30, w);
     float gs = grain_sharpness * match_grain;
     // RESOLUTION NORMALIZATION (two different scalings, folded into the k mix):
@@ -1484,31 +1592,85 @@ void hook() {
     float src_scale = GRAIN_SRC_size.y / src_h;                   // OUTPUT / SOURCE
     float k_neutral = mix(1.0, K_NEUTRAL * vis_scale, gs);
     float k_size = mix(k_neutral, gs_k_tgt * src_scale, gs * gs_fire);
+    // grain_size: live size multiplier (1.0 = calibrated). <1 finer, >1 coarser. Lets
+    // you correct the per-source size by eye -- CyberCity currently renders too FINE
+    // (fineR read its hard edges as fineness); raising size also lets the bandpass bite.
+    k_size *= grain_size;
     float soften_eff = source_soften * (1.0 - gs);
 
+    // CONTRAST/BANDPASS: build inner (s1) AND outer (s2 = BP_RATIO*s1) blur weights.
+    // bp_alpha is UNIFORM across the workgroup (grain_contrast/match_grain/gs_fire are
+    // all uniform), so the bp_alpha>0 branch below is uniform control flow -> the
+    // barriers inside it are legal. bp_alpha=0 -> outer blur skipped, bp_norm=1,
+    // grain = blur(s1) = the old lowpass generator, bit-identical (A/B-safe).
+    float bp_alpha = BP_ALPHA * grain_contrast * match_grain * gs_fire;
     if (lid < uint(2 * MAX_TAPS + 1)) {
         int idx = int(lid);
         float dx = float(idx - MAX_TAPS);
-        dyn_wr[idx] = gaussian_weight(dx, min(mix(0.78, 1.02, soften_eff) * k_size, SIGMA_MAX));
-        dyn_wg[idx] = gaussian_weight(dx, min(mix(1.00, 1.22, soften_eff) * k_size, SIGMA_MAX));
-        dyn_wb[idx] = gaussian_weight(dx, min(mix(1.20, 1.40, soften_eff) * k_size, SIGMA_MAX));
+        float s1r = mix(0.78, 1.02, soften_eff) * k_size;
+        float s1g = mix(1.00, 1.22, soften_eff) * k_size;
+        float s1b = mix(1.20, 1.40, soften_eff) * k_size;
+        dyn_wr[idx]  = gaussian_weight(dx, min(s1r, SIGMA_MAX));
+        dyn_wg[idx]  = gaussian_weight(dx, min(s1g, SIGMA_MAX));
+        dyn_wb[idx]  = gaussian_weight(dx, min(s1b, SIGMA_MAX));
+        dyn_wr2[idx] = gaussian_weight(dx, min(s1r * BP_RATIO, SIGMA_MAX));
+        dyn_wg2[idx] = gaussian_weight(dx, min(s1g * BP_RATIO, SIGMA_MAX));
+        dyn_wb2[idx] = gaussian_weight(dx, min(s1b * BP_RATIO, SIGMA_MAX));
     }
     barrier();
     if (lid == 0u) {
-        float nr = 0.0, ng = 0.0, nb = 0.0;
+        float nr = 0.0, ng = 0.0, nb = 0.0, nr2 = 0.0, ng2 = 0.0, nb2 = 0.0;
         for (int i = 0; i < 2 * MAX_TAPS + 1; i++) {
-            nr += dyn_wr[i];
-            ng += dyn_wg[i];
-            nb += dyn_wb[i];
+            nr += dyn_wr[i]; ng += dyn_wg[i]; nb += dyn_wb[i];
+            nr2 += dyn_wr2[i]; ng2 += dyn_wg2[i]; nb2 += dyn_wb2[i];
         }
         for (int i = 0; i < 2 * MAX_TAPS + 1; i++) {
-            dyn_wr[i] /= nr;
-            dyn_wg[i] /= ng;
-            dyn_wb[i] /= nb;
+            dyn_wr[i] /= nr; dyn_wg[i] /= ng; dyn_wb[i] /= nb;
+            dyn_wr2[i] /= nr2; dyn_wg2[i] /= ng2; dyn_wb2[i] /= nb2;
+        }
+        // Analytic RMS norm: Var(blur1 - a*blur2)/Var(blur1) on white noise. For a
+        // separable 2D kernel, sum-of-squares and the cross-sum get squared. Keeps
+        // grain STRENGTH constant as contrast rises (clean A/B). a=0 -> vr=1 -> norm=1.
+        float s1c[3]; float s2c[3]; float s12c[3];
+        s1c[0] = 0.0; s1c[1] = 0.0; s1c[2] = 0.0;
+        s2c[0] = 0.0; s2c[1] = 0.0; s2c[2] = 0.0;
+        s12c[0] = 0.0; s12c[1] = 0.0; s12c[2] = 0.0;
+        for (int i = 0; i < 2 * MAX_TAPS + 1; i++) {
+            s1c[0] += dyn_wr[i]*dyn_wr[i];  s2c[0] += dyn_wr2[i]*dyn_wr2[i];  s12c[0] += dyn_wr[i]*dyn_wr2[i];
+            s1c[1] += dyn_wg[i]*dyn_wg[i];  s2c[1] += dyn_wg2[i]*dyn_wg2[i];  s12c[1] += dyn_wg[i]*dyn_wg2[i];
+            s1c[2] += dyn_wb[i]*dyn_wb[i];  s2c[2] += dyn_wb2[i]*dyn_wb2[i];  s12c[2] += dyn_wb[i]*dyn_wb2[i];
+        }
+        for (int c = 0; c < 3; c++) {
+            float r1 = s1c[c] * s1c[c];
+            float vr = 1.0 + bp_alpha * bp_alpha * (s2c[c]*s2c[c]) / r1
+                           - 2.0 * bp_alpha * (s12c[c]*s12c[c]) / r1;
+            bp_norm[c] = inversesqrt(max(vr, 1e-4));
+        }
+        // value_warp amplitude bookkeeping (uniform; computed once per frame). vsum_sigma =
+        // the per-channel RMS of vsum (bp_norm makes Var(vsum)=Var(vsum1)=GRAIN_STD^2*s1c^2;
+        // verified ratio 1.000). warp_renorm = 1/sqrt(E[tanh^2(value_warp*Z)]), Z~N(0,1),
+        // via fixed Gaussian quadrature -> the tanh warp preserves grain strength (RMS
+        // stable to ~1% offline). value_warp<=0.05 -> renorm 1 (the warp branch is skipped).
+        const vec3 GRAIN_STD = vec3(0.16223, 0.1742, 0.15653);
+        vsum_sigma[0] = GRAIN_STD.x * s1c[0];
+        vsum_sigma[1] = GRAIN_STD.y * s1c[1];
+        vsum_sigma[2] = GRAIN_STD.z * s1c[2];
+        if (value_warp > 0.05) {
+            float num = 0.0, den = 0.0;
+            for (int j = -16; j <= 16; j++) {
+                float z = float(j) * 0.25;
+                float wpdf = exp(-0.5 * z * z);
+                float t = tanh(value_warp * z);
+                num += wpdf * t * t; den += wpdf;
+            }
+            warp_renorm = inversesqrt(max(num / den, 1e-4));
+        } else {
+            warp_renorm = 1.0;
         }
     }
     barrier();
 
+    // --- inner blur(s1): generate noise -> separable blur -> vsum1 ---
     for (uint i = lid; i < isize.y * isize.x; i += num_threads) {
         uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
         ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy)
@@ -1525,7 +1687,6 @@ void hook() {
         grain_b[local_pos.y][local_pos.x] = mix(grain_lum, g_b, BLUE_SATURATION * SATURATION);
     }
     barrier();
-
     for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
         float hsum_r = 0.0, hsum_g = 0.0, hsum_b = 0.0;
         for (int x = 0; x < 2 * MAX_TAPS + 1; x++) {
@@ -1538,12 +1699,69 @@ void hook() {
         grain_b[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_b;
     }
     barrier();
-
-    float vsum_r = 0.0, vsum_g = 0.0, vsum_b = 0.0;
+    float vsum1_r = 0.0, vsum1_g = 0.0, vsum1_b = 0.0;
     for (int y = 0; y < 2 * MAX_TAPS + 1; y++) {
-        vsum_r += dyn_wr[y] * grain_r[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
-        vsum_g += dyn_wg[y] * grain_g[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
-        vsum_b += dyn_wb[y] * grain_b[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
+        vsum1_r += dyn_wr[y] * grain_r[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
+        vsum1_g += dyn_wg[y] * grain_g[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
+        vsum1_b += dyn_wb[y] * grain_b[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
+    }
+
+    // --- outer blur(s2) for the DoG: regenerate the SAME noise, blur with dyn_*2 ---
+    // UNCONDITIONAL (barriers must not sit in varying control flow -> D3D X3663). When
+    // grain_contrast=0, bp_alpha=0 so vsum2 is multiplied out in the combine (still
+    // A/B-safe); we just always pay the cheap 2nd blur instead of skipping it.
+    float vsum2_r = 0.0, vsum2_g = 0.0, vsum2_b = 0.0;
+    barrier();
+    {
+        for (uint i = lid; i < isize.y * isize.x; i += num_threads) {
+            uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
+            ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy)
+                                 + ivec2(local_pos) - ivec2(MAX_TAPS);
+            uvec2 global_pos = uvec2(global_coord_i);
+            uint seed_init = (global_pos.x * 1664525u) + (global_pos.y * 22695477u)
+                           + (frame_seed * 314159265u);
+            float g_r = rand_triangular(seed_init, RED_VARIANCE_SCALE);
+            float g_g = rand_triangular(seed_init, GREEN_VARIANCE_SCALE);
+            float g_b = rand_triangular(seed_init, BLUE_VARIANCE_SCALE);
+            float grain_lum = dot(vec3(g_r, g_g, g_b), vec3(0.299, 0.587, 0.114));
+            grain_r[local_pos.y][local_pos.x] = mix(grain_lum, g_r, RED_SATURATION * SATURATION);
+            grain_g[local_pos.y][local_pos.x] = mix(grain_lum, g_g, GREEN_SATURATION * SATURATION);
+            grain_b[local_pos.y][local_pos.x] = mix(grain_lum, g_b, BLUE_SATURATION * SATURATION);
+        }
+        barrier();
+        for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
+            float hsum_r = 0.0, hsum_g = 0.0, hsum_b = 0.0;
+            for (int x = 0; x < 2 * MAX_TAPS + 1; x++) {
+                hsum_r += dyn_wr2[x] * grain_r[y][gl_LocalInvocationID.x + x];
+                hsum_g += dyn_wg2[x] * grain_g[y][gl_LocalInvocationID.x + x];
+                hsum_b += dyn_wb2[x] * grain_b[y][gl_LocalInvocationID.x + x];
+            }
+            grain_r[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_r;
+            grain_g[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_g;
+            grain_b[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_b;
+        }
+        barrier();
+        for (int y = 0; y < 2 * MAX_TAPS + 1; y++) {
+            vsum2_r += dyn_wr2[y] * grain_r[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
+            vsum2_g += dyn_wg2[y] * grain_g[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
+            vsum2_b += dyn_wb2[y] * grain_b[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
+        }
+    }
+
+    // bandpass combine (DoG = blur(s1) - a*blur(s2)), RMS-normalized so strength holds.
+    float vsum_r = bp_norm[0] * (vsum1_r - bp_alpha * vsum2_r);
+    float vsum_g = bp_norm[1] * (vsum1_g - bp_alpha * vsum2_g);
+    float vsum_b = bp_norm[2] * (vsum1_b - bp_alpha * vsum2_b);
+
+    // VALUE-DOMAIN contrast (value_warp): tanh the grain toward a bimodal/high-per-grain-
+    // contrast marginal -- the CyberCity "harsh" character (negative excess-kurtosis).
+    // Per channel: warped = sigma*renorm*tanh(warp * vsum / sigma) -> reshapes the value
+    // distribution while preserving RMS (sigma + renorm computed above). value_warp=0 is
+    // skipped -> BIT-IDENTICAL (A/B-safe). The value-domain cousin of grain_contrast.
+    if (value_warp > 0.05) {
+        vsum_r = vsum_sigma[0] * warp_renorm * tanh(value_warp * vsum_r / max(vsum_sigma[0], 1e-6));
+        vsum_g = vsum_sigma[1] * warp_renorm * tanh(value_warp * vsum_g / max(vsum_sigma[1], 1e-6));
+        vsum_b = vsum_sigma[2] * warp_renorm * tanh(value_warp * vsum_b / max(vsum_sigma[2], 1e-6));
     }
 
     vec4 color = GRAIN_SRC_tex(GRAIN_SRC_pos);
@@ -1624,6 +1842,36 @@ void hook() {
             color.rgb = vec3(m_measure_swatch_r, m_measure_swatch_g, m_measure_swatch_b);
         else if (swatch_pos.x >= 70 && swatch_pos.x < 130 && swatch_pos.y >= 0 && swatch_pos.y < 60)
             color = GRAIN_SRC_tex(vec2(0.5, 0.5));
+
+        // GRAIN-ON-CLEAN patches (right of the readout). The real source is already
+        // grainy, so A/B is hard; these show the rendered grain on a FLAT base. Each
+        // 120px patch = three 40px strips: CLEAN | LOWPASS | BANDPASS, so the bandpass
+        // character is visible directly vs clean and vs the old lowpass. Slots: source-
+        // center color, then gray 0.20 / 0.45 / 0.70 (grain is midtone-peaked -> mid shows
+        // most). Crank Ctrl+Shift+F3 (gain) to make it clearly visible.
+        ivec2 pp = ivec2(gl_GlobalInvocationID.xy) - ivec2(X_OFF + 210, Y_OFF);
+        if (pp.x >= 0 && pp.x < 120 && pp.y >= 0 && pp.y < 430) {
+            int slot = pp.y / 110;
+            if (pp.y - slot * 110 < 100) {
+                vec3 base = (slot == 0) ? vec3(m_measure_swatch_r, m_measure_swatch_g, m_measure_swatch_b)
+                          : (slot == 1) ? vec3(0.20)
+                          : (slot == 2) ? vec3(0.45)
+                          :               vec3(0.70);
+                float ts = grain_scale(dot(base, luma_coeff), eff_mid, eff_steep);
+                // thirds: CLEAN | LOWPASS (blur s1) | BANDPASS (current grain_contrast),
+                // so the bandpass character shows directly vs clean AND vs the old lowpass
+                // without toggling. Crank Ctrl+Shift+F3 (gain) to make it clearly visible.
+                vec3 gfield = (pp.x < 40) ? vec3(0.0)
+                            : (pp.x < 80) ? vec3(vsum1_r, vsum1_g, vsum1_b)
+                            :               vsum;
+                vec3 outc = base;
+                if (density_combine > 0.5)
+                    outc *= exp(eff_render * DENSITY_GAIN * gfield * ts);
+                else
+                    outc += eff_render * gfield * ts;
+                color.rgb = outc;
+            }
+        }
     }
 
     imageStore(out_image, ivec2(gl_GlobalInvocationID), color);

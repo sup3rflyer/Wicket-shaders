@@ -1,4 +1,4 @@
-// CelFlare v5.0 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.1 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Two-layer architecture:
@@ -789,7 +789,7 @@ void hook() {
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
-//!DESC CelFlare v5.0
+//!DESC CelFlare v5.1
 
 // =============================================
 //  MAIN TUNING — start here

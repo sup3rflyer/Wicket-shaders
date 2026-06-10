@@ -242,7 +242,9 @@ vec3 pq_oetf(vec3 L) {
 
 // PQ OETF polynomial approximation: degree-7 minimax fit on sqrt(L) domain
 // Valid for L in [0, 0.20] (0-2000 nits). Sub-1.2 ten-bit step accuracy for L > 0.005.
-// Near-zero (< 5 nits) has larger error but those channels are invisible in highlights.
+// Near-zero (< 30 nits) has larger error — handled by the exact-OETF blend in
+// linear709_to_pq2020 (see PQ_EXACT_LOW/HIGH), since dark channels of saturated
+// expanded pixels ARE visible as a hue/saturation skew.
 // Cost: 1 sqrt + 7 FMA per channel vs 2 pow + 1 div per channel for exact PQ.
 #if PQ_FAST_APPROX
 vec3 pq_oetf_fast(vec3 L) {
@@ -270,12 +272,30 @@ vec3 gamma709_to_pq2020(vec3 rgb_gamma) {
 // Clamp in BT.2020 space (not BT.709) so out-of-709 colors that fit in the
 // wider BT.2020 gamut are preserved — eliminates blue-channel clipping that
 // shifts warm hues (yellow/orange/red) toward green/gold.
+//
+// Fast-poly low-end repair (2026-06-10, mirrors CelFlare.glsl): the
+// polynomial's error explodes below ~30 nits — +25..42 ten-bit LSB under
+// 0.5 nits (an effective ~0.2-0.35 nit per-channel black floor), ±5 LSB
+// through 1-10 nits. "Those channels are invisible in highlights" is wrong
+// for the dark channels of saturated expanded pixels (e.g. the blue channel
+// of a red emissive): the lift is a systematic hue/saturation skew. Blend
+// small channels to the exact OETF; above PQ_EXACT_HIGH the polynomial's
+// |err| stays within its ≲1.8 LSB design accuracy.
+#define PQ_EXACT_LOW    0.0015   // L normalized (≈15 nits): fully exact below
+#define PQ_EXACT_HIGH   0.0030   // L normalized (≈30 nits): fully fast above
+
 vec3 linear709_to_pq2020(vec3 rgb_linear) {
     vec3 bt2020 = max(bt709_to_bt2020(rgb_linear), 0.0);
+    vec3 L = bt2020 * (REFERENCE_WHITE / 10000.0);
     #if PQ_FAST_APPROX
-        return pq_oetf_fast(bt2020 * (REFERENCE_WHITE / 10000.0));
+        vec3 pq = pq_oetf_fast(L);
+        if (min(min(L.r, L.g), L.b) < PQ_EXACT_HIGH) {
+            vec3 w = smoothstep(PQ_EXACT_LOW, PQ_EXACT_HIGH, L);
+            pq = mix(pq_oetf(L), pq, w);
+        }
+        return pq;
     #else
-        return pq_oetf(bt2020 * (REFERENCE_WHITE / 10000.0));
+        return pq_oetf(L);
     #endif
 }
 

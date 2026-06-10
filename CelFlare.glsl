@@ -22,6 +22,7 @@
 //!VAR float smoothed_log_avg
 //!VAR float smoothed_growth_mode
 //!VAR float scene_cut_lockout
+//!VAR float smoothed_spec_natural
 //!VAR float prev_illum[144]
 //!STORAGE
 
@@ -43,14 +44,29 @@
 // expansion at feature boundaries.
 //
 // Compute layout: 16x16 workgroup, 256 threads. Each workgroup pre-loads
-// a 54x54 luma tile into shared memory (cooperative, ~11 fetches/thread),
+// a 54x54 luma tile into shared memory (cooperative, ~11 loads/thread),
 // then each thread does 12 manual-bilinear shared reads instead of 12
-// texture fetches. ~13 tex fetches/pixel -> ~1 (center RGB only).
+// scattered texture fetches. Amortized fetch count is ~12.4/pixel (2916
+// tile loads / 256 threads + 1 center RGB) — similar to the fragment
+// path's ~13; the win is coalesced sequential loads + shared-memory
+// bilinear, not raw fetch count. A workgroup VOTE skips the tile load
+// entirely when all 256 pixels are outside the stabilization range
+// (dark scenes, letterbox, blown-out whites) — the common case.
 // Halo = radius+1 (the +1 is required for the bilinear floor(p)+1 lookup
 // at workgroup edge — easy bug if you set HALO == GRAIN_BLUR_RADIUS).
 // Math is bit-for-bit equivalent to the v4.7 fragment path: same sample
 // positions, same bilinear weights (hardware tex did fract(uv*size) on
 // the same coords).
+//
+// ALPHA PROTOCOL: this pass stores its decision luma in alpha as
+// Y * 0.5 (stabilized Y_decision, or raw Y_gamma on the exit paths).
+// The 0.5 encode keeps every legitimate value representable — the old
+// scheme stored Y directly and PASS 6 used `a > 0.99` as an "unstabilized"
+// sentinel, which collided with real stabilized lumas in (0.99, 1.0]
+// (grain pits next to super-white can stabilize above 0.99) and silently
+// fell back to raw Y there. PASS 6 decodes with a plain * 2.0. Assumes a
+// float intermediate FBO for MAIN (true under gpu-next fp16); a unorm FBO
+// would clamp at Y=2.0 instead of 1.0 — strictly more headroom than before.
 #define STABILIZE_OPACITY   0.85
 #define GRAIN_THRESHOLD     0.28
 #define GRAIN_BLUR_RADIUS   18     // 9 px inner / 18 px outer — stays inside one patch
@@ -77,6 +93,7 @@
 #define THREADS   (BLOCK_W * BLOCK_H)
 
 shared float tile_y[TILE_SIZE];
+shared uint  wg_active;   // workgroup vote: any pixel in stabilization range?
 
 float tile_bilinear(vec2 pos) {
     // pos is in tile-local pixel coords. Manual bilinear mirrors hardware
@@ -98,6 +115,31 @@ void hook() {
     ivec2 g_pixel = ivec2(gl_GlobalInvocationID.xy);
     uint  lid     = gl_LocalInvocationIndex;
 
+    // This thread's own center pixel — RGB needed for passthrough output,
+    // grabbed off the texture path (one fetch) rather than from the luma
+    // tile (which only stores Y).
+    vec2 g_uv = (vec2(g_pixel) + 0.5) * HOOKED_pt;
+    vec4 original = HOOKED_tex(g_uv);
+    float Y_gamma = dot(original.rgb, luma_coeff);
+
+    // -------- workgroup vote: skip the tile when nothing is in range --------
+    // The cooperative load (~2916 fetches + shared stores) is the pass's
+    // dominant cost, and it ran unconditionally even when every pixel in the
+    // block would early-exit — i.e. most of a dark frame, letterbox, blown
+    // whites. Vote first on each thread's own (already-fetched) center luma.
+    // All three barriers sit in workgroup-uniform control flow: the vote
+    // result is uniform by construction, so the conditional return is
+    // D3D11/SPIRV-Cross safe.
+    if (lid == 0u) wg_active = 0u;
+    barrier();
+    if (Y_gamma >= GRAIN_EARLY_EXIT && Y_gamma < GRAIN_RANGE_MAX + 0.05)
+        wg_active = 1u;   // concurrent same-value stores — benign by design
+    barrier();
+    if (wg_active == 0u) {
+        imageStore(out_image, g_pixel, vec4(original.rgb, Y_gamma * 0.5));
+        return;
+    }
+
     // -------- cooperative luma tile load --------
     // tile_origin is the top-left corner of the tile in image pixel coords.
     // Edge workgroups will sample outside the image; HOOKED_tex's clamp
@@ -111,13 +153,6 @@ void hook() {
         tile_y[i] = dot(HOOKED_tex(uv).rgb, luma_coeff);
     }
 
-    // This thread's own center pixel — RGB needed for passthrough output,
-    // grabbed off the texture path (one fetch) rather than from the luma
-    // tile (which only stores Y).
-    vec2 g_uv = (vec2(g_pixel) + 0.5) * HOOKED_pt;
-    vec4 original = HOOKED_tex(g_uv);
-    float Y_gamma = dot(original.rgb, luma_coeff);
-
     barrier();
 
     // -------- early exits --------
@@ -125,7 +160,7 @@ void hook() {
     // Upper: super-white (Y >= 1.00), range_mask = 0 above 0.95+0.05.
     //        Skips the smoothstep + bilateral entirely for upscaler overshoot.
     if (Y_gamma < GRAIN_EARLY_EXIT || Y_gamma >= GRAIN_RANGE_MAX + 0.05) {
-        imageStore(out_image, g_pixel, vec4(original.rgb, Y_gamma));
+        imageStore(out_image, g_pixel, vec4(original.rgb, Y_gamma * 0.5));
         return;
     }
 
@@ -133,7 +168,7 @@ void hook() {
                      * (1.0 - smoothstep(GRAIN_RANGE_MAX, GRAIN_RANGE_MAX + 0.05, Y_gamma));
 
     if (range_mask < 0.01) {
-        imageStore(out_image, g_pixel, vec4(original.rgb, Y_gamma));
+        imageStore(out_image, g_pixel, vec4(original.rgb, Y_gamma * 0.5));
         return;
     }
 
@@ -262,7 +297,10 @@ void hook() {
     float stab = (1.0 - edge_mask) * range_mask * STABILIZE_OPACITY;
     float Y_decision = Y_gamma + (blurred - Y_gamma) * stab;
 
-    imageStore(out_image, g_pixel, vec4(original.rgb, Y_decision));
+    // Alpha = Y * 0.5 encode (see header) — keeps stabilized values in
+    // (0.99, 1.0+] representable for PASS 6 instead of colliding with the
+    // old "unstabilized" sentinel.
+    imageStore(out_image, g_pixel, vec4(original.rgb, Y_decision * 0.5));
 }
 
 // =============================================================================
@@ -417,7 +455,12 @@ vec4 hook() {
 //!COMPUTE 16 9
 //!DESC CelFlare: Frame Stats
 
-#define KNEE            0.40
+// Scene-brightness classifier threshold for bright_frac. Deliberately ABOVE
+// PASS 6's expansion KNEE (0.30): v4.5 retuned the expansion onset down but
+// kept the stats classifier (and everything tuned against bright_frac —
+// PEAK_ATTEN, BRIGHT_FRAC_REF, growth frac_floor) calibrated at 0.40.
+// Renamed from KNEE so a future retune of one can't silently miss the other.
+#define BRIGHT_STAT_THRESH  0.40
 
 // Specular detection (source brightness tiers, no illum field)
 #define HIGHLIGHT_THRESH    0.75    // Source highlight tier
@@ -523,7 +566,7 @@ void hook() {
     s_illum[lid]    = Y_ill;
     s_log_luma[lid] = valid ? log(max(Y_src, 1e-6)) : 0.0;
     s_valid[lid]    = valid ? 1u : 0u;
-    s_bright[lid]   = (Y_ill > KNEE)                 ? 1u : 0u;
+    s_bright[lid]   = (Y_ill > BRIGHT_STAT_THRESH)   ? 1u : 0u;
     s_spec[lid]        = (intensity_src > SPECULAR_THRESH) ? 1u : 0u;
     s_high[lid]        = (intensity_src > HIGHLIGHT_THRESH) ? 1u : 0u;
     s_bright_spec[lid] = (intensity_src > BRIGHT_SPEC_THRESH) ? 1u : 0u;
@@ -640,16 +683,32 @@ void hook() {
         // lag is itself a velocity proxy). Used twice: (a) magnitude drives
         // an adaptive base alpha (slow on still scenes, mid on quick changes),
         // (b) signed components feed the growth-mode discriminator.
+        // spec_vel measures against smoothed_spec_natural (the un-lifted EMA),
+        // NOT smoothed_spec_signal: the latter is updated with the growth-
+        // LIFTED spec_raw, so using it as the baseline inflated it during
+        // growth events, drove spec_vel artificially negative, and quenched
+        // (or pumped) growth-mode before long events finished.
         float bright_vel   = bright_frac - smoothed_bright_frac;
-        float spec_vel     = spec_raw_natural - smoothed_spec_signal;
+        float spec_vel     = spec_raw_natural - smoothed_spec_natural;
         float contrast_vel = contrast - smoothed_contrast;
         float log_avg_vel  = log_avg - smoothed_log_avg;
 
         float vel_mag    = max(abs(bright_vel), abs(log_avg_vel));
         float base_alpha = mix(TEMPORAL_ALPHA_SLOW, TEMPORAL_ALPHA_MID,
                                smoothstep(ADAPT_DELTA_LOW, ADAPT_DELTA_HIGH, vel_mag));
-        float alpha      = (scene_cut || scene_cut_lockout > 0.0)
-                           ? TEMPORAL_ALPHA_FAST : base_alpha;
+        // Post-cut alpha decays FAST -> MID across the lockout window. Lock-on
+        // converges in 1-2 frames at 0.9; holding 0.9 for all 6 frames let a
+        // single-frame event inside the window (muzzle flash, strobe, white
+        // impact frame) couple ~1:1 into every EMA as a visible pulse.
+        float alpha;
+        if (scene_cut) {
+            alpha = TEMPORAL_ALPHA_FAST;
+        } else if (scene_cut_lockout > 0.0) {
+            alpha = mix(TEMPORAL_ALPHA_MID, TEMPORAL_ALPHA_FAST,
+                        scene_cut_lockout / LOCKOUT_FRAMES);
+        } else {
+            alpha = base_alpha;
+        }
 
         // Growth-mode discriminator. Fires when:
         //   - spec_vel rises faster than bright_vel (hot core saturates first
@@ -688,16 +747,18 @@ void hook() {
         spec_raw = mix(spec_raw, max(spec_raw, bs_raw), bright_scene);
 
         if (frame == 0) {
-            smoothed_bright_frac = 0.0;
-            smoothed_spec_signal = 0.0;
-            smoothed_contrast    = contrast;
-            smoothed_log_avg     = log_avg;
-            scene_cut_lockout    = 0.0;
+            smoothed_bright_frac  = 0.0;
+            smoothed_spec_signal  = 0.0;
+            smoothed_spec_natural = 0.0;
+            smoothed_contrast     = contrast;
+            smoothed_log_avg      = log_avg;
+            scene_cut_lockout     = 0.0;
         } else {
-            smoothed_bright_frac = mix(smoothed_bright_frac, bright_frac, alpha);
-            smoothed_spec_signal = mix(smoothed_spec_signal, spec_raw, alpha);
-            smoothed_contrast    = mix(smoothed_contrast, contrast, alpha);
-            smoothed_log_avg     = mix(smoothed_log_avg, log_avg, alpha);
+            smoothed_bright_frac  = mix(smoothed_bright_frac, bright_frac, alpha);
+            smoothed_spec_signal  = mix(smoothed_spec_signal, spec_raw, alpha);
+            smoothed_spec_natural = mix(smoothed_spec_natural, spec_raw_natural, alpha);
+            smoothed_contrast     = mix(smoothed_contrast, contrast, alpha);
+            smoothed_log_avg      = mix(smoothed_log_avg, log_avg, alpha);
         }
 
         // Dummy write satisfies the 1×1 SAVE target; SSBO above is the
@@ -715,8 +776,13 @@ void hook() {
 // All pixels in a bright region get the bright region's expansion — local
 // contrast preserved by construction through multiplicative application.
 //
-// Scene adaptation via bright_frac (fraction of illumination above knee)
+// Scene adaptation via bright_frac (fraction of illumination above PASS 5's
+// BRIGHT_STAT_THRESH 0.40 — deliberately above the expansion KNEE 0.30)
 // replaces the 7-type scene classifier. Continuous, no arbitrary boundaries.
+//
+// CELFLARE_STATS is bound only as the explicit data dependency on PASS 5 —
+// the stats themselves arrive through the SCENE_STATE SSBO. Do not remove
+// the bind without verifying pass ordering/visibility on every backend.
 
 //!HOOK MAIN
 //!BIND HOOKED
@@ -818,6 +884,18 @@ void hook() {
 // (caused edge halos where bright met dark instead of bloom-like
 // center-out falloff). Bypasses APL/dynamic intensity dampening.
 #define ENABLE_SPECULAR_BONUS 1
+// Saturated-channel spec drive — mirrors PASS 5's tier counting on
+// V = max(R,G,B), so saturated primaries (red LED Y=0.21, V=1.0) qualify
+// for the ramp and escape the Y-based early exit.
+// NOTE: each HOOK block (pass) is a SEPARATE compilation unit — this define
+// must exist HERE. The PASS 5 copy is not visible to this pass, and an
+// undefined identifier inside #if silently evaluates to 0: that is exactly
+// how this path was compiled out of the expansion pass from v4.7 through
+// v5.0 while the detection half (PASS 5) kept running. If you add an
+// #if-gated feature spanning passes, duplicate the define in every pass that
+// tests it. (Do not write the literal directive prefix in prose anywhere in
+// this file — the libplacebo parser splits sections on it even mid-comment.)
+#define ENABLE_SATURATED_SPEC 1
 #define SPEC_Y_LOW          0.88    // Ramp onset (dark/bright endpoint scenes)
 #define SPEC_Y_LOW_MID_BUMP 0.05    // Parabolic bump pushes onset to 0.93 at spec_apl=0.5,
                                     // which corresponds to smoothed_log_avg ≈ 0.16 —
@@ -875,6 +953,12 @@ void hook() {
 // desaturated highlights at the same luminance expansion (Helmholtz-Kohlrausch).
 // CHROMA_SCALE reduces this: 1.0 = full cbrt, 0.5 = half, 0.0 = chroma frozen.
 // Only affects already-saturated pixels — near-neutrals always get full cbrt.
+// DISABLED at current defaults: ENABLE_CHROMA_ATTEN 0 == the exact behavior
+// of CHROMA_SCALE 1.00 (chroma_factor degenerates to cbrt_exp for every
+// pixel — verified algebraically), which is the long-standing validated
+// look. The #if guard makes that explicit instead of leaving dead per-pixel
+// math whose elimination depended on the compiler folding mix(x, x, t).
+#define ENABLE_CHROMA_ATTEN 0
 #define CHROMA_SCALE        1.00
 
 // Near-neutral fast path. For desaturated pixels the Oklab roundtrip
@@ -885,9 +969,12 @@ void hook() {
 //   - pale skin gated by chroma > 0.015 (smoothstep onset)
 // Under those conditions, oklab_exp = oklab_orig × cbrt_exp uniformly, and
 // oklab_to_rgb returns rgb_linear × expansion exactly. Bypass cost is one
-// max-min subtract at pass entry. Worst-case warm pixel: sat_gamma=0.05 →
-// Oklab chroma ≈ 0.013 (below all gates). Threshold of 0.04 stays
-// comfortably below the 0.015 chroma boundary for any hue/luma combo.
+// max-min subtract at pass entry. Bound (brute-forced over hue/level for
+// pixels reachable past the early exit): max Oklab chroma at sat_gamma=0.04
+// is 0.0237 (darkish desaturated magenta) — that CAN clear the 0.015 WS/PS
+// gates, so the bypass is not exactly equivalent there. Worst-case seam:
+// warm-shift displacement <= chroma*theta = 0.0237*0.06 = 0.0014 in (a,b),
+// sub-JND and comparable to the fast_cbrt noise floor. Accepted.
 #define ENABLE_OKLAB_BYPASS 1
 #define SAT_BYPASS_THRESH   0.04
 
@@ -902,7 +989,7 @@ void hook() {
 #define WS_HUE_COS          0.3420  // cos(70°) — center of warm range in Oklab
 #define WS_HUE_SIN          0.9397  // sin(70°)
 #define WS_HUE_POWER        1.2     // Hue window width (lower = wider, ~50° each side)
-#define WS_STRENGTH          0.06   // Max rotation in radians (~7° at full drive)
+#define WS_STRENGTH          0.06   // Max rotation in radians (~3.4° at full drive)
 #define WS_ILLUM_LOW         0.35   // Y_illum below: no shift (dark region)
 #define WS_ILLUM_HIGH        0.80   // Y_illum above: full shift
 #define WS_CHROMA_FLOOR      0.015  // Skip near-neutrals (unstable hue)
@@ -926,7 +1013,12 @@ void hook() {
 #define PQ_FAST_APPROX  1
 #define EOTF_GAMMA      2.4
 #define ENABLE_GRAIN_STABLE 1
-#define EARLY_EXIT_GAMMA    0.25
+// Early-exit luma bound. == KNEE is exact for the base curve: PASS 1 writes
+// RAW luma (alpha encode) below its GRAIN_EARLY_EXIT (0.30), so for
+// Y_gamma < KNEE the decision luma equals Y_gamma, t = 0, and expansion is
+// exactly 1.0 through dynamic/APL (both scale expansion-1). Must stay
+// <= PASS 1's GRAIN_EARLY_EXIT or stabilized decisions could cross KNEE.
+#define EARLY_EXIT_GAMMA    KNEE
 
 // =============================================
 //  DEBUG
@@ -1000,12 +1092,30 @@ vec3 gamma709_to_pq2020(vec3 rgb_gamma) {
     return pq_oetf(bt2020 * (REFERENCE_WHITE / 10000.0));
 }
 
+// Fast-poly low-end repair. The polynomial's error explodes below ~30 nits:
+// +25..42 ten-bit LSB under 0.5 nits (an effective ~0.2-0.35 nit per-channel
+// black floor), ±5 LSB through 1-10 nits. The expansion-onset blend in the
+// hook body only covers expansion < 1.05 — dark CHANNELS of strongly-expanded
+// saturated pixels (e.g. the blue channel of a red emissive) went through the
+// raw polynomial. Blend small channels to the exact OETF; above PQ_EXACT_HIGH
+// the pure polynomial's |err| stays ≲ 1.8 LSB (its design accuracy). The
+// branch is coherent (dark channels cluster spatially) and the exact path
+// costs 2 pow per channel on that minority.
+#define PQ_EXACT_LOW    0.0015   // L normalized (≈15 nits): fully exact below
+#define PQ_EXACT_HIGH   0.0030   // L normalized (≈30 nits): fully fast above
+
 vec3 linear709_to_pq2020(vec3 rgb_linear) {
     vec3 bt2020 = max(bt709_to_bt2020(rgb_linear), 0.0);
+    vec3 L = bt2020 * (REFERENCE_WHITE / 10000.0);
     #if PQ_FAST_APPROX
-        return pq_oetf_fast(bt2020 * (REFERENCE_WHITE / 10000.0));
+        vec3 pq = pq_oetf_fast(L);
+        if (min(min(L.r, L.g), L.b) < PQ_EXACT_HIGH) {
+            vec3 w = smoothstep(PQ_EXACT_LOW, PQ_EXACT_HIGH, L);
+            pq = mix(pq_oetf(L), pq, w);
+        }
+        return pq;
     #else
-        return pq_oetf(bt2020 * (REFERENCE_WHITE / 10000.0));
+        return pq_oetf(L);
     #endif
 }
 
@@ -1150,27 +1260,39 @@ vec4 hook() {
     float sat_gamma = V_gamma - min_gamma;
 
     // -------------------------------------------------------------------------
-    // ILLUMINATION FIELD (before early exit — clip diffusion needs this)
+    // ILLUMINATION FIELD
     // -------------------------------------------------------------------------
+    // Fetched AFTER the early exit unless clip diffusion (or the illum debug
+    // view) needs it for every pixel — with both disabled, dark pixels skip
+    // the texture fetch entirely.
+    #if ENABLE_CLIP_DIFFUSION || DEBUG_SHOW_ILLUM
     vec3 illum_rgb = upsample_illum_rgb();
     float Y_illum = get_luma(illum_rgb);
 
     #if DEBUG_SHOW_ILLUM
         return vec4(gamma709_to_pq2020(illum_rgb), 1.0);
     #endif
+    #endif
 
-    // Early exit: no base expansion (Y < knee) AND no saturated-channel
-    // signal worth the spec ramp either.
+    // Early exit: no base expansion (Y < KNEE) AND no saturated-channel
+    // signal that could ever reach the spec ramp.
     #if ENABLE_SATURATED_SPEC
-    // Use the worst-case spec onset (SPEC_Y_LOW + SPEC_Y_LOW_MID_BUMP) so we
-    // never early-exit on a pixel that could legitimately trigger spec in some
-    // scene-APL. Pixels just under the bumped onset still skip the spec ramp,
-    // but at least they don't pay for it via the full PASS 6 path.
-    if (Y_gamma < EARLY_EXIT_GAMMA && V_gamma < SPEC_Y_LOW + SPEC_Y_LOW_MID_BUMP) {
-        return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    // SPEC_Y_LOW is the LOWEST possible spec onset across scene-APL (the
+    // mid-APL bump only raises it), so this guard never exits a pixel that
+    // could fire spec in any scene — conservative-exact, unlike the earlier
+    // V < onset+bump form, which sacrificed dim emissives with V in
+    // [SPEC_Y_LOW, SPEC_Y_LOW + bump) at endpoint APLs (the documented v5.0
+    // ~4% loss — that loss class no longer exists).
+    if (Y_gamma < EARLY_EXIT_GAMMA && V_gamma < SPEC_Y_LOW) {
+        return vec4(gamma709_to_pq2020(color.rgb), 1.0);
     }
     #else
-    if (Y_gamma < EARLY_EXIT_GAMMA) return vec4(gamma709_to_pq2020(color.rgb), color.a);
+    if (Y_gamma < EARLY_EXIT_GAMMA) return vec4(gamma709_to_pq2020(color.rgb), 1.0);
+    #endif
+
+    #if !(ENABLE_CLIP_DIFFUSION || DEBUG_SHOW_ILLUM)
+    vec3 illum_rgb = upsample_illum_rgb();
+    float Y_illum = get_luma(illum_rgb);
     #endif
 
     // -------------------------------------------------------------------------
@@ -1178,7 +1300,13 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     float Y_decision_gamma = Y_gamma;
     #if ENABLE_GRAIN_STABLE
-        Y_decision_gamma = (color.a > 0.99) ? Y_gamma : color.a;
+        // PASS 1 stores its decision luma (stabilized Y_decision, or raw
+        // Y_gamma on its exit paths) as alpha * 0.5 — decode with * 2.0.
+        // Replaces the old `a > 0.99 ? Y_gamma : a` sentinel, which collided
+        // with legitimate stabilized lumas in (0.99, 1.0] and silently fell
+        // back to raw Y there (frame-to-frame decision flicker exactly in
+        // the spec-ramp band).
+        Y_decision_gamma = color.a * 2.0;
     #endif
 
     // -------------------------------------------------------------------------
@@ -1289,14 +1417,18 @@ vec4 hook() {
         float spec_apl = smoothstep(SPEC_APL_LOW, SPEC_APL_HIGH, smoothed_log_avg);
         float spec_peak = mix(SPEC_PEAK_DARK, SPEC_PEAK_BRIGHT, spec_apl);
         float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, spec_apl);
-        // Drive signal: max(stabilized Y, peak channel). Neutrals use the
-        // grain-stabilized luma (no per-frame flicker). Saturated primaries
-        // at peak channel (V=1.0) qualify even when Y is low, so red LEDs
-        // and blue lasers get emissive pop. V is per-pixel — grain on
-        // saturated peaks is small in gamma space, temporal flicker is
-        // damped by smoothed_spec_signal at the scene level.
+        // Drive signal: stabilized Y, with a saturation-gated peak-channel
+        // escape. Saturated primaries at peak channel (V=1.0) qualify even
+        // when Y is low, so red LEDs and blue lasers get emissive pop; grain
+        // on saturated peaks is small in gamma space and scene-damped by
+        // smoothed_spec_signal. The v_drive gate keeps NEAR-NEUTRALS on the
+        // grain-stabilized luma exactly: a bare max(Y_dec, V) would let raw
+        // V rectify every positive grain excursion past the stabilizer
+        // (asymmetric sparkle + DC lift) on bright neutrals, where V ≈ raw Y.
         #if ENABLE_SATURATED_SPEC
-        float spec_driver = max(Y_decision_gamma, V_gamma);
+        float v_drive = smoothstep(0.10, 0.30, sat_gamma);
+        float spec_driver = mix(Y_decision_gamma,
+                                max(Y_decision_gamma, V_gamma), v_drive);
         #else
         float spec_driver = Y_decision_gamma;
         #endif
@@ -1306,13 +1438,13 @@ vec4 hook() {
         // spec_apl=0.5 with value SPEC_Y_LOW_MID_BUMP.
         float spec_y_low = SPEC_Y_LOW
                          + SPEC_Y_LOW_MID_BUMP * spec_apl * (1.0 - spec_apl) * 4.0;
-        float t = smoothstep(spec_y_low, 1.0, spec_driver);
+        float spec_t = smoothstep(spec_y_low, 1.0, spec_driver);
         // Super-white overshoot: upscaler can produce signal > 1.0. Treat
         // it as evidence that the source was SDR-clipped — add linear bonus
         // on top of the saturated ramp, scene-signal-gated as everything
         // else. Hard-capped so extreme overshoot can't blow the nit budget.
         float overshoot = max(spec_driver - 1.0, 0.0);
-        float spec_ramp = min(pow(t, spec_gamma) + overshoot * SPEC_OVERSHOOT_GAIN,
+        float spec_ramp = min(pow(spec_t, spec_gamma) + overshoot * SPEC_OVERSHOOT_GAIN,
                               SPEC_RAMP_CEIL);
         spec_strength = spec_peak * spec_ramp * smoothed_spec_signal;
 
@@ -1371,7 +1503,7 @@ vec4 hook() {
             float chw = smoothstep(0.015, 0.06, cr_dbg)
                       * (1.0 - smoothstep(0.04, PS_CHROMA_CEIL + 0.04, cr_dbg));
             #if ENABLE_GRAIN_STABLE
-            float Yd = (color.a > 0.99) ? get_luma(rl_dbg) : eotf_gamma(color.a);
+            float Yd = eotf_gamma(color.a * 2.0);
             #else
             float Yd = get_luma(rl_dbg);
             #endif
@@ -1392,7 +1524,7 @@ vec4 hook() {
     // expansion ≈ 1.001 will now pay the Oklab cost only to be clamped back
     // below threshold — accepted.
     if (expansion < 1.001) {
-        return vec4(gamma709_to_pq2020(color.rgb), color.a);
+        return vec4(gamma709_to_pq2020(color.rgb), 1.0);
     }
 
     #if DEBUG_SHOW_EXPANSION
@@ -1446,7 +1578,7 @@ vec4 hook() {
         // ---- PALE SKIN PROTECTION ----
         #if ENABLE_PALE_SKIN
             #if ENABLE_GRAIN_STABLE
-            float Y_decision = (color.a > 0.99) ? get_luma(rgb_linear) : eotf_gamma(color.a);
+            float Y_decision = eotf_gamma(color.a * 2.0);
             #else
             float Y_decision = get_luma(rgb_linear);
             #endif
@@ -1465,7 +1597,8 @@ vec4 hook() {
 
         // ---- APPLY WARM SHIFT ----
         // Small-angle rotation in Oklab (a,b) plane — clockwise toward red.
-        // cos(θ) ≈ 1, sin(θ) ≈ θ for θ < 0.12 rad. Chroma preserved to ~0.7%.
+        // cos(θ) ≈ 1, sin(θ) ≈ θ. At the current max θ = 0.06 rad, chroma
+        // grows by θ²/2 ≈ 0.2% (the small-angle matrix scales by √(1+θ²)).
         #if ENABLE_WARM_SHIFT
         if (ws_angle > 0.0) {
             float a_shifted = oklab_orig.y + oklab_orig.z * ws_angle;
@@ -1484,8 +1617,15 @@ vec4 hook() {
         vec3 oklab_exp = oklab_orig;
         float cbrt_exp = fast_cbrt(expansion);
         oklab_exp.x *= cbrt_exp;
+        #if ENABLE_CHROMA_ATTEN
         float sat_norm = smoothstep(0.10, 0.25, chroma_orig);
         float chroma_factor = mix(cbrt_exp, mix(1.0, cbrt_exp, CHROMA_SCALE), sat_norm);
+        #else
+        // H-K attenuation disabled (== CHROMA_SCALE 1.0 exactly): chroma
+        // scales by the same cbrt as L — uniform LMS' scale, i.e. plain
+        // rgb_linear * expansion for chroma-neutral manipulation paths.
+        float chroma_factor = cbrt_exp;
+        #endif
         oklab_exp.yz *= chroma_factor;
         #if ENABLE_PALE_SKIN
         oklab_exp.yz *= (1.0 + ps_sat);
@@ -1533,5 +1673,7 @@ vec4 hook() {
         rgb_pq += tri_noise * (1.0 / 1023.0);
     }
 
-    return vec4(rgb_pq, color.a);
+    // Alpha out is a clean 1.0 on every production path — color.a held
+    // PASS 1's encoded decision luma, which must not leak past this pass.
+    return vec4(rgb_pq, 1.0);
 }

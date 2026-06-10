@@ -501,6 +501,21 @@ vec4 hook() {
 // quick lighting changes get faster adaptation (MID), scene cuts get nearly
 // instant lock-on (FAST). vel_mag = max(|Δbright_frac|, |Δlog_avg|) drives
 // the SLOW→MID interpolation; cut detection overrides to FAST regardless.
+//
+// KNOWN LIMITATION (accepted 2026-06-10): all temporal constants are
+// per-RENDERED-VIDEO-FRAME and tuned for ~24p content. Display refresh is
+// irrelevant (mpv renders each video frame once regardless of vsync rate),
+// but 60fps CONTENT runs every EMA ~2.5x faster and shrinks per-frame
+// velocities ~2.5x (growth-mode under-fires). The failure direction is
+// conservative — snappier adaptation, less pop, never artifacts. No time
+// source exists in user shaders (probed: only `frame`/`random`; no PTS
+// uniform in current mpv/libplacebo), and in-shader fps estimation is
+// unsound for anime (held cels on twos/threes are pixel-identical to
+// transport duplicates). If mpv ever exposes a PTS uniform: store prev_pts
+// in the SSBO, dt = clamp(pts - prev_pts, 0.0, 0.5), alpha_eff =
+// 1 - pow(1 - alpha24, dt*24), lockout in seconds, velocity gates scaled
+// by 24*dt — thread-0-only, and EMAs become immune to redraw double-ticks,
+// pause, and seeks for free.
 #define TEMPORAL_ALPHA_SLOW 0.03    // Stable scenes (= prior TEMPORAL_ALPHA)
 #define TEMPORAL_ALPHA_MID  0.12    // Quick lighting / brightness shifts
 #define TEMPORAL_ALPHA_FAST 0.9     // Scene cut + lockout

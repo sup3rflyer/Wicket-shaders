@@ -1450,9 +1450,23 @@ vec4 hook() {
         // LED / laser case — or super-white) the correction is exactly 0
         // and V passes through raw, scene-damped by smoothed_spec_signal
         // as before.
+        // The escape is additionally FADED OUT by stabilized luma: it exists
+        // for DIM saturated emissives (red LED Y=0.21, blue laser Y=0.07,
+        // magenta neon Y=0.29) whose Y can never reach the ramp. A bright
+        // saturated FIELD (blue/cyan sky: Y ~0.70, V ~0.95) is per-pixel
+        // indistinguishable from an emissive, and its V carries Cb chroma
+        // noise that NO luma-derived stabilization can remove (PASS 1 has no
+        // chroma decision) — so above the fade band the driver returns to
+        // the grain-stabilized luma exactly, which zeroes the ramp there.
+        // High-Y saturated emissives (green laser 0.72, cyan 0.79) lose the
+        // escape, same as every version before v5.1 — accepted.
+        #define SPEC_V_ESCAPE_Y_LO 0.45
+        #define SPEC_V_ESCAPE_Y_HI 0.60
         #if ENABLE_SATURATED_SPEC
         float V_stable = V_gamma + (Y_decision_gamma - Y_gamma);
-        float v_drive = smoothstep(0.10, 0.30, sat_gamma);
+        float v_drive = smoothstep(0.10, 0.30, sat_gamma)
+                      * (1.0 - smoothstep(SPEC_V_ESCAPE_Y_LO,
+                                          SPEC_V_ESCAPE_Y_HI, Y_decision_gamma));
         float spec_driver = mix(Y_decision_gamma,
                                 max(Y_decision_gamma, V_stable), v_drive);
         #else

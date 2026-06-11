@@ -1434,16 +1434,27 @@ vec4 hook() {
         float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, spec_apl);
         // Drive signal: stabilized Y, with a saturation-gated peak-channel
         // escape. Saturated primaries at peak channel (V=1.0) qualify even
-        // when Y is low, so red LEDs and blue lasers get emissive pop; grain
-        // on saturated peaks is small in gamma space and scene-damped by
-        // smoothed_spec_signal. The v_drive gate keeps NEAR-NEUTRALS on the
-        // grain-stabilized luma exactly: a bare max(Y_dec, V) would let raw
-        // V rectify every positive grain excursion past the stabilizer
-        // (asymmetric sparkle + DC lift) on bright neutrals, where V ≈ raw Y.
+        // when Y is low, so red LEDs and blue lasers get emissive pop. The
+        // v_drive gate keeps NEAR-NEUTRALS on the grain-stabilized luma
+        // exactly: a bare max(Y_dec, V) would let raw V rectify every
+        // positive grain excursion past the stabilizer (asymmetric sparkle
+        // + DC lift) on bright neutrals, where V ≈ raw Y.
+        //
+        // V itself must ALSO be grain-stabilized: a bright saturated sky
+        // (sat ~0.4-0.7, V ~0.95) drives v_drive to 1.0, putting raw V on
+        // the steep part of the spec ramp — per-frame grain in the peak
+        // channel became per-pixel spec flicker (speckling sky). Grain is
+        // overwhelmingly achromatic, so the luma stabilizer's own measured
+        // correction (Y_decision - Y_raw) transplants onto V directly.
+        // Where PASS 1 didn't stabilize (Y < its 0.30 early exit — the red
+        // LED / laser case — or super-white) the correction is exactly 0
+        // and V passes through raw, scene-damped by smoothed_spec_signal
+        // as before.
         #if ENABLE_SATURATED_SPEC
+        float V_stable = V_gamma + (Y_decision_gamma - Y_gamma);
         float v_drive = smoothstep(0.10, 0.30, sat_gamma);
         float spec_driver = mix(Y_decision_gamma,
-                                max(Y_decision_gamma, V_gamma), v_drive);
+                                max(Y_decision_gamma, V_stable), v_drive);
         #else
         float spec_driver = Y_decision_gamma;
         #endif
@@ -1470,9 +1481,16 @@ vec4 hook() {
         // firing on the red car under the sun. Emissive carve-out preserves
         // light sources at V ≥ 0.92 (tungsten/fire/sodium) from being gated.
         // V_gamma + sat_gamma already computed at PASS 6 entry (shared with
-        // the Oklab fast-path bypass).
+        // the Oklab fast-path bypass). The carve uses the grain-stabilized
+        // V where available — its 0.92-0.99 band has a ~14x/unit slope, so
+        // raw-V grain made the sat gate itself flicker on saturated skies.
+        #if ENABLE_SATURATED_SPEC
+        float emissive_carve = smoothstep(SPEC_SAT_EMISSIVE_LOW,
+                                          SPEC_SAT_EMISSIVE_HIGH, V_stable);
+        #else
         float emissive_carve = smoothstep(SPEC_SAT_EMISSIVE_LOW,
                                           SPEC_SAT_EMISSIVE_HIGH, V_gamma);
+        #endif
         float sat_atten = mix(SPEC_SAT_ATTEN_DARK, SPEC_SAT_ATTEN_BRIGHT, spec_apl)
                         * (1.0 - emissive_carve);
         spec_strength *= 1.0 - smoothstep(SPEC_SAT_LOW, SPEC_SAT_HIGH, sat_gamma) * sat_atten;

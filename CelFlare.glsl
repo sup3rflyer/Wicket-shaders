@@ -490,6 +490,21 @@ vec4 hook() {
 // on anime even though the spatial curve alone was on target.
 #define BRIGHT_SPEC_FRAC_MAX  0.15  // Recovery starts fading at 15% of cells > 0.97
 #define BRIGHT_SPEC_FRAC_CEIL 0.40  // Recovery fully off at 40% of cells > 0.97
+// Recovery counts NEAR-WHITE cells only. Every case in the recovery's spec
+// (chrome, sun glints, headlights) is near-neutral by nature. With
+// ENABLE_SATURATED_SPEC the counters run on V = max(R,G,B), so without a
+// saturation fence a large bright SATURATED surface (pink carpet, a 1080p
+// WEB test scene) supplies V>0.97 cells and impersonates "sparse chrome at noon"
+// — keeping smoothed_spec_signal ~1 on a scene the NORMAL path correctly
+// shut off (spec_frac > SPEC_FRAC_CEIL), which re-arms the per-pixel
+// saturated-spec ramp on the very field that tripped the shutoff: 8-bit
+// 4:2:0 Cr noise in V (unstabilizable by the luma-transplant V_stable)
+// then flickers on the ramp = speckle. Saturated EMISSIVE scenes
+// (LEDs/lasers/fire in the dark) are unaffected: they fire via the normal
+// path's sparse_bonus/tier_gate, not the bright-scene recovery. A genuinely
+// near-white V>0.97 cell always passes (sat 0.30 is far above specular
+// whites; the carpet's qualifying cells measured sat 0.40–0.88).
+#define BRIGHT_SPEC_SAT_MAX   0.30  // s_bright_spec counts only cells with sat below this
 
 // Saturated-channel spec detection. Count pixels using V = max(R,G,B) rather
 // than Y so pure saturated primaries (red LED Y=0.21 but V=1.0) qualify as
@@ -578,13 +593,22 @@ void hook() {
     #endif
 
     bool valid = Y_src > 0.001;
+    // Near-white fence for the bright-scene recovery counter (see
+    // BRIGHT_SPEC_SAT_MAX). Saturation is computed from V/min of rgb_src
+    // regardless of ENABLE_SATURATED_SPEC (under !SAT_SPEC the gate is a
+    // structural no-op anyway: Y_src > 0.97 forces near-neutral RGB).
+    float v_src   = max(max(rgb_src.r, rgb_src.g), rgb_src.b);
+    float sat_src = (v_src > 1e-6)
+        ? (v_src - min(min(rgb_src.r, rgb_src.g), rgb_src.b)) / v_src
+        : 0.0;
     s_illum[lid]    = Y_ill;
     s_log_luma[lid] = valid ? log(max(Y_src, 1e-6)) : 0.0;
     s_valid[lid]    = valid ? 1u : 0u;
     s_bright[lid]   = (Y_ill > BRIGHT_STAT_THRESH)   ? 1u : 0u;
     s_spec[lid]        = (intensity_src > SPECULAR_THRESH) ? 1u : 0u;
     s_high[lid]        = (intensity_src > HIGHLIGHT_THRESH) ? 1u : 0u;
-    s_bright_spec[lid] = (intensity_src > BRIGHT_SPEC_THRESH) ? 1u : 0u;
+    s_bright_spec[lid] = (intensity_src > BRIGHT_SPEC_THRESH &&
+                          sat_src < BRIGHT_SPEC_SAT_MAX) ? 1u : 0u;
 
     // Scene-cut delta. Each lane reads + writes its own prev_illum slot —
     // no cross-lane SSBO traffic, so race-free even though the buffer is
@@ -910,7 +934,7 @@ void hook() {
 // #if-gated feature spanning passes, duplicate the define in every pass that
 // tests it. (Do not write the literal directive prefix in prose anywhere in
 // this file — the libplacebo parser splits sections on it even mid-comment.)
-#define ENABLE_SATURATED_SPEC 1
+#define ENABLE_SATURATED_SPEC 0
 #define SPEC_Y_LOW          0.88    // Ramp onset (dark/bright endpoint scenes)
 #define SPEC_Y_LOW_MID_BUMP 0.05    // Parabolic bump pushes onset to 0.93 at spec_apl=0.5,
                                     // which corresponds to smoothed_log_avg ≈ 0.16 —

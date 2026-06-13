@@ -31,8 +31,7 @@ const float DETAIL_HIGH = 0.013;
 // Cinematic boost parameters
 // Max multiplier applied to sharpen_amount in lowest-variance areas.
 const float LOWDETAIL_MAX_BOOST = 1.5;  // final cap (1.0 = no boost, 1.5 = +50%)
-// Power exponent for "cinematic" curve.
-const float LOWDETAIL_EXP = 0.5;
+// Curve shape is a fixed sqrt() (was pow(.., 0.5)); see the boost block below.
 
 float get_grid(int x, int y, float grid[25]) {
     return grid[(y + 2) * 5 + (x + 2)];
@@ -106,6 +105,8 @@ vec4 hook() {
     float avg_grain = sum_grain / 9.0;
     float avg_texture = sum_texture / 9.0;
     float window_mean = window_sum / 9.0;
+    // E[x^2] - E[x]^2 form (numerically loose, but fine for luma in [0,1]); the tiny
+    // negative FP results it can produce are absorbed by the smoothstep/max() below.
     float window_variance = window_sum_sq / 9.0 - window_mean * window_mean;
 
     // Local texture blending
@@ -121,11 +122,17 @@ vec4 hook() {
     float scale_diff = max_dev_center - max_dev_large;
     final_grain *= (1.0 - smoothstep(0.0, 0.05, scale_diff));
 
-    // Unsharp mask
-    float blurred = (p.x + get_grid(1,0,grid) + get_grid(0,1,grid) +
-                     get_grid(-1,0,grid) + get_grid(0,-1,grid)) * 0.2;
+    // Unsharp mask — isotropic 3x3 binomial high-pass (center 4, edges 2, corners 1; / 16).
+    // Replaces the old 5-tap axis cross, which had no diagonal taps and therefore
+    // under-sharpened diagonal texture/edges (mild axis-aligned anisotropy). All taps
+    // already live in grid[] — this costs zero extra texture fetches.
+    float blurred = (4.0 * p.x
+                     + 2.0 * (get_grid(1,0,grid) + get_grid(-1,0,grid) +
+                              get_grid(0,1,grid) + get_grid(0,-1,grid))
+                     + (get_grid(1,1,grid)  + get_grid(-1,1,grid) +
+                        get_grid(1,-1,grid) + get_grid(-1,-1,grid))) * (1.0 / 16.0);
     float t = p.x - blurred;
-    float t_sharp = sign(t) * max(abs(t) - THRESHOLD, 0.0);
+    float t_sharp = t - clamp(t, -THRESHOLD, THRESHOLD);
 
     // Sobel edge detection
     float sobel_h = (grid[8] - grid[6]) + 2.0 * (grid[13] - grid[11]) + (grid[18] - grid[16]);
@@ -141,14 +148,18 @@ vec4 hook() {
     float sharpen_amount = t_sharp * PARAM * combined;
 
     // -----------------------
-    // Cinematic low-detail boost (applied BEFORE black/white mask)
+    // Mild-detail boost (applied BEFORE black/white mask)
     // -----------------------
-    // We want a curve that strongly favors the very-low variance areas while
-    // leaving mid/high detail alone. Use an exponent (power curve) for a
-    // cinematic "lift" feel and cap the multiplier at LOWDETAIL_MAX_BOOST.
+    // Goal: lift the sharpening a little more in MILD / low-amplitude texture, while
+    // leaving already-sharp (high-variance) detail untouched. The boost rides on top of
+    // sharpen_amount, which the texture/detail gates have already zeroed in flat areas,
+    // so this only acts where there is some texture to begin with.
+    // NOTE: keyed on window_variance alone, so it cannot distinguish mild distributed
+    // texture from sparse isolated detail at the same low variance — see audit notes.
     float lowdetail_gain = 1.0 - smoothstep(0.0, DETAIL_LOW, window_variance);
-    // Now bias with a power curve (exponent < 1 emphasizes lowest values)
-    lowdetail_gain = pow(max(lowdetail_gain, 0.0), LOWDETAIL_EXP);
+    // Concave (square-root) curve emphasizes the milder end of the range.
+    // sqrt(x) == pow(x, 0.5); the guard keeps the input non-negative.
+    lowdetail_gain = sqrt(max(lowdetail_gain, 0.0));
     // Map to a multiplier between 1.0 and LOWDETAIL_MAX_BOOST
     float lowdetail_boost = mix(1.0, LOWDETAIL_MAX_BOOST, lowdetail_gain);
 

@@ -883,7 +883,7 @@ void hook() {
 // Consequence: dim saturated emissives (red LED Y~0.21) get no BASE credit;
 // that regime belongs to the spec escape, which already covers V >= 0.88.
 #define ENABLE_BASE_V_CREDIT 1
-#define BASE_V_CREDIT        0.50   // fraction of the Y->V gap credited at full gate
+#define BASE_V_CREDIT        0.75   // fraction of the Y->V gap credited at full gate
 #define BASE_V_SAT_LO        0.10   // sat_gamma gate (same band as the spec v_drive)
 #define BASE_V_SAT_HI        0.30
 #define BASE_V_Y_LO          0.32   // luma floor fade-in: 0 at/below the early exit (KNEE)

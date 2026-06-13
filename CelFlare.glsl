@@ -859,6 +859,35 @@ void hook() {
 #define PEAK_DARK       2.7     // Expansion peak for dark regions (~313 nits pre-APL)
 #define GAMMA_BRIGHT    2.1     // Gentler ramp through 0.85–0.95 — peak preserved at Y=1.0
 #define GAMMA_DARK      2.3     // Matching gradualness in dark scenes
+
+// Saturated-brightness credit on the base ramp. BT.709 luma under-credits
+// the brightness of saturated R/B-dominant colors (G carries 0.7152 of the
+// weight), so a bright saturated accent inside a bright field gets left
+// behind by the convex ramp and reads as a dark stain after expansion.
+// Measured (cheek blush on bright skin, 1080p WEB scene): blush V=0.952 vs
+// skin V=0.994 — nearly equal peak channel — but Y 0.735 vs 0.942 put them
+// at x1.23 vs x1.84 expansion, amplifying the artist's 1.67x local contrast
+// to 2.51x on glass: pink darkened relative to its surround = purple bruise.
+// Perception agrees with V, not Y (Helmholtz–Kohlrausch: saturated colors
+// look brighter than their luminance), and the artist placed the accent at
+// the top of its channel range — so saturated pixels get a BOUNDED credit
+// from stabilized Y toward stabilized V on the ramp input. This is the base-
+// curve sibling of the spec path's v_drive escape, at a fraction of the
+// noise exposure: the base ramp's slope is ~10x gentler than the spec ramp
+// and the credit halves the coupling, so WEB-grade 4:2:0 chroma noise in V
+// works out to ~1-2 nits of wobble (vs the full-ramp speckle that killed
+// raw-V spec drivers). Near-neutrals are bit-identical (sat gate = 0).
+// The Y floor fade keeps the EARLY_EXIT_GAMMA boundary conservative-EXACT:
+// at/below BASE_V_Y_LO the credit is 0, so any pixel the early exit skips
+// would have computed expansion = 1.0 anyway — no contour at the boundary.
+// Consequence: dim saturated emissives (red LED Y~0.21) get no BASE credit;
+// that regime belongs to the spec escape, which already covers V >= 0.88.
+#define ENABLE_BASE_V_CREDIT 1
+#define BASE_V_CREDIT        0.50   // fraction of the Y->V gap credited at full gate
+#define BASE_V_SAT_LO        0.10   // sat_gamma gate (same band as the spec v_drive)
+#define BASE_V_SAT_HI        0.30
+#define BASE_V_Y_LO          0.32   // luma floor fade-in: 0 at/below the early exit (KNEE)
+#define BASE_V_Y_HI          0.48
 #define PEAK_ATTEN      0.12    // Gentle bright_frac dampening (spatial curve adapts)
 #define BRIGHT_FRAC_REF 0.40    // Bright fraction where scene adaptation plateaus
 
@@ -1360,6 +1389,16 @@ vec4 hook() {
     }
     #endif
 
+    // Grain-stabilized peak channel: the luma stabilizer's own measured
+    // correction transplanted onto V (cancels achromatic grain exactly;
+    // residual chroma noise is unfixable here — PASS 1 has no chroma
+    // decision). Computed once for both consumers: the base-ramp V credit
+    // below and the saturated-spec driver/emissive carve in the spec block.
+    // Placed AFTER clip diffusion so it matches the spec block's previous
+    // local computation bit-exactly in every config (diffusion rewrites
+    // Y_gamma; V_gamma stays pre-diffusion).
+    float V_stable = V_gamma + (Y_decision_gamma - Y_gamma);
+
     // -------------------------------------------------------------------------
     // SPATIALLY-MODULATED PER-PIXEL EXPANSION
     // -------------------------------------------------------------------------
@@ -1389,8 +1428,21 @@ vec4 hook() {
     local_peak *= (1.0 - peak_atten_eff * bf);  // scene-level dampening on top
     float local_gamma = mix(GAMMA_DARK, GAMMA_BRIGHT, spatial_t);
 
-    // Per-pixel expansion curve: linear ramp from KNEE, shaped by pow(gamma)
-    float t = max(Y_decision_gamma - KNEE, 0.0) / (1.0 - KNEE);
+    // Per-pixel expansion curve: linear ramp from KNEE, shaped by pow(gamma).
+    // Ramp input = stabilized luma, plus the bounded saturated-brightness
+    // credit toward stabilized V (see BASE_V_CREDIT block). max() makes the
+    // credit strictly lift-only; all three gate terms are smoothsteps of
+    // continuous per-pixel quantities, so the drive stays contour-free.
+    #if ENABLE_BASE_V_CREDIT
+    float vcredit_w = BASE_V_CREDIT
+                    * smoothstep(BASE_V_SAT_LO, BASE_V_SAT_HI, sat_gamma)
+                    * smoothstep(BASE_V_Y_LO, BASE_V_Y_HI, Y_decision_gamma);
+    float base_drive = mix(Y_decision_gamma,
+                           max(Y_decision_gamma, V_stable), vcredit_w);
+    #else
+    float base_drive = Y_decision_gamma;
+    #endif
+    float t = max(base_drive - KNEE, 0.0) / (1.0 - KNEE);
     t = pow(min(t, 1.0), local_gamma);  // clamp for upscaler super-whites
     float expansion = 1.0 + (local_peak - 1.0) * t * INTENSITY;
 
@@ -1487,7 +1539,8 @@ vec4 hook() {
         #define SPEC_V_ESCAPE_Y_LO 0.45
         #define SPEC_V_ESCAPE_Y_HI 0.60
         #if ENABLE_SATURATED_SPEC
-        float V_stable = V_gamma + (Y_decision_gamma - Y_gamma);
+        // V_stable hoisted to the base-curve entry (shared with the
+        // BASE_V_CREDIT ramp input) — same value, computed once.
         float v_drive = smoothstep(0.10, 0.30, sat_gamma)
                       * (1.0 - smoothstep(SPEC_V_ESCAPE_Y_LO,
                                           SPEC_V_ESCAPE_Y_HI, Y_decision_gamma));

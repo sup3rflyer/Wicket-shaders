@@ -23,7 +23,18 @@
 //!VAR float smoothed_growth_mode
 //!VAR float scene_cut_lockout
 //!VAR float smoothed_spec_natural
+//!VAR float pump_fast
+//!VAR float pump_slow
+//!VAR float pump_env
 //!VAR float prev_illum[144]
+//!VAR float pump_fast_cell[144]
+//!VAR float pump_slow_cell[144]
+//!VAR float pump_env_cell[144]
+//!VAR float pump_cell_peak
+//!VAR float pump_pan_score
+//!VAR float pump_cover_gate
+//!VAR float pump_conf_env
+//!VAR float pump_pan_env
 //!STORAGE
 
 //!HOOK MAIN
@@ -426,6 +437,80 @@ vec4 hook() {
 }
 
 // =============================================================================
+// PASS 4b/4c: MID-SIGMA BLUR (1/4 resolution) — spatial-pump cell driver
+// =============================================================================
+// A SEPARATE, sharper blur than the σ80 illumination field: sigma=5 at 1/4 res
+// = ~20px full-res (FWHM ~47px full). Feeds ONLY the spatial pump's per-cell
+// driver (PASS 5), which box-means it over each 120px cell. Rationale (ship-on
+// blocker A / A2): CELFLARE_DS is a ~2px-box ALIASED downsample — box-meaning it
+// on a 30px-spaced tap grid lets sub-cell events fall between taps and flicker
+// into the temporal band-pass, and passes grain/sparkle straight through. A
+// band-limited ~20px field makes the tap grid gap-free (FWHM 11.8 DS-texels >
+// 7.5 tap spacing), destroys grain before the band-pass, and sits between DS and
+// the σ80 scalar field so the two pump layers share scale. NOT used by the
+// expansion/illumination path — that stays on σ80 CELFLARE_ILLUM.
+
+//!HOOK MAIN
+//!BIND CELFLARE_DS
+//!SAVE CELFLARE_MID_H
+//!WIDTH CELFLARE_DS.w
+//!HEIGHT CELFLARE_DS.h
+//!DESC CelFlare: Mid Blur H (pump cell driver)
+
+// sigma=5 (1/4 res), radius=16, 8 bilinear-merged pairs
+vec4 hook() {
+    const float go[8] = {
+        1.4850044984, 3.4650570548, 5.4452207649, 7.4255574832,
+        9.4061268971, 11.3869858239, 13.3681875823, 15.3497814514
+    };
+    const float gw[8] = {
+        1.9033150197, 1.5614192485, 1.0932829157, 0.6533483993,
+        0.3332339823, 0.1450563803, 0.0538885495, 0.0170850194
+    };
+    // Precomputed: 1.0 + 2.0 * sum(gw[]) = 12.52125903
+    #define MID_INV_WSUM 0.0798641732
+
+    vec2 pt  = CELFLARE_DS_pt;
+    vec2 pos = CELFLARE_DS_pos;
+    vec3 sum = CELFLARE_DS_tex(pos).rgb;
+    for (int i = 0; i < 8; i++) {
+        vec3 sp = CELFLARE_DS_tex(pos + vec2(go[i] * pt.x, 0.0)).rgb;
+        vec3 sn = CELFLARE_DS_tex(pos - vec2(go[i] * pt.x, 0.0)).rgb;
+        sum += (sp + sn) * gw[i];
+    }
+    return vec4(sum * MID_INV_WSUM, 1.0);
+}
+
+//!HOOK MAIN
+//!BIND CELFLARE_MID_H
+//!SAVE CELFLARE_MID
+//!WIDTH CELFLARE_MID_H.w
+//!HEIGHT CELFLARE_MID_H.h
+//!DESC CelFlare: Mid Blur V (pump cell driver)
+
+vec4 hook() {
+    const float go[8] = {
+        1.4850044984, 3.4650570548, 5.4452207649, 7.4255574832,
+        9.4061268971, 11.3869858239, 13.3681875823, 15.3497814514
+    };
+    const float gw[8] = {
+        1.9033150197, 1.5614192485, 1.0932829157, 0.6533483993,
+        0.3332339823, 0.1450563803, 0.0538885495, 0.0170850194
+    };
+    #define MID_INV_WSUM 0.0798641732
+
+    vec2 pt  = CELFLARE_MID_H_pt;
+    vec2 pos = CELFLARE_MID_H_pos;
+    vec3 sum = CELFLARE_MID_H_tex(pos).rgb;
+    for (int i = 0; i < 8; i++) {
+        vec3 sp = CELFLARE_MID_H_tex(pos + vec2(0.0, go[i] * pt.y)).rgb;
+        vec3 sn = CELFLARE_MID_H_tex(pos - vec2(0.0, go[i] * pt.y)).rgb;
+        sum += (sp + sn) * gw[i];
+    }
+    return vec4(sum * MID_INV_WSUM, 1.0);
+}
+
+// =============================================================================
 // PASS 5: FRAME STATS (compute, 144-thread parallel reduction)
 // =============================================================================
 // Samples illumination field on a 16×9 grid. Computes frame-level metrics that
@@ -449,6 +534,7 @@ vec4 hook() {
 //!BIND HOOKED
 //!BIND SCENE_STATE
 //!BIND CELFLARE_ILLUM
+//!BIND CELFLARE_MID
 //!SAVE CELFLARE_STATS
 //!WIDTH 1
 //!HEIGHT 1
@@ -555,6 +641,76 @@ vec4 hook() {
 #define GROWTH_FRAC_FLOOR_HIGH 0.10
 #define GROWTH_SHUTOFF_LIFT    0.6    // 0 = no spec_shutoff bypass during growth, 1 = full lift
 
+// Light-pump detector — augments sudden SUSTAINED brightening (explosion
+// bloom, train exiting a tunnel, spell charge-up). Temporal band-pass on
+// avg_illum: a moderate-alpha fast lane minus a slow baseline lane. The
+// difference is positive only during a multi-frame RISE (so the pump tracks
+// and augments the source's own attack), ≈0 at steady state, and self-
+// releases once brightness plateaus (fast lane catches the slow one). The
+// moderate fast alpha is what rejects 2-3 frame flashes (lightning, muzzle):
+// they reverse before the fast lane builds, so drive stays under the onset.
+// PUMP_ALPHA_FAST is the primary flash-vs-sustained dial: LOWER = more flash
+// rejection but slower response to genuine attacks.
+#define PUMP_ALPHA_FAST     0.12   // fast lane (~8 frame time constant). Sets ATTACK speed — lower = gentler ramp
+#define PUMP_ALPHA_SLOW     0.04   // slow baseline lane (~25 frame time constant)
+#define PUMP_DRIVE_LOW      0.03   // band-pass onset — below this, no pump
+#define PUMP_DRIVE_HIGH     0.20   // band-pass saturation — full pump needs a steep rise (reserves full for violent events)
+// Spatial pump: also run the band-pass PER CELL (16×9) to localize the pump to
+// the actually-brightening region instead of lifting the whole frame. Reuses the
+// ALPHA/ADAPT constants; only its reset flag comes from the reducer. 0 =
+// scene-global scalar only. MUST match PASS 6 copy.
+#define ENABLE_SPATIAL_PUMP 1
+#define PUMP_CELL_DEADZONE  0.01   // per-cell drive dead-zone: idle-wobble cells read true zero (anti competing-highlight leak)
+// The per-cell path has its OWN drive thresholds, independent of the scalar's
+// PUMP_DRIVE_LOW/HIGH — the cell driver is a MID box-mean per cell vs the scalar's
+// σ80 frame-mean, so their signal scales differ. But the key fact (from band-pass
+// simulation): the ABSOLUTE per-cell drive is SMALL — a fast/slow EMA over an
+// ~8-frame rise captures only ~40% of the step, so a 40px spell peaks ~0.02-0.04,
+// an 80px bloom ~0.08, and only 200px+ explosions reach ~0.20+. So HIGH must sit
+// LOW to let the small LOCALIZED events (the whole reason the spatial layer
+// exists) fire, while big blooms still saturate. A/B 0.16-0.18. Tune these (not
+// the scalar's) for spatial firing.
+#define PUMP_CELL_DRIVE_LOW  0.02   // per-cell band-pass onset
+#define PUMP_CELL_DRIVE_HIGH 0.18   // per-cell saturation (small events peak ~0.02-0.08; big blooms 0.20+)
+// Spatial-pump gate thresholds (canonical home — PASS 6 consumes the enveloped
+// results pump_conf_env / pump_pan_env, so tune these HERE):
+//   GATE_LO/HI — localized event gate on the PEAK cell (pump_cell_peak). Keyed
+//     off the peak, NOT the frame mean, so a small localized event fires.
+//   PAN_LO/HI  — across-pan reject on pump_pan_score = fall/(rise+fall) drive. A
+//     translation rises on the lead edge WHILE falling on the trail (→~0.5); an
+//     in-place event rises only (→0). Into-pans (net reveal) still pass (v2).
+#define PUMP_GATE_LO         0.10   // peak below → suppressed (no real local event)
+#define PUMP_GATE_HI         0.35   // peak above → full confidence
+#define PUMP_PAN_LO          0.25   // pan_score below → no rejection (in-place event)
+#define PUMP_PAN_HI          0.45   // pan_score above → fully rejected (translation)
+// Gate envelope (asymmetric): the reducer slews the localized + pan_reject scene
+// scalars into pump_conf_env / pump_pan_env so a gate CLOSE eases out instead of
+// snapping. Attack fast (onset already ramped by the mask EMA), release slow.
+#define PUMP_GATE_ATTACK     0.60   // FAST rate (≈2-frame ease): conf-open / pan-engage-rejection
+#define PUMP_GATE_RELEASE    0.08   // SLOW rate (~0.7s @24p): conf-close / pan-release — controlled, no squash
+// Release is VELOCITY-MATCHED, not clock-based: the primary release is sourced
+// from the negative half of the band-pass (the source's own luminance fall —
+// see the reducer), so the pump eases out in lockstep with the source and a
+// HELD light does not release on a timer. This floor is the only clock left —
+// an imperceptibly slow geometric relaxation so an indefinitely-held light
+// settles like the eye adjusting, not like an animated dim. Keep it near 1.0.
+// half-life = ln(0.5)/ln(F):  0.999 ≈ 29s @24p   0.9995 ≈ 58s   1.0 = pure hold
+#define PUMP_ADAPT_FLOOR    0.999   // held-light relaxation; raise toward 1.0 = even slower/imperceptible
+// Fade guard via CONTRAST RETENTION (not coverage). A genuine event keeps a
+// hot core against dark surround/smoke → contrast stays high → pump allowed.
+// A fade-to-white (or fade-to-any-uniform-colour) collapses contrast as the
+// field goes uniform → pump muted. This distinguishes "explosion fills frame"
+// (keep) from "frame whites out" (mute) — which coverage alone cannot — and
+// because contrast collapses gradually during a fade, the mute eases in on its
+// own (controlled release, no slew machinery needed). contrast = log2 dynamic
+// range of the illumination field, in stops.
+#define PUMP_CONTRAST_LOW   1.0    // below this (≈uniform): pump fully muted
+#define PUMP_CONTRAST_HIGH  2.5    // above this (structured frame): full pump
+// Optional coverage backstop for the degenerate uniform-but-high-contrast case
+// (rare). Kept for A/B; not wired by default — the contrast gate supersedes it.
+//#define PUMP_COVER_HIGH     0.62   // bright_frac above which the pump tapers
+//#define PUMP_COVER_FULL     0.85   // bright_frac at/above which the pump is fully muted
+
 float get_luma(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
@@ -570,6 +726,12 @@ shared uint  s_spec[144];
 shared uint  s_high[144];
 shared uint  s_change[144];
 shared uint  s_bright_spec[144];    // BRIGHT_SPEC_THRESH=0.97 count for bright-scene recovery
+shared float s_illum_v[144];        // max(R,G,B) of the illum field — V-aware pump driver/guard
+#if ENABLE_SPATIAL_PUMP
+shared uint  s_pump_reset;          // thread-0 publishes per-cell pump reset (cut/lockout/frame0)
+shared float s_cell_env[144];       // per-cell mask value → peak (localized) reduction
+shared float s_cell_drive[144];     // per-cell signed drive → pan (rise-vs-fall) score
+#endif
 
 void hook() {
     uint lid = gl_LocalInvocationIndex;    // 0..143
@@ -582,7 +744,9 @@ void hook() {
                      (float(iy) + 0.5) / 9.0);
 
     // -------- per-cell sampling (parallel) --------
-    float Y_ill   = get_luma(CELFLARE_ILLUM_tex(spos).rgb);
+    vec3  illum_rgb = CELFLARE_ILLUM_tex(spos).rgb;
+    float Y_ill   = get_luma(illum_rgb);
+    float V_ill   = max(max(illum_rgb.r, illum_rgb.g), illum_rgb.b);  // V-aware pump driver/guard
     vec3  rgb_src = HOOKED_tex(spos).rgb;
     float Y_src   = get_luma(rgb_src);
 
@@ -602,6 +766,7 @@ void hook() {
         ? (v_src - min(min(rgb_src.r, rgb_src.g), rgb_src.b)) / v_src
         : 0.0;
     s_illum[lid]    = Y_ill;
+    s_illum_v[lid]  = V_ill;
     s_log_luma[lid] = valid ? log(max(Y_src, 1e-6)) : 0.0;
     s_valid[lid]    = valid ? 1u : 0u;
     s_bright[lid]   = (Y_ill > BRIGHT_STAT_THRESH)   ? 1u : 0u;
@@ -636,12 +801,19 @@ void hook() {
         uint  bright_spec_count = 0u;
         float illum_min         = 1.0;
         float illum_max         = 0.0;
+        float illum_v_sum       = 0.0;
+        float illum_v_min       = 1.0;
+        float illum_v_max       = 0.0;
 
         for (uint i = 0u; i < 144u; i++) {
             float yi           = s_illum[i];
             illum_sum         += yi;
             illum_min          = min(illum_min, yi);
             illum_max          = max(illum_max, yi);
+            float vi           = s_illum_v[i];
+            illum_v_sum       += vi;
+            illum_v_min        = min(illum_v_min, vi);
+            illum_v_max        = max(illum_v_max, vi);
             log_luma_sum      += s_log_luma[i];
             valid_luma        += s_valid[i];
             bright_count      += s_bright[i];
@@ -658,6 +830,17 @@ void hook() {
         // Contrast: dynamic range from illumination field (stable, noise-free)
         float contrast = (illum_min > 0.001)
             ? log2(max(illum_max / illum_min, 1.0))
+            : 0.0;
+
+        // V-aware pump signals: same mean + dynamic-range stats on max(R,G,B)
+        // of the illum field, so saturated colored events (blue spell, red
+        // blast — low luma, high V) both DRIVE the pump and SURVIVE its
+        // contrast guard. Neutral content has V==Y, so these collapse to the
+        // luma versions exactly. Kept separate from avg_illum/contrast, which
+        // growth-mode and APL still consume on the luma axis.
+        float avg_illum_v = illum_v_sum / N_SAMPLES;
+        float contrast_v  = (illum_v_min > 0.001)
+            ? log2(max(illum_v_max / illum_v_min, 1.0))
             : 0.0;
 
         // Log-average: perceptual brightness key from source pixels
@@ -785,6 +968,47 @@ void hook() {
         // bs_raw and bright_scene weighting.
         spec_raw = mix(spec_raw, max(spec_raw, bs_raw), bright_scene);
 
+        // ---- Light-pump band-pass (sudden sustained brightening) ----
+        // Two fixed-alpha EMAs of avg_illum_v (V = max(R,G,B) of the illum
+        // field, so saturated colored events register); their positive
+        // difference is the pump drive. Reset both lanes to avg_illum_v on
+        // frame 0 and across cut/lockout so a cut transient or stale baseline
+        // can't manufacture drive (a hard cut to a brighter scene must NOT
+        // pump). Self-contained — does not touch the smoothed_* init block.
+        bool pump_reset = (frame == 0) || scene_cut || (scene_cut_lockout > 0.0);
+        if (pump_reset) {
+            pump_fast = avg_illum_v;
+            pump_slow = avg_illum_v;
+            pump_env  = 0.0;
+            #if ENABLE_SPATIAL_PUMP
+            pump_cover_gate = 0.0;
+            #endif
+        } else {
+            pump_fast = mix(pump_fast, avg_illum_v, PUMP_ALPHA_FAST);
+            pump_slow = mix(pump_slow, avg_illum_v, PUMP_ALPHA_SLOW);
+            float drive      = pump_fast - pump_slow;                    // SIGNED velocity
+            float pump_gate  = smoothstep(PUMP_DRIVE_LOW, PUMP_DRIVE_HIGH, max(0.0, drive));
+            // Contrast-retention fade guard on the SAME V axis as the driver
+            // (else a colored event would be driven but muted): high while the
+            // frame keeps a hot core vs dark surround (explosion, spell),
+            // collapses toward 0 as the field goes uniform (fade-to-white or
+            // fade-to-colour). Events are never muted; fades ease out.
+            float cover_gate = smoothstep(PUMP_CONTRAST_LOW, PUMP_CONTRAST_HIGH, contrast_v);
+            // Velocity-matched release. The NEGATIVE half of the band-pass is
+            // the source itself falling: while drive<0, pump_fast/pump_slow is
+            // <1 by exactly the source's recent fractional drop, so pump_env
+            // eases out in lockstep with the source (fast on a cut, gentle on a
+            // bloom-fade). A steady source gives drive≈0 → ratio 1 → NO release
+            // (this is what made a held light's old timed release look like an
+            // animated dim). PUMP_ADAPT_FLOOR is the only clock left: it relaxes
+            // an indefinitely-held light imperceptibly slowly (eye-adapting).
+            float rel = (drive < 0.0 && pump_slow > 1e-3) ? (pump_fast / pump_slow) : 1.0;
+            pump_env = max(pump_env * rel * PUMP_ADAPT_FLOOR, pump_gate) * cover_gate;
+            #if ENABLE_SPATIAL_PUMP
+            pump_cover_gate = cover_gate;   // published for the spatial gate (mask has no cover)
+            #endif
+        }
+
         if (frame == 0) {
             smoothed_bright_frac  = 0.0;
             smoothed_spec_signal  = 0.0;
@@ -800,11 +1024,124 @@ void hook() {
             smoothed_log_avg      = mix(smoothed_log_avg, log_avg, alpha);
         }
 
+        // Publish the per-cell pump reset flag (cut / lockout / frame 0) so all
+        // lanes reset their cell band-pass coherently in the spatial block below.
+        #if ENABLE_SPATIAL_PUMP
+        s_pump_reset = pump_reset ? 1u : 0u;
+        #endif
+
         // Dummy write satisfies the 1×1 SAVE target; SSBO above is the
         // real product. Other lanes are out-of-bounds for the image and
         // would be no-ops, but the guard avoids 143 redundant store ops.
         imageStore(out_image, ivec2(0), vec4(0));
     }
+
+    // -------- per-cell pump band-pass (spatial mask) --------
+    // All 144 lanes; each owns one 16×9 grid cell and touches only its own SSBO
+    // slots (race-free). The barrier gates s_pump_reset visibility (published by
+    // thread-0). Same velocity-matched release + adaptation floor as the
+    // scene-global pump, but NO cover_gate here — the global gate (which already
+    // carries cover) is applied in PASS 6. Emits pump_env_cell[144]; PASS 6
+    // bilinear-upsamples it.
+    #if ENABLE_SPATIAL_PUMP
+    barrier();
+    {
+        // Sharp per-cell driver: 4×4 box-mean of CELFLARE_MID (mid-σ ~20px blur,
+        // PASS 4b/4c) over this cell's footprint, NOT a point-sample of the σ~80
+        // CELFLARE_ILLUM blur. The σ80 field smears a small event across ±1-2
+        // neighbouring cells and dilutes its peak; the mid-σ box-mean keeps the
+        // event's energy in the cell it occupies, at full strength → real
+        // localization (the missing half of the localized-gate fix). MID is
+        // band-limited (unlike the aliased DS) so the 30px-spaced tap grid is
+        // gap-free — sub-cell events don't fall between taps and flicker — and
+        // grain/sparkle is destroyed before the temporal band-pass. Per-tap V
+        // (max channel) preserves colored-bloom detection and folds in the mask
+        // guide's V-fix; the scalar pump keeps its own s_illum_v (σ80) driver.
+        const float cell_tap[4] = { -0.75, -0.25, 0.25, 0.75 };  // 4-pt midpoint quadrature across the cell
+        float cell_v_sum = 0.0;
+        for (int ty = 0; ty < 4; ty++)
+        for (int tx = 0; tx < 4; tx++) {
+            vec3 mr = CELFLARE_MID_tex(spos + vec2(cell_tap[tx] * (0.5 / 16.0),
+                                                   cell_tap[ty] * (0.5 / 9.0))).rgb;
+            cell_v_sum += max(max(mr.r, mr.g), mr.b);
+        }
+        float v = cell_v_sum * (1.0 / 16.0);
+        if (s_pump_reset != 0u) {
+            pump_fast_cell[lid] = v;
+            pump_slow_cell[lid] = v;
+            pump_env_cell[lid]  = 0.0;
+            s_cell_env[lid]     = 0.0;
+            s_cell_drive[lid]   = 0.0;
+        } else {
+            pump_fast_cell[lid] = mix(pump_fast_cell[lid], v, PUMP_ALPHA_FAST);
+            pump_slow_cell[lid] = mix(pump_slow_cell[lid], v, PUMP_ALPHA_SLOW);
+            float d = pump_fast_cell[lid] - pump_slow_cell[lid];
+            // Dead-zone: idle-wobble cells (drive under the zone) read true zero
+            // so a competing highlight can't slowly accumulate a held mask.
+            float a = smoothstep(PUMP_CELL_DRIVE_LOW, PUMP_CELL_DRIVE_HIGH, max(0.0, d - PUMP_CELL_DEADZONE));
+            float r = (d < 0.0 && pump_slow_cell[lid] > 1e-3)
+                    ? (pump_fast_cell[lid] / pump_slow_cell[lid]) : 1.0;
+            pump_env_cell[lid] = max(pump_env_cell[lid] * r * PUMP_ADAPT_FLOOR, a);
+            s_cell_env[lid]    = pump_env_cell[lid];   // peak (localized) reduction input
+            s_cell_drive[lid]  = d;                    // pan rise-vs-fall input
+        }
+    }
+
+    // -------- spatial gate reduction (localized confidence + pan score) --------
+    // Second barrier publishes the per-cell mask + drive to thread-0, reduced
+    // into two scene scalars for PASS 6:
+    //   pump_cell_peak = max cell mask → LOCALIZED event confidence, so a small
+    //     spell fires its own cell even when the frame mean barely moved (the
+    //     fix for the frame-mean gate that killed small events).
+    //   pump_pan_score = falling/(rising+falling) drive across cells → across-pan
+    //     discriminator: a translation rises on the leading edge WHILE falling on
+    //     the trailing edge (→~0.5); an in-place event rises only (→0). Into-pans
+    //     (net reveal, little falling) still pass — deferred to the motion v2.
+    barrier();
+    if (lid == 0u) {
+        float peak = 0.0, rise = 0.0, fall = 0.0;
+        for (uint i = 0u; i < 144u; i++) {
+            peak = max(peak, s_cell_env[i]);
+            float dd = s_cell_drive[i];
+            rise += max(0.0,  dd);
+            fall += max(0.0, -dd);
+        }
+        pump_cell_peak = peak;
+        pump_pan_score = fall / (rise + fall + 1e-4);
+
+        // Gate envelope — the two scene gate scalars otherwise snap frame-to-frame:
+        // localized (from the peak cell) and pan_reject (from pan_score). A hard
+        // gate close SQUASHES the pump and distracts the eye. Each scalar gets an
+        // asymmetric two-rate slew (FAST 0.60 / SLOW 0.08), but the DIRECTIONS
+        // differ because their "danger" edges differ:
+        //   conf: a REAL event fading is the gate close → ease it out (fast OPEN so
+        //     onset isn't lagged — the mask EMA already ramps it; slow CLOSE).
+        //   pan:  a pan STARTING must cut a swept band promptly (else it pumps a
+        //     moving band — the artifact pan_reject exists to kill), so rejection
+        //     ENGAGES fast (pan_env falling → fast); when the pan ENDS the pump
+        //     eases back slow (pan_env rising → slow) to avoid a pop. i.e. pan is
+        //     the MIRROR of conf. (A slow pan-engage would re-open the artifact —
+        //     and sustain-protect can't cover it, since a new swept band hasn't
+        //     built cell env yet.)
+        // cover (fade-to-white guard) is deliberately NOT slewed — instant in
+        // PASS 6. A scene cut hard-resets via s_pump_reset, so nothing lingers.
+        float loc_raw = smoothstep(PUMP_GATE_LO, PUMP_GATE_HI, peak);
+        float pan_raw = 1.0 - smoothstep(PUMP_PAN_LO, PUMP_PAN_HI, pump_pan_score);
+        if (s_pump_reset != 0u) {
+            pump_conf_env = loc_raw;
+            pump_pan_env  = pan_raw;
+        } else {
+            // conf: fast OPEN (rising), slow CLOSE (falling)
+            pump_conf_env = (loc_raw > pump_conf_env)
+                ? mix(pump_conf_env, loc_raw, PUMP_GATE_ATTACK)
+                : mix(pump_conf_env, loc_raw, PUMP_GATE_RELEASE);
+            // pan: fast ENGAGE-rejection (falling), slow RELEASE-rejection (rising)
+            pump_pan_env = (pan_raw < pump_pan_env)
+                ? mix(pump_pan_env, pan_raw, PUMP_GATE_ATTACK)
+                : mix(pump_pan_env, pan_raw, PUMP_GATE_RELEASE);
+        }
+    }
+    #endif
 }
 
 // =============================================================================
@@ -939,6 +1276,55 @@ void hook() {
 #define GROWTH_APL_BYPASS        0.8   // APL factor → mix toward 1.0 by (this * growth_mode)
 
 // =============================================
+//  LIGHT PUMP — augment sudden sustained brightening
+// =============================================
+// PASS 5 sets pump_env in [0,1] during a multi-frame brightness RISE
+// (explosion bloom, train exiting a tunnel, spell charge-up) and ≈0 otherwise.
+// Here it multiplies the fully-formed expansion (post base/APL/spec) by a
+// brightness-weighted gain, giving the rising bright region an exposure-like
+// punch on top of the normal curve. Self-releases when brightness plateaus
+// (pump_env → 0). Distinct from the growth bypass: that REMOVES suppression on
+// a sustained expanding object; this ADDS gain on the rising EDGE. A fireball
+// can trigger both (pump on the bloom rise, growth-mode on the sustain) — if
+// they stack too hot, gate PUMP_STRENGTH down by smoothed_growth_mode.
+//
+// EXAGGERATED defaults for first validation — the gain ceil dominates so the
+// effect is unmissable. Drop PUMP_STRENGTH to ~0.3-0.6 for the subtle target.
+#define ENABLE_LIGHT_PUMP   1
+#define PUMP_STRENGTH       1      // gain per unit pump_env at full pixel weight. At = CEIL the response is
+                                   // PROPORTIONAL (peak reserved for full-detection events, not roof-pinned);
+                                   // > CEIL slams moderate events to the roof (aggressive); subtle ≈ 0.4
+#define PUMP_Y_LOW          0.35   // per-pixel weight onset — low/broad so the whole bright region lifts (not a pinpoint)
+#define PUMP_GAIN_CEIL      1.5    // hard cap on the pump multiplier (safety against runaway expansion)
+#define PUMP_GROWTH_DAMP    0.6    // down-gate pump where growth-mode already lifts expansion (anti double-stack on fireballs)
+// Spatial pump (MUST match PASS 5 copy). Localizes the pump to the brightening
+// region via the per-cell mask (pump_env_cell[144], 16×9, bilinear-sampled).
+// The mask is gated by three scene scalars from PASS 5 (localized × pan_reject
+// × cover). Set ENABLE_SPATIAL_PUMP 0 for the legacy scene-global scalar.
+#define ENABLE_SPATIAL_PUMP 1
+// NOTE: the localized-gate (PUMP_GATE_LO/HI) and across-pan (PUMP_PAN_LO/HI)
+// thresholds now live in PASS 5 — the smoothstep gating + the fast-attack/
+// slow-release envelope are computed there and arrive here as pump_conf_env /
+// pump_pan_env. Tune those two pairs in PASS 5, NOT here (a copy here would be a
+// dead knob). The sustain-protect + cover are still applied per-pixel below.
+// Sustain-protect: pan_score is a GLOBAL scalar, so incidental motion (rising
+// smoke over a stationary flame, a camera tilt) pushes it into the reject band
+// and tears down a REAL in-place event that happens to share the frame. A
+// pan-revealed band never builds sustained per-cell env; an established event
+// does. So exempt high-env pixels from pan rejection — "held light holds,"
+// mirroring the scalar pump's velocity-matched release. (Interim local-pan fix
+// pending the per-cell neighbour test — HANDOFF §5B.)
+#define PUMP_PAN_KEEP_LO    0.20   // cell env below → pan rejection applies in full
+#define PUMP_PAN_KEEP_HI    0.50   // cell env above → established event, pan reject waived
+// Mask reconstruction. Fractional coords are smoothstep-eased (C1) to kill the
+// bilinear derivative-kink seams (#5). The mask is then slightly biased by the
+// SMOOTH illum field (#4) so it follows the bloom's brightness profile instead
+// of the blocky per-cell grid, hiding per-cell release mottling. GUIDE 0 = pure
+// bilinear; higher = more brightness-shaping (concentrates pump on bright cores).
+#define PUMP_GUIDE          0.30   // strength of the Y_illum brightness bias (0 = off)
+#define PUMP_GUIDE_LOW      0.35   // illum below → guide pulls mask down (matches pump_w onset)
+
+// =============================================
 //  SPECULAR BONUS — scene-detected, per-pixel bloom
 // =============================================
 // Stats pass samples 16×9 grid, counting source pixels in highlight
@@ -964,7 +1350,11 @@ void hook() {
 // tests it. (Do not write the literal directive prefix in prose anywhere in
 // this file — the libplacebo parser splits sections on it even mid-comment.)
 #define ENABLE_SATURATED_SPEC 0
-#define SPEC_Y_LOW          0.88    // Ramp onset (dark/bright endpoint scenes)
+#define SPEC_Y_LOW          0.80    // Ramp onset — widened to soften "crunchy" clipped speculars.
+                                    // Builds the spec as a gradient INTO the clipped core from
+                                    // below; peak at Y=1.0 is unchanged, so no attenuation of the
+                                    // source clip. Lower = wider/gentler phase-in (floor ~0.75
+                                    // before spec starts catching bright-but-not-specular pixels).
 #define SPEC_Y_LOW_MID_BUMP 0.05    // Parabolic bump pushes onset to 0.93 at spec_apl=0.5,
                                     // which corresponds to smoothed_log_avg ≈ 0.16 —
                                     // normally-lit interiors, dusk exteriors, mid-key
@@ -1096,6 +1486,7 @@ void hook() {
 #define DEBUG_SHOW_EXPANSION 0  // Expansion amount as heat map
 #define DEBUG_SHOW_DETAIL    0   // Spatial vs per-pixel: green=spatial, red=per-pixel fallback
 #define DEBUG_SHOW_SPECULAR  0   // Specular bonus: cyan = spec strength
+#define DEBUG_SHOW_PUMP      0   // Light pump: red = scene pump_env, green = per-pixel applied gain
 #define DEBUG_SHOW_WP        0   // Warm shift + pale skin
 #define DEBUG_SHOW_STATS     0   // avg_illum + bright_frac + contrast + log_avg bars
 
@@ -1593,6 +1984,95 @@ vec4 hook() {
     #if DEBUG_SHOW_SPECULAR && ENABLE_SPECULAR_BONUS
     {
         return vec4(gamma709_to_pq2020(vec3(0.0, spec_strength, spec_strength)), 1.0);
+    }
+    #endif
+
+    // -------------------------------------------------------------------------
+    // LIGHT PUMP — augment sudden sustained brightening (post-spec)
+    // -------------------------------------------------------------------------
+    // Multiplicative exposure-like gain on the fully-formed expansion, weighted
+    // by per-pixel brightness so the rising bright region lifts while shadows
+    // hold (preserves contrast — the explosion doesn't wash the dark frame to
+    // grey). pump_env is the PASS 5 band-pass: nonzero only during a multi-
+    // frame brightness rise, self-releasing at plateau. Capped for safety.
+    #if ENABLE_LIGHT_PUMP
+    float pump_gain = 0.0;
+    {
+        float pump_w = smoothstep(PUMP_Y_LOW, 1.0, Y_decision_gamma);
+        // Spatial vs scene-global drive. Spatial: bilinear-sample the per-cell
+        // mask (16×9) at this pixel, gated by global event confidence (pump_env,
+        // which already carries the fade/cover guard). Localizes the pump to the
+        // brightening region and rejects across-pans. Legacy: the global scalar
+        // lifts every bright pixel uniformly.
+        #if ENABLE_SPATIAL_PUMP
+        vec2  pg  = vec2(HOOKED_pos.x * 16.0 - 0.5, HOOKED_pos.y * 9.0 - 0.5);
+        vec2  pgf = fract(pg);
+        pgf = pgf * pgf * (3.0 - 2.0 * pgf);    // #5: smoothstep-ease → C1, kills bilinear kink seams
+        ivec2 pi0 = clamp(ivec2(floor(pg)),     ivec2(0), ivec2(15, 8));
+        ivec2 pi1 = clamp(ivec2(floor(pg)) + 1, ivec2(0), ivec2(15, 8));
+        float m00 = pump_env_cell[pi0.y * 16 + pi0.x];
+        float m10 = pump_env_cell[pi0.y * 16 + pi1.x];
+        float m01 = pump_env_cell[pi1.y * 16 + pi0.x];
+        float m11 = pump_env_cell[pi1.y * 16 + pi1.x];
+        float mask = mix(mix(m00, m10, pgf.x), mix(m01, m11, pgf.x), pgf.y);
+        float mask_env = mask;   // pre-guide per-pixel cell env = local event confidence (sustain-protect key)
+        // #4: slight brightness guide — bias the mask by the SMOOTH illum field
+        // so it follows the bloom profile, hiding per-cell release mottling
+        // behind the brightness gradient. Only shapes falloff INSIDE the
+        // already-gated region, so it can't re-leak a competing highlight.
+        // Uses V = max(R,G,B) of the illum field, NOT luma: the pump driver is
+        // V-based so a saturated colored bloom (blue spell, red blast — low
+        // luma, high V) registers; a luma guide would pull the mask DOWN on
+        // exactly those colored events the V-driver worked to detect.
+        float v_illum = max(max(illum_rgb.r, illum_rgb.g), illum_rgb.b);
+        mask *= mix(1.0, smoothstep(PUMP_GUIDE_LOW, 1.0, v_illum), PUMP_GUIDE);
+        // Gate the mask by three scene scalars (all from PASS 5):
+        //   pump_conf_env = localized event confidence (peak cell), asymmetric
+        //                   fast-attack / slow-release enveloped so it eases out
+        //   pump_pan_env  = pan_reject (1 - pan_score), same envelope
+        //   cover         = contrast fade guard — applied instant (safety, not slewed)
+        // The smoothstep gating + slew happen in PASS 5; here we just consume the
+        // envelopes. See the reducer's "Gate envelope" block.
+        // Sustain-protect (see PUMP_PAN_KEEP_*): waive pan rejection where the
+        // cell env is already established, so a global pan score from rising
+        // smoke / a camera tilt can't tear down a stationary in-place event.
+        float pan_reject_eff = mix(pump_pan_env, 1.0,
+                                   smoothstep(PUMP_PAN_KEEP_LO, PUMP_PAN_KEEP_HI, mask_env));
+        float pump_local = mask * pump_conf_env * pan_reject_eff * pump_cover_gate;
+        #else
+        float pump_local = pump_env;
+        #endif
+        // Down-gate where growth-mode is already restoring expansion (a fireball
+        // triggers both): keeps pump + growth-bypass + spec from stacking the
+        // transient peak past the display's ceiling, where the DISPLAY would
+        // hard-clip and flatten the hot core. Gradation itself is never at risk
+        // from the pump — it's a monotonic multiplier on expansion, so a
+        // gradient stays a gradient; this only governs the absolute peak.
+        float pump_str = PUMP_STRENGTH * (1.0 - PUMP_GROWTH_DAMP * smoothed_growth_mode);
+        pump_gain = min(pump_local * pump_str * pump_w, PUMP_GAIN_CEIL);
+        expansion *= 1.0 + pump_gain;
+    }
+    #endif
+
+    #if DEBUG_SHOW_PUMP && ENABLE_LIGHT_PUMP
+    {
+        #if ENABLE_SPATIAL_PUMP
+        // Red = effective gate (enveloped conf × sustain-protected pan_env × cover);
+        // Green = per-pixel applied gain; Blue = raw per-cell mask (WHERE it localizes).
+        vec2  pg  = vec2(HOOKED_pos.x * 16.0 - 0.5, HOOKED_pos.y * 9.0 - 0.5);
+        vec2  pgf = fract(pg);
+        pgf = pgf * pgf * (3.0 - 2.0 * pgf);    // match application: eased C1 sampling
+        ivec2 pi0 = clamp(ivec2(floor(pg)),     ivec2(0), ivec2(15, 8));
+        ivec2 pi1 = clamp(ivec2(floor(pg)) + 1, ivec2(0), ivec2(15, 8));
+        float mask = mix(mix(pump_env_cell[pi0.y*16+pi0.x], pump_env_cell[pi0.y*16+pi1.x], pgf.x),
+                         mix(pump_env_cell[pi1.y*16+pi0.x], pump_env_cell[pi1.y*16+pi1.x], pgf.x), pgf.y);
+        float dbg_pan_eff = mix(pump_pan_env, 1.0, smoothstep(PUMP_PAN_KEEP_LO, PUMP_PAN_KEEP_HI, mask));
+        float dbg_gate = pump_conf_env * dbg_pan_eff * pump_cover_gate;
+        return vec4(gamma709_to_pq2020(vec3(dbg_gate, pump_gain, mask)), 1.0);
+        #else
+        // Red = scene-global trigger; Green = per-pixel applied gain.
+        return vec4(gamma709_to_pq2020(vec3(pump_env, pump_gain, 0.0)), 1.0);
+        #endif
     }
     #endif
 

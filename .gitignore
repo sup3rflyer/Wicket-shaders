@@ -14,3 +14,10 @@ __pycache__/
 *.pyc
 *.bak
 *.bak-*
+
+# Dev docs — local to this working copy, NEVER published (see CLAUDE.md §policy).
+# CHANGELOG has internal audit/tuning notes; publish a cleaned version deliberately
+# if ever wanted — don't let it leak here by default.
+CLAUDE.md
+HANDOFF.md
+CHANGELOG.md

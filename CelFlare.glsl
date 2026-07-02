@@ -1,4 +1,4 @@
-// CelFlare v5.4 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.5 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Two-layer architecture:
@@ -26,6 +26,7 @@
 //!VAR float pump_fast
 //!VAR float pump_slow
 //!VAR float pump_env
+//!VAR float pump_cover_gate
 //!VAR float prev_illum[144]
 //!VAR float pump_fast_cell[144]
 //!VAR float pump_slow_cell[144]
@@ -647,12 +648,12 @@ vec4 hook() {
 // holds only for the RELEASE path (ungated). The mask still can't ADD
 // under any p.
 #define PUMP_DRIVE_P        4.0    // highlight weighting of BOTH drive statistics. A/B 2.0-6.0
-// Spatial pump (SUBTRACTIVE): per-cell band-pass on the COARSE σ80 CELFLARE_ILLUM V
-// (sampled at the cell center — the SAME field the scalar means over the frame) →
-// a [0,1] "is this region brightening" mask. PASS 6 MULTIPLIES the global scalar
-// pump by it, so spatial can only SUPPRESS the scalar where a region isn't
-// brightening — never add pump. 0 = scalar-only (mask disabled).
-// ⚠ FOOTGUN — this define is DUPLICATED in PASS 6 (line ~1149) and the two MUST
+// Spatial pump: per-cell band-pass on the COARSE σ80 CELFLARE_ILLUM V (sampled at
+// the cell center — the SAME field the scalar means over the frame) → a [0,1]
+// per-cell "is this region brightening" env. How PASS 6 consumes it is that pass's
+// SPATIAL_PUMP_ADDITIVE knob (additive = env is the local pump amplitude;
+// subtractive = env only suppresses the global scalar). 0 = scalar-only.
+// ⚠ FOOTGUN — this define is DUPLICATED in PASS 6 (line ~1428) and the two MUST
 // match: no compile-time guard. A PASS5=0/PASS6=1 mismatch COMPILES but leaves
 // pump_env_cell unwritten → PASS 6 reads a stale/garbage mask and the pump
 // misbehaves. (Found flipped to 0 twice this session — keep BOTH at the same value.)
@@ -690,7 +691,8 @@ vec4 hook() {
 // cancel (no false release), dying fires still release.
 // Offline-validated on the killer clip (16x9 cell replica of this pass):
 // drive_loc onset 0.15→0.000 across the 3 s reveal (was env 0.80 for ~70
-// frames = the artifact), mask-open cell-frames 3016→75 (frame-edge cells).
+// frames = the artifact), mask-open cell-frames 3016→75 (frame-edge cells —
+// since closed by the anchored window in the freshness scan below).
 // Target events preserved: tunnel exit (uniform rise: slow lags fast
 // everywhere → nothing is under a neighbour's ceiling; global drive owns it
 // regardless), dark-scene fires (neighbourhood slow is dark), SPREADING
@@ -703,25 +705,30 @@ vec4 hook() {
 // toward 0.05 if any reveal still breathes; the ring is fixed at 2 (matches
 // the σ80 edge smear — a wider ring only widens the standing-mass trade).
 #define PUMP_ESTABLISH_MARGIN 0.03
-// Mask half of the gate (A/B lever): 1 = a cell mask may only OPEN on a
-// fresh rise (held env still max-holds and releases normally — closing is
-// never gated). 0 = mask opens on any rise (pre-gate behavior); the scalar
-// onset gate above stays active either way.
+// Mask half of the gate: 1 = a cell mask may only OPEN on a fresh rise (held
+// env still max-holds and releases normally — closing is never gated). 0 =
+// mask opens on any rise; the scalar onset gate above stays active either way.
+// Under PASS 6's SPATIAL_PUMP_ADDITIVE this is the load-bearing reveal
+// safety, not an A/B lever — an ungated additive mask is exactly the pre-v5.2
+// artifact machine. Keep it 1 while the additive experiment is on.
 #define PUMP_MASK_ESTABLISH 1
-// SUBTRACTIVE model (2026-07-02): the per-cell env is a [0,1] SUPPRESSOR — PASS 6
-// multiplies the global scalar pump by it, so spatial can only REMOVE pump from
-// non-brightening regions, never ADD it. That structurally kills the whole reveal/
-// ghost/occluder-trail artifact class (no global event → scalar ~0 → product ~0,
-// regardless of any local rise), which is why the additive-mask machinery is gone:
-// no novelty gate, no habitual-V memory, no established-exemption, no localized-
-// confidence gate, no motion crossfade — all existed only to stop an additive mask
-// from over-firing. Pump AMPLITUDE comes from the global scalar; since v5.3 its
-// onset is max(p-norm band-pass, drive_loc — a signed p-mean aggregate of the
-// per-cell drives; see PUMP_DRIVE_P block), so a localized event fires the scalar
-// regardless of standing bright content — the mask then confines the pump to the
-// brightening cells. Amplitude is still shared (one scalar), but per-region TIMING
-// is each cell's own band-pass env, so multiple independent events (several fires)
-// pump on their own rhythms.
+// SPATIAL MODEL — two apply modes, selected by PASS 6's SPATIAL_PUMP_ADDITIVE:
+//  - SUBTRACTIVE (v5.2–v5.4, field-confirmed): pump_local = pump_env × mask.
+//    The env is a [0,1] SUPPRESSOR — spatial can only REMOVE the global scalar
+//    pump from non-brightening regions, never ADD it, so the reveal/ghost/
+//    occluder-trail class dies by construction (no global event → scalar ~0 →
+//    product ~0). Amplitude is shared (one scalar, p-norm + drive_loc onset —
+//    see PUMP_DRIVE_P block); per-region TIMING is each cell's own env.
+//  - ADDITIVE (v5.5 experiment, the §13 "additive door"): pump_local = mask ×
+//    cover. Each cell's gated env IS its own pump amplitude, so independent
+//    regional events pump at their own strength AND rhythm (per-cell release —
+//    the shared-amplitude bleed class dies too), and a localized event no
+//    longer needs the frame statistics to fire. What makes an additive mask
+//    safe NOW, where the pre-v5.2 stack (novelty gate, habitual-V memory,
+//    pan reject, sustain-protect, motion crossfade — all deleted) kept
+//    leaking: every mask OPENING passes the ESTABLISHED-LEVEL GATE above plus
+//    the frame-edge rule — a rise merely converging to a level its
+//    neighbourhood (or the frame) already holds cannot open a cell.
 // Release is VELOCITY-MATCHED, not clock-based: the primary release is sourced
 // from the negative half of the band-pass (the source's own luminance fall —
 // see the reducer), so the pump eases out in lockstep with the source and a
@@ -1039,6 +1046,7 @@ void hook() {
             pump_fast = pnorm_illum_v;
             pump_slow = pnorm_illum_v;
             pump_env  = 0.0;
+            pump_cover_gate = 0.0;
         } else {
             // Locals: the SSBO is coherent, so re-reading a lane just written
             // is a real memory round-trip — compute once, store once.
@@ -1114,15 +1122,51 @@ void hook() {
                 float m  = max(abs(di) - PUMP_CELL_DEADZONE, 0.0);
                 float w  = pow(m, PUMP_DRIVE_P);
                 bool fresh = false;
+                float fresh_ease = 0.0;
                 if (di > 0.0) {
+                    // ANCHORED establishment window (frame-edge rule, the
+                    // additive-door prerequisite): the 5×5 ring-2 window is
+                    // clamped to stay FULLY inside the grid, so at a frame
+                    // edge it shifts inward instead of truncating. The old
+                    // truncated scan made freshness EASIER at the border
+                    // (killer clip: a bottom-edge cell held its mask ~55
+                    // frames — inert under subtractive, a pump under
+                    // additive); the shifted window answers with the nearest
+                    // full block of in-frame context instead, which is a
+                    // strict SUPERSET of the truncated scan — border
+                    // freshness can only get harder, never easier. Interior
+                    // cells are bit-identical to the old ring-2.
+                    // Measured alternatives, both rejected (cell battery):
+                    //  - out-of-frame = established-bright (1.0, the §13
+                    //    sketch): border cells can never be fresh → a 2-cell
+                    //    unpumped VIGNETTE ring on every global event;
+                    //  - ring 3: in a 9-row grid a 7-row window can never
+                    //    exclude a 3-row sky, so the standing-mass trade goes
+                    //    frame-global vertically — a fire under any brighter
+                    //    sky never localizes (kills the multi-fire target).
+                    //    Ring stays 2; the ≥5-cell-tall occluder wake this
+                    //    leaves open is the documented additive residual.
+                    // cy/cx (not iy/ix): the lane-ID names are taken by the
+                    // outer uint pair — audit-flagged shadow, renamed.
+                    int cy = int(i) / 16, cx = int(i) % 16;
+                    int ny0 = clamp(cy - 2, 0, 4);
+                    int nx0 = clamp(cx - 2, 0, 11);
                     float nb_est = 0.0;
-                    int iy = int(i) / 16, ix = int(i) % 16;
-                    for (int ny = max(iy - 2, 0); ny <= min(iy + 2, 8); ny++)
-                        for (int nx = max(ix - 2, 0); nx <= min(ix + 2, 15); nx++)
-                            if (ny != iy || nx != ix)
+                    for (int ny = ny0; ny < ny0 + 5; ny++)
+                        for (int nx = nx0; nx < nx0 + 5; nx++)
+                            if (ny != cy || nx != cx)
                                 nb_est = max(nb_est, s_pump_snap_s[ny * 16 + nx]);
                     fresh = cf - PUMP_ESTABLISH_MARGIN > nb_est;
                     if (fresh) loc_on_sum += w;
+                    // Mask half consumes an EASED freshness: the band starts
+                    // AT the margin, so everything the boolean suppresses
+                    // stays exactly 0 (a reveal that noise-overshoots its
+                    // neighbour by ~0.01 still cannot open) — the ease only
+                    // softens the snap-open of a qualifying rise (the §13
+                    // mask-hole seam, which additive amplitude would expose).
+                    fresh_ease = smoothstep(PUMP_ESTABLISH_MARGIN,
+                                            2.0 * PUMP_ESTABLISH_MARGIN,
+                                            cf - nb_est);
                 } else {
                     loc_on_sum -= w;    // sign(di)*w with di <= 0
                 }
@@ -1138,10 +1182,11 @@ void hook() {
                 // PUMP_CELL_DRIVE_LOW/HIGH — see the knob block).
                 float a = smoothstep(PUMP_CELL_DRIVE_LOW, PUMP_CELL_DRIVE_HIGH, d);
                 #if PUMP_MASK_ESTABLISH
-                // Mask half of the gate: only a FRESH rise may OPEN the mask.
-                // An already-open cell max-holds and releases exactly as
-                // before — closing is never gated.
-                if (!fresh) a = 0.0;
+                // Mask half of the gate: only a FRESH rise may OPEN the mask,
+                // eased over [MARGIN, 2·MARGIN] above the neighbour ceiling
+                // (see fresh_ease above). An already-open cell max-holds and
+                // releases exactly as before — closing is never gated.
+                a *= fresh_ease;
                 #endif
                 // Velocity-matched release: the negative half of the band-pass
                 // is the region's own fall, so the mask eases out in lockstep
@@ -1164,6 +1209,11 @@ void hook() {
             // collapses toward 0 as the field goes uniform (fade-to-white or
             // fade-to-colour). Events are never muted; fades ease out.
             float cover_gate = smoothstep(PUMP_CONTRAST_LOW, PUMP_CONTRAST_HIGH, contrast_v);
+            // Published for PASS 6's ADDITIVE apply: the per-cell mask carries
+            // no scene guard of its own, so the additive path multiplies this
+            // in PASS 6 (instant, never slewed — it is the fade-to-white
+            // safety; a genuine event holds contrast, so it never bites one).
+            pump_cover_gate = cover_gate;
             // Velocity-matched release. The NEGATIVE half of the band-pass is
             // the source itself falling: while drive<0, pump_fast/pump_slow is
             // <1 by exactly the source's recent fractional drop, so pump_env
@@ -1239,7 +1289,7 @@ void hook() {
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
-//!DESC CelFlare v5.4
+//!DESC CelFlare v5.5
 
 // =============================================
 //  MAIN TUNING — start here
@@ -1374,17 +1424,28 @@ void hook() {
 #define PUMP_Y_LOW          0.35   // per-pixel weight onset — low/broad so the whole bright region lifts (not a pinpoint)
 #define PUMP_GAIN_CEIL      1.5    // hard cap on the pump multiplier (safety against runaway expansion)
 #define PUMP_GROWTH_DAMP    0.6    // down-gate pump where growth-mode already lifts expansion (anti double-stack on fireballs)
-// Spatial pump (SUBTRACTIVE). ⚠ MUST match the PASS 5 copy (line ~587) — no compile
-// guard; a mismatch leaves pump_env_cell unwritten and PASS 6 reads a garbage mask.
-// PASS 5 produces the per-cell brightening mask (pump_env_cell[144], 16×9); this pass
-// bilinear-samples it and MULTIPLIES the global scalar pump by it (only suppresses,
-// never adds). 0 = scalar-only.
+// Spatial pump. ⚠ MUST match the PASS 5 copy (line ~660) — no compile guard; a
+// mismatch leaves pump_env_cell unwritten and PASS 6 reads a garbage mask.
+// PASS 5 produces the per-cell brightening mask (pump_env_cell[144], 16×9);
+// this pass bilinear-samples it. 0 = scalar-only.
 #define ENABLE_SPATIAL_PUMP 1
-// SUBTRACTIVE apply (see PASS 5): pump_local = pump_env × mask, where mask is the
-// bilinear per-cell brightening env ∈[0,1]. The scalar (pump_env) supplies amplitude
-// AND its own cover/velocity guards; the mask only SUPPRESSES it where a region isn't
-// brightening. No crossfade / conf / cover knobs here — all lived in the additive
-// model. Mask fractional coords are smoothstep-eased (C1) to kill bilinear seams.
+// Apply mode (PASS 6-only knob — PASS 5 needs no copy). 1 = ADDITIVE (v5.5
+// experiment, the HANDOFF §13 "additive door"): pump_local = mask ×
+// pump_cover_gate — the bilinear per-cell env IS the local pump amplitude, so
+// each region pumps at its own strength and rhythm and a localized event no
+// longer needs the frame statistics to fire (small-event amplitude back).
+// Safe to open only because PASS 5 gates every mask OPENING on the
+// established-level test + frame-edge rule — the reveal/ghost/trail class
+// that sank the pre-v5.2 additive mask cannot open a cell.
+// 0 = SUBTRACTIVE (v5.2–v5.4 shipping behavior): pump_local = pump_env × mask
+// — the mask only suppresses the scalar; instant fallback if the experiment
+// misbehaves in the field.
+// Amplitude note: the additive path saturates at PUMP_CELL_DRIVE_HIGH (0.15,
+// PASS 5) per cell vs the scalar's PUMP_DRIVE_HIGH (0.20), so moderate events
+// run a touch hotter than v5.4 — that PASS 5 knob is the amplitude-reserve
+// lever. Mask fractional coords are smoothstep-eased (C1) to kill bilinear
+// seams.
+#define SPATIAL_PUMP_ADDITIVE 1
 
 // =============================================
 //  SPECULAR BONUS — scene-detected, per-pixel bloom
@@ -1999,6 +2060,23 @@ vec4 hook() {
         float m01 = pump_env_cell[pi1.y * 16 + pi0.x];
         float m11 = pump_env_cell[pi1.y * 16 + pi1.x];
         pump_mask = mix(mix(m00, m10, pgf.x), mix(m01, m11, pgf.x), pgf.y);
+        #if SPATIAL_PUMP_ADDITIVE
+        // ADDITIVE: the mask (per-cell established-gated brightening env) is the
+        // local pump amplitude; pump_cover_gate is the scene fade-to-white guard
+        // the scalar bakes into pump_env, applied here instant (safety, never
+        // slewed). pump_env itself is not consumed: pump_env ≤ cover holds BY
+        // INDUCTION (pump_env = max(held·rel·floor, gate)·cover, where the held
+        // term is a prior pump_env ≤ prior cover ≤ 1 and gate ≤ 1 — note the
+        // proof leans on cover_gate ∈ [0,1]; a future >1 boost term there would
+        // silently break it), so mask × cover ≥ pump_env × mask pointwise —
+        // additive never pumps less than subtractive. The APPLIED amplitude is
+        // mask × cover: the per-cell env holds/releases on the velocity ratio +
+        // adapt floor (held light holds — eye adaptation, not a dim), but cover
+        // can mute it instantly on a fade-to-white. That instant mute is the
+        // safety, and it eases in practice because contrast_v itself collapses
+        // gradually during a fade.
+        float pump_local = pump_mask * pump_cover_gate;
+        #else
         // SUBTRACTIVE: the mask (per-cell "is this region brightening" ∈[0,1]) only
         // SUPPRESSES the global scalar pump — it can't add pump. pump_env already
         // carries the scalar's amplitude, contrast/cover guard, and velocity release.
@@ -2006,6 +2084,7 @@ vec4 hook() {
         // decays to 0 (suppressed). A reveal/pan/occluder-wake can't manufacture pump:
         // no global event ⇒ pump_env ~0 ⇒ product ~0 regardless of any local rise.
         float pump_local = pump_env * pump_mask;
+        #endif
         #else
         float pump_local = pump_env;
         #endif
@@ -2024,8 +2103,9 @@ vec4 hook() {
     #if DEBUG_SHOW_PUMP && ENABLE_LIGHT_PUMP
     {
         #if ENABLE_SPATIAL_PUMP
-        // Red = scalar pump (global amplitude); Green = per-pixel applied gain;
-        // Blue = per-cell suppression mask (1 = brightening/kept, 0 = suppressed).
+        // Red = scalar pump (under ADDITIVE this is the reference — what the
+        // scalar alone would do; the applied amplitude is blue × cover);
+        // Green = per-pixel applied gain; Blue = per-cell mask.
         // pump_mask is the hoisted value the apply block actually used.
         return vec4(gamma709_to_pq2020(vec3(pump_env, pump_gain, pump_mask)), 1.0);
         #else

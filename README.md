@@ -23,13 +23,13 @@ The keybindings above use a Lua script for mpv. Ask an AI assistant to write you
 
 Uses a spatially-modulated expansion curve driven by an illumination field (bright-biased Gaussian blur of regional luminance). All pixels in a region share the same curve parameters — local contrast preserved by construction through multiplicative application. Frame-level scene metrics (APL, contrast, bright fraction) drive continuous adaptation rather than discrete scene-type classification. Highlights expand to ~200–310 nits with specular pop on top, while midtones stay close to the SDR grade. Works with anime and live-action content.
 
-All supported tuning lives in the **USER TUNING block at the top of the shader** — five sliders (`cf_ref_white`, `cf_strength`, `cf_curve`, `cf_spec`, `cf_pump`) and per-feature toggles, each documented in place. Edit the values there, or set them from `mpv.conf` without touching the file:
+All supported tuning lives in the **USER TUNING block at the top of the shader** — six sliders (`cf_ref_white`, `cf_strength`, `cf_curve`, `cf_shoulder`, `cf_spec`, `cf_pump`) and per-feature toggles, each documented in place. Edit the values there, or set them from `mpv.conf` without touching the file:
 
 ```ini
 glsl-shader-opts=cf_ref_white=110,cf_strength=1.2,cf_spec=0.8
 ```
 
-The sliders respond live during playback (bind `glsl-shader-opts` changes to keys for real-time A/B); toggles trigger a quick recompile. `cf_strength` scales the whole effect (0 = plain SDR), `cf_curve` sets how harshly expansion ramps into the highlights (peak brightness unchanged), `cf_spec` scales specular pop, `cf_pump` scales the light pump. Deeper internals are tunable in each pass — at your own peril.
+The sliders respond live during playback (bind `glsl-shader-opts` changes to keys for real-time A/B); toggles trigger a quick recompile. `cf_strength` scales the whole effect (0 = plain SDR), `cf_curve` sets how harshly expansion ramps into the highlights (peak brightness unchanged), `cf_shoulder` softens the arrival at peak for sources whose highlights are already harsh or clipped hard, `cf_spec` scales specular pop, `cf_pump` scales the light pump. Deeper internals are tunable in each pass — at your own peril.
 
 Features:
 - Spatially-modulated expansion curve (per-pixel, regionally adapted by an illumination field)

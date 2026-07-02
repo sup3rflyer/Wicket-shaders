@@ -1,5 +1,11 @@
-// CelFlare v5.8 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.9 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
+//
+// Design goal: emulate a professional HDR grade of the source — midtones hold
+// the SDR grade, highlights expand with natural gradation, speculars get
+// grade-realistic pop. Never exaggeration for its own sake. (The "fake-gradient
+// hot core" language in the rules below is an anti-squash requirement for
+// clipped regions — a defense, not an aesthetic target.)
 //
 // Two-layer architecture:
 //  1. Base curve: per-pixel monotonic f(Y) with shape (peak, gamma)
@@ -52,6 +58,13 @@
 //!MINIMUM 0.6
 //!MAXIMUM 1.8
 1.0
+
+//!PARAM cf_shoulder
+//!DESC Highlight shoulder — softens how hard expansion arrives at the brightest pixels. 0 = shipped look (steepest near-clip differentiation); 1 = expansion reaches its peak with no extra steepening. Raise it for sources whose highlights are already harsh or clipped hard.
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
 
 //!PARAM cf_spec
 //!DESC Specular pop — extra punch on glints, light sources, and clipped highlights. 1 = shipped tune, 0 = off.
@@ -1552,7 +1565,7 @@ void hook() {
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
-//!DESC CelFlare v5.8
+//!DESC CelFlare v5.9
 
 // =============================================
 //  MAIN TUNING — deep anchors. The supported user surface is the cf_* block
@@ -2180,6 +2193,23 @@ vec4 hook() {
     #endif
     float t = max(base_drive - KNEE, 0.0) / (1.0 - KNEE);
     t = pow(min(t, 1.0), local_gamma);  // clamp for upscaler super-whites
+    // cf_shoulder (top-of-file knob): one-sided cubic shoulder bump — softens
+    // the TOP-END derivative for sources whose highlights are already
+    // harsh/hard-clipped. Slope at t=1 scales as (1 - cf_shoulder): 0 =
+    // shipped look (steepest near-clip differentiation), 1 = expansion
+    // arrives at peak flat (clipped regions read uniformly ~peak× brighter;
+    // source gradation preserved at amplitude scale, not exaggerated). The cubic t²(1-t) — NOT the symmetric
+    // SPEC_Y_LOW_MID_BUMP parabola — is deliberate: its perturbation peaks at
+    // t=2/3 (Y≈0.81-0.88) and has quadratic contact at the knee, so faces are
+    // untouched and the composite curve's inflection stays at Y≥0.82 at
+    // default gamma (worst corner s=1 + cf_curve=0.6: Y≈0.66, band edge; the
+    // symmetric bump planted it at Y≈0.47, mid-face — audit-caught).
+    // Monotonicity: d/dt [t + s·t²·(1-t)] = 1 + s(2t - 3t²) >= 1 - s >= 0 —
+    // the PARAM's MAXIMUM 1.0 IS the proof bound, don't widen it. Peak is
+    // invariant (bump is 0 at t=1). The multiplier stays monotonic at every
+    // setting, so rule #1 holds: output gradient never drops below
+    // peak × source gradient.
+    t += cf_shoulder * t * t * (1.0 - t);
     float expansion = 1.0 + (local_peak - 1.0) * t * INTENSITY;
 
     #if DEBUG_SHOW_DETAIL

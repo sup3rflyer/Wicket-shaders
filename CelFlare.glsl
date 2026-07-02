@@ -1,4 +1,4 @@
-// CelFlare v5.6 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.7 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Two-layer architecture:
@@ -32,6 +32,7 @@
 //!VAR float pump_slow_cell[144]
 //!VAR float pump_env_cell[144]
 //!VAR float pump_mask_cell[144]
+//!VAR float bar_run[8]
 //!STORAGE
 
 //!HOOK MAIN
@@ -416,7 +417,8 @@ vec4 hook() {
 // Scene cut: the previous prev_illum[16] separate 4×4 grid was
 // redundant — the 16×9 stats grid already covers the frame at higher density.
 // prev_illum was widened to [144] so each lane stores its own slot (no
-// cross-lane access -> race-free), and change_pct is computed over all 144.
+// cross-lane access -> race-free); change_pct counts over all 144 cells but
+// is normalized to the picture-area cells (see the letterbox block).
 // SCENE_CUT_PCT semantics are preserved: fraction of cells whose illum moved
 // by > ILLUM_CHANGE_THRESH. Spatial density is higher (1/16-w × 1/9-h vs
 // 1/4 × 1/4), threshold tuning is unchanged.
@@ -437,6 +439,38 @@ vec4 hook() {
 // PEAK_ATTEN, BRIGHT_FRAC_REF, growth frac_floor) calibrated at 0.40.
 // Renamed from KNEE so a future retune of one can't silently miss the other.
 #define BRIGHT_STAT_THRESH  0.40
+
+// LETTERBOX / PILLARBOX BAR EXCLUSION (v5.7). Bar cells used to poison the
+// scene statistics: their near-zero illum pinned both contrast extrema at
+// ~4-6 stops permanently (the pump's fade-to-white cover gate read 1.0
+// forever, DYN_INTENSITY sat at max on all letterboxed content), diluted
+// every tier fraction by the bar area, and shrank the scene-cut change_pct
+// ceiling (windowboxed content — 4:3 + 2.35 inside 16:9, 60 live cells —
+// could NEVER reach SCENE_CUT_PCT 0.50, so cuts went undetected and the
+// pump lanes never reset on them). Detection is GEOMETRIC + PERSISTENT,
+// deliberately NOT luminance-based: a candidate row (0,1,7,8) or column
+// (0,1,14,15) counts as a bar only while EVERY cell in it is invalid
+// (source Y <= 0.001) for LB_ENGAGE_FRAMES consecutive frames. Center
+// cells are never candidates, so a night scene's true blacks can never be
+// misclassified (a fire against black surround keeps its dark cells in the
+// cover-gate contrast — a generic "exclude dark cells" rule would mute the
+// flagship dark-scene fire). Any content appearing in a bar (aspect change)
+// resets its run INSTANTLY. Candidate rows/cols cover 2.35:1 through
+// 2.76:1 letterbox and 4:3 pillarbox at cell resolution. Engaged bar cells
+// drop out of: both contrast extrema, the four tier sums AND their
+// denominator (fractions read as calibrated on the picture area), and the
+// scene-cut denominator. The pump p-NORM deliberately stays a mean over
+// ALL 144 cells: bars dilute it only ~(144/n_eff)^(1/4) ≈ 3-6%, and keeping
+// it fixed avoids a one-time step in the DRIVE path at the engage frame (a
+// step in the fracs is EMA-absorbed; a drive step could cross the pump
+// onset once). Residuals: dirty bars (level > ~17) never engage
+// (conservative, old behavior); hardsubs burned into a bar keep that bar
+// un-engaged (the other one still engages); a >5s static shot whose ONLY
+// true-blacks form complete edge rows loses them from the extrema —
+// harmless unless no other dark cell exists. EMAs make the one-time engage
+// step ease in. Per-rendered-frame like every other counter (60fps engages
+// ~2.5x sooner — same direction, fine).
+#define LB_ENGAGE_FRAMES    120.0   // ~5s @24p of all-black before a row/col is a bar
 
 // Specular detection (source brightness tiers, no illum field)
 #define HIGHLIGHT_THRESH    0.75    // Source highlight tier
@@ -636,7 +670,7 @@ vec4 hook() {
 // per-cell "is this region brightening" env. How PASS 6 consumes it is that pass's
 // SPATIAL_PUMP_ADDITIVE knob (additive = env is the local pump amplitude;
 // subtractive = env only suppresses the global scalar). 0 = scalar-only.
-// ⚠ FOOTGUN — this define is DUPLICATED in PASS 6 (line ~1516) and the two MUST
+// ⚠ FOOTGUN — this define is DUPLICATED in PASS 6 (line ~1594) and the two MUST
 // match: no compile-time guard. A PASS5=0/PASS6=1 mismatch COMPILES but leaves
 // pump_mask_cell unwritten → PASS 6 reads a stale/garbage mask and the pump
 // misbehaves. (Found flipped to 0 twice this session — keep BOTH at the same value.)
@@ -746,6 +780,20 @@ vec4 hook() {
 // range of the illumination field, in stops.
 #define PUMP_CONTRAST_LOW   1.0    // below this (≈uniform): pump fully muted
 #define PUMP_CONTRAST_HIGH  2.5    // above this (structured frame): full pump
+// Cover-gate fall rate (v5.7, audit finding M1). The cover multiplies the
+// HELD pump_env every frame, so any one-frame drop in contrast_v used to
+// yank an active pump in a single frame — a rule-2 step. The concrete
+// trigger: the letterbox exclusion engaging (~5s in, absolute frame count)
+// steps the V extrema once, and a pump held across that frame dipped
+// visibly. Cover now RISES instantly (a gate re-opening can never hurt) but
+// FALLS no faster than this per-frame ratio (half-life ~4 frames; 1→0.15 in
+// ~12 frames ≈ 0.5s @24p — "own the mistake, release slowly"). A genuine
+// fade-to-white collapses contrast over many frames, so the clamp rarely
+// binds there; a hard cut still mutes INSTANTLY via transient_reset (env
+// and cover both zeroed). This deliberately supersedes the v5.1-era "cover
+// is never slewed" rule — that rule predates cover feeding a held additive
+// amplitude and the engage step.
+#define PUMP_COVER_FALL     0.85
 // Optional coverage backstop for the degenerate uniform-but-high-contrast case
 // (rare). Kept for A/B; not wired by default — the contrast gate supersedes it.
 //#define PUMP_COVER_HIGH     0.62   // bright_frac above which the pump tapers
@@ -845,22 +893,70 @@ void hook() {
         float illum_v_psum      = 0.0;
         float illum_v_min       = 1.0;
         float illum_v_max       = 0.0;
+        uint  n_bar             = 0u;
+
+        // -------- letterbox / pillarbox bar detection (see LB_ENGAGE_FRAMES) --------
+        // Thread-0 serial over the candidate edge lines; state = 8 run
+        // counters in the SSBO (rows 0,1,7,8 then cols 0,1,14,15 — thread-0
+        // is the single writer). A run survives cuts by design (persistence
+        // through content changes is the evidence FOR barness); content in a
+        // bar resets it the same frame. Engaged lines become bit masks the
+        // stats loop tests per cell.
+        uint lb_row_mask = 0u;
+        uint lb_col_mask = 0u;
+        {
+            const int lb_rows[4] = int[4](0, 1, 7, 8);
+            const int lb_cols[4] = int[4](0, 1, 14, 15);
+            for (int k = 0; k < 4; k++) {
+                bool all_dark = true;
+                for (int x = 0; x < 16; x++)
+                    all_dark = all_dark && (s_valid[lb_rows[k] * 16 + x] == 0u);
+                float run = (frame == 0 || !all_dark)
+                    ? 0.0 : min(bar_run[k] + 1.0, LB_ENGAGE_FRAMES);
+                bar_run[k] = run;
+                if (run >= LB_ENGAGE_FRAMES) lb_row_mask |= 1u << uint(lb_rows[k]);
+            }
+            for (int k = 0; k < 4; k++) {
+                bool all_dark = true;
+                for (int y = 0; y < 9; y++)
+                    all_dark = all_dark && (s_valid[y * 16 + lb_cols[k]] == 0u);
+                float run = (frame == 0 || !all_dark)
+                    ? 0.0 : min(bar_run[k + 4] + 1.0, LB_ENGAGE_FRAMES);
+                bar_run[k + 4] = run;
+                if (run >= LB_ENGAGE_FRAMES) lb_col_mask |= 1u << uint(lb_cols[k]);
+            }
+        }
 
         for (uint i = 0u; i < 144u; i++) {
             float yi           = s_illum[i];
             illum_sum         += yi;
-            illum_min          = min(illum_min, yi);
-            illum_max          = max(illum_max, yi);
             // Floor at 0: upstream ringing can undershoot slightly negative and
             // GLSL pow() is undefined for x<0 — a single NaN here would persist
             // in pump_fast/pump_slow (SSBO) until the next scene cut.
             float vi           = max(s_illum_v[i], 0.0);
+            // p-norm over ALL 144 cells including bars — deliberate, see the
+            // LB_ENGAGE_FRAMES block (drive path must not step at engage).
             illum_v_psum      += pow(vi, PUMP_DRIVE_P);
-            illum_v_min        = min(illum_v_min, vi);
-            illum_v_max        = max(illum_v_max, vi);
             log_luma_sum      += s_log_luma[i];
             valid_luma        += s_valid[i];
+            // Engaged bar cells are excluded from everything below: contrast
+            // extrema (both axes), the tier sums + their denominator, AND the
+            // scene-cut change count. The change count must sit below the
+            // exclusion (audit M1): s_change tests the σ80 ILLUM field, which
+            // bleeds across the bar boundary while the bar's SOURCE stays
+            // black — counting bleed-swung bar cells over the n_eff
+            // denominator would let a large bright event's halo manufacture
+            // a FALSE cut on letterboxed content (lockout → pump reset
+            // mid-event). Numerator and denominator now cover the same
+            // picture-area population. (i >> 4 = row, i & 15 = col.)
+            bool lb_dead = (((lb_row_mask >> (i >> 4u)) & 1u) == 1u)
+                        || (((lb_col_mask >> (i & 15u)) & 1u) == 1u);
+            if (lb_dead) { n_bar++; continue; }
             change_count      += s_change[i];
+            illum_min          = min(illum_min, yi);
+            illum_max          = max(illum_max, yi);
+            illum_v_min        = min(illum_v_min, vi);
+            illum_v_max        = max(illum_v_max, vi);
             // Tier sums, re-derived from the raw per-lane values (single-
             // sourced thresholds next to the sums they feed). SOFT membership
             // (see TIER_SOFT_HALFBAND): each compare is a smoothstep over the
@@ -880,8 +976,13 @@ void hook() {
         }
 
         const float N_SAMPLES = 144.0;
+        // Effective picture-area cell count. Worst case (2.76:1 letterbox +
+        // 4:3 pillarbox simultaneously) excludes 64+36−16 = 84 cells →
+        // n_eff ≥ 60, never near zero. avg_illum stays /144 (it is only the
+        // log_avg fallback for near-black frames, where bars are moot).
+        float n_eff       = N_SAMPLES - float(n_bar);
         float avg_illum   = illum_sum / N_SAMPLES;
-        float bright_frac = bright_sum / N_SAMPLES;
+        float bright_frac = bright_sum / n_eff;
 
         // Contrast: dynamic range from illumination field (stable, noise-free).
         // max/min >= 1 by construction: both are running extrema of one sample set.
@@ -908,8 +1009,8 @@ void hook() {
             : avg_illum;
 
         // Specular signal: present when small fraction at specular tier
-        float spec_frac          = spec_sum / N_SAMPLES;
-        float highlight_frac_src = high_sum / N_SAMPLES;
+        float spec_frac          = spec_sum / n_eff;
+        float highlight_frac_src = high_sum / n_eff;
         float spec_onset         = smoothstep(0.0, SPEC_FRAC_MIN, spec_frac);
         float spec_shutoff       = 1.0 - smoothstep(SPEC_FRAC_MAX, SPEC_FRAC_CEIL, spec_frac);
         // Tier separation: specular must be rarer than highlights.
@@ -933,7 +1034,7 @@ void hook() {
         // ramps don't introduce a step into spec_raw_natural that would
         // false-trigger the growth-mode discriminator via spec_vel.
         // Supplements only — uses max(spec_raw, bs_raw).
-        float bs_frac     = bright_spec_sum / N_SAMPLES;
+        float bs_frac     = bright_spec_sum / n_eff;
         float bs_onset    = smoothstep(0.0, SPEC_FRAC_MIN, bs_frac);
         float bs_shutoff  = 1.0 - smoothstep(BRIGHT_SPEC_FRAC_MAX,
                                              BRIGHT_SPEC_FRAC_CEIL, bs_frac);
@@ -957,7 +1058,12 @@ void hook() {
         // The lockout counter alone encodes the whole cut-window state: a cut
         // sets it to LOCKOUT_FRAMES, so "cut this frame" == lockout at its max
         // and every consumer below keys off lockout > 0 (needs LOCKOUT_FRAMES > 0).
-        float change_pct  = float(change_count) / N_SAMPLES;
+        // Denominator = picture-area cells: bar cells never change, so they
+        // only diluted this. Windowboxed content (60 live cells) could never
+        // reach SCENE_CUT_PCT 0.50 over /144 — cuts went UNDETECTED and the
+        // pump lanes never reset on them. Over n_eff the 0.50 threshold means
+        // "majority of the PICTURE moved" at any aspect ratio.
+        float change_pct  = float(change_count) / n_eff;
         scene_cut_lockout = max(scene_cut_lockout - 1.0, 0.0);
         if (change_pct > SCENE_CUT_PCT && scene_cut_lockout <= 0.0)
             scene_cut_lockout = LOCKOUT_FRAMES;
@@ -1242,11 +1348,19 @@ void hook() {
             // frame keeps a hot core vs dark surround (explosion, spell),
             // collapses toward 0 as the field goes uniform (fade-to-white or
             // fade-to-colour). Events are never muted; fades ease out.
-            float cover_gate = smoothstep(PUMP_CONTRAST_LOW, PUMP_CONTRAST_HIGH, contrast_v);
+            float cover_raw = smoothstep(PUMP_CONTRAST_LOW, PUMP_CONTRAST_HIGH, contrast_v);
+            // Asymmetric cover envelope (see PUMP_COVER_FALL): instant rise,
+            // rate-clamped fall. pump_cover_gate doubles as the previous
+            // frame's effective cover (thread-0 read-then-write, single
+            // writer). transient_reset writes 0.0, so a cut still mutes
+            // instantly and the post-cut re-open is an instant rise.
+            float cover_gate = (cover_raw >= pump_cover_gate)
+                ? cover_raw
+                : max(cover_raw, pump_cover_gate * PUMP_COVER_FALL);
             // Published for PASS 6's ADDITIVE apply: the per-cell mask carries
             // no scene guard of its own, so the additive path multiplies this
-            // in PASS 6 (instant, never slewed — it is the fade-to-white
-            // safety; a genuine event holds contrast, so it never bites one).
+            // in PASS 6 — the same enveloped value the scalar bakes into
+            // pump_env (a genuine event holds contrast, so it never bites one).
             pump_cover_gate = cover_gate;
             // Velocity-matched release. The NEGATIVE half of the band-pass is
             // the source itself falling: while drive<0, pump_fast/pump_slow is
@@ -1337,7 +1451,7 @@ void hook() {
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
-//!DESC CelFlare v5.6
+//!DESC CelFlare v5.7
 
 // =============================================
 //  MAIN TUNING — start here
@@ -1472,7 +1586,7 @@ void hook() {
 #define PUMP_Y_LOW          0.35   // per-pixel weight onset — low/broad so the whole bright region lifts (not a pinpoint)
 #define PUMP_GAIN_CEIL      1.5    // hard cap on the pump multiplier (safety against runaway expansion)
 #define PUMP_GROWTH_DAMP    0.6    // down-gate pump where growth-mode already lifts expansion (anti double-stack on fireballs)
-// Spatial pump. ⚠ MUST match the PASS 5 copy (line ~679) — no compile guard; a
+// Spatial pump. ⚠ MUST match the PASS 5 copy (line ~677) — no compile guard; a
 // mismatch leaves pump_mask_cell unwritten and PASS 6 reads a garbage mask.
 // PASS 5 produces the per-cell brightening mask (pump_mask_cell[144], 16×9 —
 // the softened presentation of pump_env_cell); this pass bilinear-samples it.
@@ -1662,7 +1776,7 @@ void hook() {
 #define DEBUG_SHOW_EXPANSION 0  // Expansion amount as heat map
 #define DEBUG_SHOW_DETAIL    0   // Spatial vs per-pixel: green=spatial, red=per-pixel fallback
 #define DEBUG_SHOW_SPECULAR  0   // Specular bonus: cyan = spec strength
-#define DEBUG_SHOW_PUMP      0   // Light pump: red = scene pump_env, green = per-pixel applied gain
+#define DEBUG_SHOW_PUMP      1   // Light pump: red = scene pump_env, green = per-pixel applied gain
 #define DEBUG_SHOW_WP        0   // Warm shift + pale skin
 #define DEBUG_SHOW_STATS     0   // avg_illum + bright_frac + contrast + log_avg bars
 
@@ -2122,18 +2236,19 @@ vec4 hook() {
         #if SPATIAL_PUMP_ADDITIVE
         // ADDITIVE: the mask (per-cell established-gated brightening env) is the
         // local pump amplitude; pump_cover_gate is the scene fade-to-white guard
-        // the scalar bakes into pump_env, applied here instant (safety, never
-        // slewed). pump_env itself is not consumed: pump_env ≤ cover holds BY
-        // INDUCTION (pump_env = max(held·rel·floor, gate)·cover, where the held
-        // term is a prior pump_env ≤ prior cover ≤ 1 and gate ≤ 1 — note the
-        // proof leans on cover_gate ∈ [0,1]; a future >1 boost term there would
-        // silently break it), so mask × cover ≥ pump_env × mask pointwise —
-        // additive never pumps less than subtractive. The APPLIED amplitude is
-        // mask × cover: the per-cell env holds/releases on the velocity ratio +
-        // adapt floor (held light holds — eye adaptation, not a dim), but cover
-        // can mute it instantly on a fade-to-white. That instant mute is the
-        // safety, and it eases in practice because contrast_v itself collapses
-        // gradually during a fade.
+        // the scalar bakes into pump_env — an asymmetric envelope since v5.7
+        // (instant rise, rate-clamped fall ~0.5s; see PASS 5's PUMP_COVER_FALL;
+        // a hard cut still zeroes it instantly via the reset). pump_env itself
+        // is not consumed: pump_env ≤ cover holds BY INDUCTION (pump_env =
+        // max(held·rel·floor, gate)·cover, where the held term is a prior
+        // pump_env ≤ prior cover ≤ 1 and gate ≤ 1 — note the proof leans on
+        // cover_gate ∈ [0,1]; a future >1 boost term there would silently
+        // break it), so mask × cover ≥ pump_env × mask pointwise — additive
+        // never pumps less than subtractive. The APPLIED amplitude is mask ×
+        // cover: the per-cell env holds/releases on the velocity ratio + adapt
+        // floor (held light holds — eye adaptation, not a dim); cover mutes a
+        // fade-to-white over ~12 frames worst case, usually slower because
+        // contrast_v itself collapses gradually during a fade.
         float pump_local = pump_mask * pump_cover_gate;
         #else
         // SUBTRACTIVE: the mask (per-cell "is this region brightening" ∈[0,1]) only

@@ -1,4 +1,4 @@
-// CelFlare v5.7 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.8 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Two-layer architecture:
@@ -10,10 +10,111 @@
 //     channel V = max(R,G,B). Restores HDR pop where SDR compressed most
 //     (saturated primaries at signal ceiling, bright specular highlights).
 //
-// You MUST set REFERENCE_WHITE to match your SDR white and hdr-reference-white
-// in mpv.conf.
+// Quick start: all supported user controls live in the USER TUNING block
+// directly below. cf_ref_white MUST match hdr-reference-white in mpv.conf;
+// everything else is taste. Every knob can also be set from mpv.conf without
+// editing this file, e.g.:
+//     glsl-shader-opts=cf_strength=1.2,cf_spec=0.8
+// The five sliders respond live during playback; the toggles trigger a quick
+// shader recompile on change.
 //
-// Search for "MAIN TUNING" in the expansion pass for user-facing controls.
+// Deep tuning (advanced): search "MAIN TUNING" in the expansion pass. The
+// cf_* knobs are neutral overlays on those anchors — deep values stay
+// canonical, knobs scale them.
+
+// =============================================================================
+//  USER TUNING
+// =============================================================================
+// Each control is the plain number on the last line of its block. Sliders
+// first, then feature toggles (1 = on, 0 = off; changing a toggle recompiles
+// the shader). Ranges are enforced; defaults = the shipped tune. Anything not
+// listed here is internal — tune it in the passes below at your own peril.
+// NOTE: no comment lines may sit between a PARAM directive block and the next
+// directive — the parser folds them into the value and fails to load.
+
+//!PARAM cf_ref_white
+//!DESC SDR white level in nits — MUST match hdr-reference-white in mpv.conf. On Windows this is your "SDR content brightness" slider (see README for the slider-to-nits table).
+//!TYPE float
+//!MINIMUM 80.0
+//!MAXIMUM 480.0
+116.0
+
+//!PARAM cf_strength
+//!DESC Overall HDR strength. 1 = the shipped tune, 0 = plain SDR (no expansion at all), 2 = double. Scales everything: base expansion, specular pop, and light pump.
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 2.0
+1.0
+
+//!PARAM cf_curve
+//!DESC How harshly expansion ramps up. Below 1 = gentle, broad lift spread across the highlights; above 1 = expansion concentrated hard against the brightest pixels for a punchier pop. Peak brightness itself does not change.
+//!TYPE float
+//!MINIMUM 0.6
+//!MAXIMUM 1.8
+1.0
+
+//!PARAM cf_spec
+//!DESC Specular pop — extra punch on glints, light sources, and clipped highlights. 1 = shipped tune, 0 = off.
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 2.0
+1.0
+
+//!PARAM cf_pump
+//!DESC Light pump — a temporary surge on sudden sustained brightening (explosions, tunnel exits, spells). 1 = shipped tune, 0 = off.
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 2.0
+1.0
+
+//!PARAM cf_grain_stab
+//!DESC Grain stabilization — keeps film grain looking like film grain after expansion instead of shimmering.
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+1
+
+//!PARAM cf_spec_bonus
+//!DESC Specular bonus feature — master switch for the cf_spec slider.
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+1
+
+//!PARAM cf_light_pump
+//!DESC Light pump feature — master switch for the cf_pump slider.
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+1
+
+//!PARAM cf_spatial_pump
+//!DESC Pump localization — confine the light pump to the region of the frame that is actually brightening. 0 = scene-global pump only.
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+1
+
+//!PARAM cf_warm_shift
+//!DESC Warm-hue correction — stops fire, sunsets, and skin from drifting green as they get brighter.
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+1
+
+//!PARAM cf_pale_skin
+//!DESC Pale-skin protection — keeps fair skin from washing out in bright scenes.
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+1
+
+//!PARAM cf_debug
+//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars.
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 8
+0
 
 //!BUFFER SCENE_STATE
 //!VAR float smoothed_bright_frac
@@ -670,11 +771,11 @@ vec4 hook() {
 // per-cell "is this region brightening" env. How PASS 6 consumes it is that pass's
 // SPATIAL_PUMP_ADDITIVE knob (additive = env is the local pump amplitude;
 // subtractive = env only suppresses the global scalar). 0 = scalar-only.
-// ⚠ FOOTGUN — this define is DUPLICATED in PASS 6 (line ~1594) and the two MUST
-// match: no compile-time guard. A PASS5=0/PASS6=1 mismatch COMPILES but leaves
-// pump_mask_cell unwritten → PASS 6 reads a stale/garbage mask and the pump
-// misbehaves. (Found flipped to 0 twice this session — keep BOTH at the same value.)
-#define ENABLE_SPATIAL_PUMP 1
+// Single-sourced from the top-of-file cf_spatial_pump toggle (a file-scoped
+// param injected into every pass). PASS 6 aliases the SAME param, so the old
+// PASS5/PASS6 duplicate-define desync (compiled fine, read a garbage mask) is
+// structurally impossible now. Don't replace either alias with a literal.
+#define ENABLE_SPATIAL_PUMP cf_spatial_pump
 // drive_loc rectification/noise floor ONLY (§10): shrinks |d| symmetrically
 // before the signed p-mean so idle wobble contributes nothing. It no longer
 // touches the mask onset — the old smoothstep(LOW, HIGH, max(0, d - DEADZONE))
@@ -1451,12 +1552,14 @@ void hook() {
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
-//!DESC CelFlare v5.7
+//!DESC CelFlare v5.8
 
 // =============================================
-//  MAIN TUNING — start here
+//  MAIN TUNING — deep anchors. The supported user surface is the cf_* block
+//  at the top of the file; those knobs scale the values below (neutral at 1).
 // =============================================
-#define INTENSITY       1.0     // Global scaling — PEAK defines expansion directly at 1.0
+#define INTENSITY       cf_strength  // Global scaling knob (top of file). Also scales
+                                     // spec + pump at their apply sites, so 0 = SDR.
 #define KNEE            0.30    // Expansion onset — midtones below this stay near SDR
 
 
@@ -1579,19 +1682,20 @@ void hook() {
 //
 // EXAGGERATED defaults for first validation — the gain ceil dominates so the
 // effect is unmissable. Drop PUMP_STRENGTH to ~0.3-0.6 for the subtle target.
-#define ENABLE_LIGHT_PUMP   1
+#define ENABLE_LIGHT_PUMP   cf_light_pump   // top-of-file toggle
 #define PUMP_STRENGTH       1      // gain per unit pump_env at full pixel weight. At = CEIL the response is
                                    // PROPORTIONAL (peak reserved for full-detection events, not roof-pinned);
                                    // > CEIL slams moderate events to the roof (aggressive); subtle ≈ 0.4
 #define PUMP_Y_LOW          0.35   // per-pixel weight onset — low/broad so the whole bright region lifts (not a pinpoint)
 #define PUMP_GAIN_CEIL      1.5    // hard cap on the pump multiplier (safety against runaway expansion)
 #define PUMP_GROWTH_DAMP    0.6    // down-gate pump where growth-mode already lifts expansion (anti double-stack on fireballs)
-// Spatial pump. ⚠ MUST match the PASS 5 copy (line ~677) — no compile guard; a
-// mismatch leaves pump_mask_cell unwritten and PASS 6 reads a garbage mask.
+// Spatial pump. Single-sourced from the top-of-file cf_spatial_pump toggle —
+// PASS 5 aliases the SAME param, so the historical PASS5/PASS6 duplicate-define
+// desync (garbage mask) can no longer happen. Don't replace with a literal.
 // PASS 5 produces the per-cell brightening mask (pump_mask_cell[144], 16×9 —
 // the softened presentation of pump_env_cell); this pass bilinear-samples it.
 // 0 = scalar-only.
-#define ENABLE_SPATIAL_PUMP 1
+#define ENABLE_SPATIAL_PUMP cf_spatial_pump
 // Apply mode (PASS 6-only knob — PASS 5 needs no copy). 1 = ADDITIVE (v5.5
 // experiment, the HANDOFF §13 "additive door"): pump_local = mask ×
 // pump_cover_gate — the bilinear per-cell env IS the local pump amplitude, so
@@ -1623,7 +1727,7 @@ void hook() {
 // bright scenes stay controlled. No per-pixel Y_illum modulation
 // (caused edge halos where bright met dark instead of bloom-like
 // center-out falloff). Bypasses APL/dynamic intensity dampening.
-#define ENABLE_SPECULAR_BONUS 1
+#define ENABLE_SPECULAR_BONUS cf_spec_bonus   // top-of-file toggle
 // (ENABLE_SATURATED_SPEC is PASS 5-only now. The per-pixel V escape it once
 // gated HERE was field-rejected twice and DELETED 2026-07-02: restoring it
 // crushed saturated speculars — in a saturated region the peak channel clips
@@ -1733,7 +1837,7 @@ void hook() {
 // pixels in bright warm regions get compensated because the B-B shift is
 // a spatial perceptual effect. b_norm scaling (sine of hue from +a axis)
 // prevents overshoot: near-red pixels barely rotate, yellows rotate fully.
-#define ENABLE_WARM_SHIFT    1
+#define ENABLE_WARM_SHIFT    cf_warm_shift   // top-of-file toggle
 #define WS_HUE_COS          0.3420  // cos(70°) — center of warm range in Oklab
 #define WS_HUE_SIN          0.9397  // sin(70°)
 #define WS_HUE_POWER        1.2     // Hue window width (lower = wider, ~50° each side)
@@ -1742,7 +1846,7 @@ void hook() {
 #define WS_ILLUM_HIGH        0.80   // Y_illum above: full shift
 #define WS_CHROMA_FLOOR      0.015  // Skip near-neutrals (unstable hue)
 
-#define ENABLE_PALE_SKIN    1
+#define ENABLE_PALE_SKIN    cf_pale_skin   // top-of-file toggle
 #define ENABLE_PS_COMPRESS  0       // GLSL #if needs integer — toggle this when tuning PS_COMPRESS > 0
 #define PS_HUE_COS          0.7317  // cos(43°) — warm hue center for skin detection
 #define PS_HUE_SIN          0.6816  // sin(43°)
@@ -1757,10 +1861,10 @@ void hook() {
 // =============================================
 //  OUTPUT — encoding
 // =============================================
-#define REFERENCE_WHITE 116.0
+#define REFERENCE_WHITE cf_ref_white   // top-of-file knob — match hdr-reference-white
 #define PQ_FAST_APPROX  1
 #define EOTF_GAMMA      2.4
-#define ENABLE_GRAIN_STABLE 1
+#define ENABLE_GRAIN_STABLE cf_grain_stab   // top-of-file toggle
 // Early-exit luma bound. == KNEE is exact for the base curve: PASS 1 writes
 // RAW luma (alpha encode) below its GRAIN_EARLY_EXIT (0.30), so for
 // Y_gamma < KNEE the decision luma equals Y_gamma, t = 0, and expansion is
@@ -1771,14 +1875,16 @@ void hook() {
 // =============================================
 //  DEBUG
 // =============================================
-#define DEBUG_BYPASS         0
-#define DEBUG_SHOW_ILLUM     0   // Illumination field as grayscale
-#define DEBUG_SHOW_EXPANSION 0  // Expansion amount as heat map
-#define DEBUG_SHOW_DETAIL    0   // Spatial vs per-pixel: green=spatial, red=per-pixel fallback
-#define DEBUG_SHOW_SPECULAR  0   // Specular bonus: cyan = spec strength
-#define DEBUG_SHOW_PUMP      1   // Light pump: red = scene pump_env, green = per-pixel applied gain
-#define DEBUG_SHOW_WP        0   // Warm shift + pale skin
-#define DEBUG_SHOW_STATS     0   // avg_illum + bright_frac + contrast + log_avg bars
+// All views are driven by the single top-of-file cf_debug selector (0 = off),
+// so they're switchable from mpv.conf / a keybind without editing this file.
+#define DEBUG_BYPASS         (cf_debug == 1)
+#define DEBUG_SHOW_ILLUM     (cf_debug == 2)   // Illumination field as grayscale
+#define DEBUG_SHOW_EXPANSION (cf_debug == 3)   // Expansion amount as heat map
+#define DEBUG_SHOW_DETAIL    (cf_debug == 4)   // Spatial vs per-pixel: green=spatial, red=per-pixel fallback
+#define DEBUG_SHOW_SPECULAR  (cf_debug == 5)   // Specular bonus: cyan = spec strength
+#define DEBUG_SHOW_PUMP      (cf_debug == 6)   // Light pump: red = scene pump_env, green = per-pixel applied gain
+#define DEBUG_SHOW_WP        (cf_debug == 7)   // Warm shift + pale skin
+#define DEBUG_SHOW_STATS     (cf_debug == 8)   // avg_illum + bright_frac + contrast + log_avg bars
 
 // =============================================================================
 // HELPER FUNCTIONS
@@ -2051,7 +2157,12 @@ vec4 hook() {
     float peak_atten_eff = PEAK_ATTEN;
     #endif
     local_peak *= (1.0 - peak_atten_eff * bf);  // scene-level dampening on top
-    float local_gamma = mix(GAMMA_DARK, GAMMA_BRIGHT, spatial_t);
+    // cf_curve (top-of-file knob) scales the exponent: <1 broadens the ramp
+    // (gentle lift deeper into the highlights), >1 concentrates it against
+    // Y=1 (harsher pop). Peak is invariant (t=1 → pow=1 for any gamma). The
+    // max(1.0) floor preserves the monotonically-increasing-derivative
+    // invariant the curve comment above relies on — never let gamma < 1.
+    float local_gamma = max(1.0, mix(GAMMA_DARK, GAMMA_BRIGHT, spatial_t) * cf_curve);
 
     // Per-pixel expansion curve: linear ramp from KNEE, shaped by pow(gamma).
     // Ramp input = stabilized luma, plus the bounded saturated-brightness
@@ -2169,7 +2280,13 @@ vec4 hook() {
         float overshoot = max(spec_driver - 1.0, 0.0);
         float spec_ramp = min(pow(spec_t, spec_gamma) + overshoot * SPEC_OVERSHOOT_GAIN,
                               SPEC_RAMP_CEIL);
-        spec_strength = spec_peak * spec_ramp * smoothed_spec_signal;
+        // User knobs: cf_spec scales spec pop alone; cf_strength rides along
+        // so strength 0 is a true no-op (spec is additive — it wouldn't die
+        // with the base curve on its own). Scaling here (not on the PEAK
+        // defines) keeps the dark:bright ratio and the sat/emissive gates
+        // untouched at any knob setting.
+        spec_strength = spec_peak * spec_ramp * smoothed_spec_signal
+                      * cf_spec * cf_strength;
 
         // Saturation gate. Genuine specular is near-white. Bright colored
         // objects (red shirts under sun, blonde hair, saturated sky) shouldn't
@@ -2268,7 +2385,12 @@ vec4 hook() {
         // hard-clip and flatten the hot core. Gradation itself is never at risk
         // from the pump — it's a monotonic multiplier on expansion, so a
         // gradient stays a gradient; this only governs the absolute peak.
-        float pump_str = PUMP_STRENGTH * (1.0 - PUMP_GROWTH_DAMP * smoothed_growth_mode);
+        // User knobs: cf_pump scales the pump alone; cf_strength rides along
+        // so strength 0 is a true no-op (the pump multiplies expansion — at
+        // expansion 1.0 it would still lift without this). PUMP_GAIN_CEIL is
+        // NOT scaled: it's the safety roof, not a taste knob.
+        float pump_str = PUMP_STRENGTH * cf_pump * cf_strength
+                       * (1.0 - PUMP_GROWTH_DAMP * smoothed_growth_mode);
         pump_gain = min(pump_local * pump_str * pump_w, PUMP_GAIN_CEIL);
         expansion *= 1.0 + pump_gain;
     }

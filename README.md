@@ -23,7 +23,13 @@ The keybindings above use a Lua script for mpv. Ask an AI assistant to write you
 
 Uses a spatially-modulated expansion curve driven by an illumination field (bright-biased Gaussian blur of regional luminance). All pixels in a region share the same curve parameters — local contrast preserved by construction through multiplicative application. Frame-level scene metrics (APL, contrast, bright fraction) drive continuous adaptation rather than discrete scene-type classification. Highlights expand to ~200–310 nits with specular pop on top, while midtones stay close to the SDR grade. Works with anime and live-action content.
 
-Use INTENSITY for overall strength and KNEE for where expansion onsets. `SPEC_PEAK_DARK` and `SPEC_PEAK_BRIGHT` control the strength of specular pop in dark vs bright scenes. Other internals are at your own peril.
+All supported tuning lives in the **USER TUNING block at the top of the shader** — five sliders (`cf_ref_white`, `cf_strength`, `cf_curve`, `cf_spec`, `cf_pump`) and per-feature toggles, each documented in place. Edit the values there, or set them from `mpv.conf` without touching the file:
+
+```ini
+glsl-shader-opts=cf_ref_white=110,cf_strength=1.2,cf_spec=0.8
+```
+
+The sliders respond live during playback (bind `glsl-shader-opts` changes to keys for real-time A/B); toggles trigger a quick recompile. `cf_strength` scales the whole effect (0 = plain SDR), `cf_curve` sets how harshly expansion ramps into the highlights (peak brightness unchanged), `cf_spec` scales specular pop, `cf_pump` scales the light pump. Deeper internals are tunable in each pass — at your own peril.
 
 Features:
 - Spatially-modulated expansion curve (per-pixel, regionally adapted by an illumination field)
@@ -58,9 +64,10 @@ sub-hdr-peak=110
 image-subs-hdr-peak=110
 vf-append=format:gamma=pq:primaries=bt.2020 		#Has to be set
 glsl-shaders-append=~~/shaders/CelFlare.glsl
+glsl-shader-opts=cf_ref_white=110      # Same value as hdr-reference-white above
 ```
 
-Set `REFERENCE_WHITE` inside the shader to match your `hdr-reference-white` value.
+`cf_ref_white` must match `hdr-reference-white` (set it via `glsl-shader-opts` as above, or edit the default at the top of the shader).
 
 #### Finding your SDR white level
 
@@ -83,7 +90,7 @@ Source: [DISPLAYCONFIG_SDR_WHITE_LEVEL (Microsoft)](https://learn.microsoft.com/
 
 **Static SDR-to-HDR highlight expansion** — lightweight variant of CelFlare using the same processing pipeline (PQ BT.2020 output, bilateral grain stabilization, chroma-adaptive expansion, PQ-aware dither) but with fixed expansion parameters instead of scene-adaptive analysis.
 
-Uses the same mpv profile and `REFERENCE_WHITE` setup as CelFlare. Tune with `INTENSITY`, `CURVE_STEEPNESS`, `HIGHLIGHT_PEAK`, and `KNEE_END`.
+Uses the same mpv profile as CelFlare, but keeps the classic in-file setup: set `REFERENCE_WHITE` inside the shader to match `hdr-reference-white`. Tune with `INTENSITY`, `CURVE_STEEPNESS`, `HIGHLIGHT_PEAK`, and `KNEE_END`.
 
 ---
 

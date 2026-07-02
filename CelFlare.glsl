@@ -1,4 +1,4 @@
-// CelFlare v5.3 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.4 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Two-layer architecture:
@@ -313,9 +313,10 @@ void hook() {
 // PASS 2: COLOR DOWNSAMPLE (1/4 resolution)
 // =============================================================================
 // 4-tap bilinear from RAW pixel RGB (gamma-space), not grain-stabilized alpha.
-// The illumination field is blurred at sigma=25 on 1/4 res — grain is
-// destroyed by the Gaussian. RGB stored for clip diffusion; Y extracted
-// downstream via dot product.
+// The illumination field is blurred at sigma=20 on 1/4 res — grain is
+// destroyed by the Gaussian. RGB kept through the blur chain for the V-aware
+// pump driver (PASS 5 reads max(R,G,B) of the field); Y extracted downstream
+// via dot product.
 
 //!HOOK MAIN
 //!BIND HOOKED
@@ -439,9 +440,12 @@ vec4 hook() {
 // the entire 7-type scene classifier from v3.2), and scene cut detection.
 //
 // Compute layout: COMPUTE 16 9 dispatches one workgroup of 144 threads
-// against the 1×1 output. Each thread owns one grid cell — sampling, tier
-// classification, and per-cell scene-cut delta all happen in parallel. Thread
-// 0 performs the final 144-element reduction and writes SCENE_STATE.
+// against the 1×1 output. Each thread owns one grid cell — sampling and the
+// per-cell scene-cut delta happen in parallel (each lane also writes its own
+// prev_illum slot). Thread 0 performs the final 144-element reduction (tier
+// counts derived there from the raw per-lane values) and owns every other
+// SCENE_STATE write, including the per-cell pump lanes — single writer, one
+// barrier total in this pass.
 //
 // Scene cut: the previous prev_illum[16] separate 4×4 grid was
 // redundant — the 16×9 stats grid already covers the frame at higher density.
@@ -510,12 +514,16 @@ vec4 hook() {
 // path's sparse_bonus/tier_gate, not the bright-scene recovery. A genuinely
 // near-white V>0.97 cell always passes (sat 0.30 is far above specular
 // whites; the carpet's qualifying cells measured sat 0.40–0.88).
-#define BRIGHT_SPEC_SAT_MAX   0.30  // s_bright_spec counts only cells with sat below this
+#define BRIGHT_SPEC_SAT_MAX   0.30  // bright-spec tier counts only cells with sat below this
 
 // Saturated-channel spec detection. Count pixels using V = max(R,G,B) rather
 // than Y so pure saturated primaries (red LED Y=0.21 but V=1.0) qualify as
 // specular tier. V >= Y always, so neutrals behave identically. Scene-level
 // gating (tier_ratio, shutoff) still suppresses red-dominated scenes.
+// PASS 5-ONLY since 2026-07-02: the PASS 6 per-pixel V escape this used to
+// pair with was field-rejected (crushed saturated speculars) and deleted —
+// see the PASS 6 spec block. Detection stays on V because every scene-gate
+// tuning since f453fc4 was validated against V counting.
 #define ENABLE_SATURATED_SPEC 1
 
 // Velocity-adaptive temporal alpha. Stable scenes get heavy smoothing (SLOW),
@@ -612,7 +620,11 @@ vec4 hook() {
 // aggregate would re-open the crossing-trail class — KEEP IT SIGNED.
 // Fade-to-white: all cells rise coherently → drive_loc ≈ global drive →
 // the contrast guard mutes it as before. Idle wobble: |0.005|^4 ≈ 6e-10,
-// annihilated. pump_gate takes max(drive, drive_loc). RELEASE: a purely-
+// annihilated. pump_gate takes max(drive, drive_on) — drive_on is drive_loc
+// with rises passed through the ESTABLISHED-LEVEL GATE (see the
+// PUMP_ESTABLISH_MARGIN block): a rise merely converging to the level its
+// neighbourhood already holds (occluder retreat / reveal) contributes
+// nothing; falls always count, so a moving light self-cancels. RELEASE: a purely-
 // local event never moves the global lanes, so without a local release its
 // env would linger ~29s behind closed masks and any later mask opening
 // (incl. an occluder wake) would inherit stale amplitude. When drive_loc<0
@@ -629,8 +641,11 @@ vec4 hook() {
 // than before. Not a new artifact class (photometrically = tunnel exit, a
 // designed target: the frame genuinely brightens and the pump eases in and
 // out) — judge on real content. If it reads wrong, lower P toward 2
-// (drive_loc needs bigger events); at p=1 both statistics collapse to the
-// frame mean = v5.2 behavior. The mask still can't ADD under any p.
+// (drive_loc needs bigger events). p=1 collapses the p-statistics to means,
+// but the ESTABLISHED-LEVEL GATE still removes non-fresh rises from the
+// onset sum at ANY p — the exact "p=1 == v5.2 frame mean" identity now
+// holds only for the RELEASE path (ungated). The mask still can't ADD
+// under any p.
 #define PUMP_DRIVE_P        4.0    // highlight weighting of BOTH drive statistics. A/B 2.0-6.0
 // Spatial pump (SUBTRACTIVE): per-cell band-pass on the COARSE σ80 CELFLARE_ILLUM V
 // (sampled at the cell center — the SAME field the scalar means over the frame) →
@@ -642,7 +657,12 @@ vec4 hook() {
 // pump_env_cell unwritten → PASS 6 reads a stale/garbage mask and the pump
 // misbehaves. (Found flipped to 0 twice this session — keep BOTH at the same value.)
 #define ENABLE_SPATIAL_PUMP 1
-#define PUMP_CELL_DEADZONE  0.01   // per-cell drive dead-zone: idle-wobble cells read true zero (anti competing-highlight leak)
+// drive_loc rectification/noise floor ONLY (§10): shrinks |d| symmetrically
+// before the signed p-mean so idle wobble contributes nothing. It no longer
+// touches the mask onset — the old smoothstep(LOW, HIGH, max(0, d - DEADZONE))
+// was a pure edge shift, folded into PUMP_CELL_DRIVE_LOW/HIGH below (+0.01
+// each), so this knob and the mask thresholds now tune independently.
+#define PUMP_CELL_DEADZONE  0.01
 // Per-cell drive thresholds (independent of the scalar's PUMP_DRIVE_LOW/HIGH). The
 // cell driver is the σ80 V AT the cell vs the scalar's frame p-norm, so a
 // LOCALIZED event swings its own cell far more than it moves any frame stat → the
@@ -650,9 +670,44 @@ vec4 hook() {
 // scalar's. LOW sits a touch above the scalar onset to reject σ80 neighbour-bleed
 // (a rising event bleeding ~half-amplitude into an adjacent cell) and idle wobble;
 // HIGH is where a genuine in-cell brightening saturates. Retuned for σ80 (the old
-// 0.02/0.18 were for the deleted sharp MID driver). A/B LOW 0.03-0.05, HIGH 0.10-0.16.
-#define PUMP_CELL_DRIVE_LOW  0.04   // per-cell band-pass onset (mask starts opening — region is brightening)
-#define PUMP_CELL_DRIVE_HIGH 0.14   // per-cell saturation (mask fully open — region clearly brightening)
+// 0.02/0.18 were for the deleted sharp MID driver). Values absorb the former
+// 0.01 dead-zone shift (0.04/0.14 + 0.01 — same mask response, deadzone-free).
+// A/B LOW 0.04-0.06, HIGH 0.11-0.17.
+#define PUMP_CELL_DRIVE_LOW  0.05   // per-cell band-pass onset (mask starts opening — region is brightening)
+#define PUMP_CELL_DRIVE_HIGH 0.15   // per-cell saturation (mask fully open — region clearly brightening)
+// ESTABLISHED-LEVEL GATE (2026-07-02, from dissecting the killer reveal clip —
+// a BD anime OP, black silhouette shrinking/drifting over a bright background;
+// the scene that originally sank the additive spatial pump).
+// A rising cell counts as FRESH LIGHT only once its fast lane exceeds the
+// highest ESTABLISHED (slow-lane) level among its ring-2 neighbours by this
+// margin. Physical meaning: a rise CONVERGING to a level the neighbourhood
+// already holds is brightness EXTENDING — an occluder retreating / pan /
+// shrinking silhouette re-exposing background — not a light event; only a
+// rise EXCEEDING the local established ceiling is new light. Non-fresh rises
+// contribute NOTHING to the drive_loc ONSET sum (falls still count, so a
+// translating light self-cancels), and (PUMP_MASK_ESTABLISH) may not OPEN
+// the cell mask. RELEASE keeps the UNGATED sum — balanced crossings still
+// cancel (no false release), dying fires still release.
+// Offline-validated on the killer clip (16x9 cell replica of this pass):
+// drive_loc onset 0.15→0.000 across the 3 s reveal (was env 0.80 for ~70
+// frames = the artifact), mask-open cell-frames 3016→75 (frame-edge cells).
+// Target events preserved: tunnel exit (uniform rise: slow lags fast
+// everywhere → nothing is under a neighbour's ceiling; global drive owns it
+// regardless), dark-scene fires (neighbourhood slow is dark), SPREADING
+// fires (ignition outruns the 25-frame slow-lane establishment), and the
+// σ80 bleed halo around a fire stops opening its own mask (tighter
+// localization). Measured trade: a fire igniting within 2 cells of an
+// EQUALLY-bright standing region loses drive_loc onset until it exceeds
+// that region's level (synthetic: 0.232→0.019) — bounded under-pump.
+// MARGIN: 0.02 leaks on the killer clip; 0.03-0.05 fully suppress. Raise
+// toward 0.05 if any reveal still breathes; the ring is fixed at 2 (matches
+// the σ80 edge smear — a wider ring only widens the standing-mass trade).
+#define PUMP_ESTABLISH_MARGIN 0.03
+// Mask half of the gate (A/B lever): 1 = a cell mask may only OPEN on a
+// fresh rise (held env still max-holds and releases normally — closing is
+// never gated). 0 = mask opens on any rise (pre-gate behavior); the scalar
+// onset gate above stays active either way.
+#define PUMP_MASK_ESTABLISH 1
 // SUBTRACTIVE model (2026-07-02): the per-cell env is a [0,1] SUPPRESSOR — PASS 6
 // multiplies the global scalar pump by it, so spatial can only REMOVE pump from
 // non-brightening regions, never ADD it. That structurally kills the whole reveal/
@@ -694,20 +749,26 @@ float get_luma(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
 
-// Per-lane scratch for the cross-lane reduction. 8 arrays × 144 elements ×
-// 4 bytes (mix of float and uint, all 32-bit) = 4608 bytes — well under any
-// GPU's 16-32 KB shared-memory floor.
+// Per-lane scratch for the cross-lane reduction. 7 arrays × 144 elements ×
+// 4 bytes (all 32-bit) = 4032 bytes — well under any GPU's 16-32 KB
+// shared-memory floor. The tier counters (bright/spec/high/bright-spec) are
+// NOT stored as per-lane booleans: the reducer re-derives them from the raw
+// values below (bit-identical compares on the same floats), keeping each
+// threshold single-sourced next to the count it feeds.
 shared float s_illum[144];
 shared float s_log_luma[144];
 shared uint  s_valid[144];
-shared uint  s_bright[144];
-shared uint  s_spec[144];
-shared uint  s_high[144];
 shared uint  s_change[144];
-shared uint  s_bright_spec[144];    // BRIGHT_SPEC_THRESH=0.97 count for bright-scene recovery
+shared float s_intensity[144];      // spec/highlight tier source: V or Y per ENABLE_SATURATED_SPEC
+shared float s_sat[144];            // near-white fence input for the bright-scene recovery counter
 shared float s_illum_v[144];        // max(R,G,B) of the illum field — V-aware pump driver/guard
 #if ENABLE_SPATIAL_PUMP
-shared uint  s_pump_reset;          // thread-0 publishes per-cell pump reset (cut/lockout/frame0)
+// Thread-0-only scratch (written and read after the barrier by thread 0
+// exclusively — no synchronization needed): full pre-update snapshot of the
+// cell lanes for the established-level neighbour test, which must see every
+// cell's PRE-update state while the fused loop updates them in place.
+shared float s_pump_snap_f[144];
+shared float s_pump_snap_s[144];
 #endif
 
 void hook() {
@@ -727,14 +788,8 @@ void hook() {
     vec3  rgb_src = HOOKED_tex(spos).rgb;
     float Y_src   = get_luma(rgb_src);
 
-    #if ENABLE_SATURATED_SPEC
-    float intensity_src = max(max(rgb_src.r, rgb_src.g), rgb_src.b);
-    #else
-    float intensity_src = Y_src;
-    #endif
-
     bool valid = Y_src > 0.001;
-    // Near-white fence for the bright-scene recovery counter (see
+    // Near-white fence input for the bright-scene recovery counter (see
     // BRIGHT_SPEC_SAT_MAX). Saturation is computed from V/min of rgb_src
     // regardless of ENABLE_SATURATED_SPEC (under !SAT_SPEC the gate is a
     // structural no-op anyway: Y_src > 0.97 forces near-neutral RGB).
@@ -742,15 +797,17 @@ void hook() {
     float sat_src = (v_src > 1e-6)
         ? (v_src - min(min(rgb_src.r, rgb_src.g), rgb_src.b)) / v_src
         : 0.0;
-    s_illum[lid]    = Y_ill;
-    s_illum_v[lid]  = V_ill;
-    s_log_luma[lid] = valid ? log(max(Y_src, 1e-6)) : 0.0;
-    s_valid[lid]    = valid ? 1u : 0u;
-    s_bright[lid]   = (Y_ill > BRIGHT_STAT_THRESH)   ? 1u : 0u;
-    s_spec[lid]        = (intensity_src > SPECULAR_THRESH) ? 1u : 0u;
-    s_high[lid]        = (intensity_src > HIGHLIGHT_THRESH) ? 1u : 0u;
-    s_bright_spec[lid] = (intensity_src > BRIGHT_SPEC_THRESH &&
-                          sat_src < BRIGHT_SPEC_SAT_MAX) ? 1u : 0u;
+    #if ENABLE_SATURATED_SPEC
+    float intensity_src = v_src;
+    #else
+    float intensity_src = Y_src;
+    #endif
+    s_illum[lid]     = Y_ill;
+    s_illum_v[lid]   = V_ill;
+    s_log_luma[lid]  = valid ? log(max(Y_src, 1e-6)) : 0.0;
+    s_valid[lid]     = valid ? 1u : 0u;
+    s_intensity[lid] = intensity_src;
+    s_sat[lid]       = sat_src;
 
     // Scene-cut delta. Each lane reads + writes its own prev_illum slot —
     // no cross-lane SSBO traffic, so race-free even though the buffer is
@@ -796,20 +853,26 @@ void hook() {
             illum_v_max        = max(illum_v_max, vi);
             log_luma_sum      += s_log_luma[i];
             valid_luma        += s_valid[i];
-            bright_count      += s_bright[i];
-            spec_count        += s_spec[i];
-            high_count        += s_high[i];
             change_count      += s_change[i];
-            bright_spec_count += s_bright_spec[i];
+            // Tier counts, re-derived from the raw per-lane values (identical
+            // compares on the same floats the lanes sampled — single-sourced
+            // thresholds next to the counts they feed).
+            float ii           = s_intensity[i];
+            bright_count      += (yi > BRIGHT_STAT_THRESH)   ? 1u : 0u;
+            spec_count        += (ii > SPECULAR_THRESH)      ? 1u : 0u;
+            high_count        += (ii > HIGHLIGHT_THRESH)     ? 1u : 0u;
+            bright_spec_count += (ii > BRIGHT_SPEC_THRESH &&
+                                  s_sat[i] < BRIGHT_SPEC_SAT_MAX) ? 1u : 0u;
         }
 
         const float N_SAMPLES = 144.0;
         float avg_illum   = illum_sum / N_SAMPLES;
         float bright_frac = float(bright_count) / N_SAMPLES;
 
-        // Contrast: dynamic range from illumination field (stable, noise-free)
+        // Contrast: dynamic range from illumination field (stable, noise-free).
+        // max/min >= 1 by construction: both are running extrema of one sample set.
         float contrast = (illum_min > 0.001)
-            ? log2(max(illum_max / illum_min, 1.0))
+            ? log2(illum_max / illum_min)
             : 0.0;
 
         // V-aware pump signals on max(R,G,B) of the illum field, so saturated
@@ -822,7 +885,7 @@ void hook() {
         // luma axis.
         float pnorm_illum_v = pow(illum_v_psum / N_SAMPLES, 1.0 / PUMP_DRIVE_P);
         float contrast_v    = (illum_v_min > 0.001)
-            ? log2(max(illum_v_max / illum_v_min, 1.0))
+            ? log2(illum_v_max / illum_v_min)
             : 0.0;
 
         // Log-average: perceptual brightness key from source pixels
@@ -877,10 +940,13 @@ void hook() {
         // SCENE_CUT_PCT (0.50) interpretation stays "majority of cells moved";
         // denser sampling makes detection more robust against localized motion
         // that the old 4×4 grid could fully miss between cell centers.
+        // The lockout counter alone encodes the whole cut-window state: a cut
+        // sets it to LOCKOUT_FRAMES, so "cut this frame" == lockout at its max
+        // and every consumer below keys off lockout > 0 (needs LOCKOUT_FRAMES > 0).
         float change_pct  = float(change_count) / N_SAMPLES;
         scene_cut_lockout = max(scene_cut_lockout - 1.0, 0.0);
-        bool scene_cut    = (change_pct > SCENE_CUT_PCT) && (scene_cut_lockout <= 0.0);
-        if (scene_cut) scene_cut_lockout = LOCKOUT_FRAMES;
+        if (change_pct > SCENE_CUT_PCT && scene_cut_lockout <= 0.0)
+            scene_cut_lockout = LOCKOUT_FRAMES;
 
         // ---- Velocity-driven adaptation ----
         // Signed velocities — instantaneous minus previous smoothed (the EMA
@@ -903,16 +969,13 @@ void hook() {
         // Post-cut alpha decays FAST -> MID across the lockout window. Lock-on
         // converges in 1-2 frames at 0.9; holding 0.9 for all 6 frames let a
         // single-frame event inside the window (muzzle flash, strobe, white
-        // impact frame) couple ~1:1 into every EMA as a visible pulse.
-        float alpha;
-        if (scene_cut) {
-            alpha = TEMPORAL_ALPHA_FAST;
-        } else if (scene_cut_lockout > 0.0) {
-            alpha = mix(TEMPORAL_ALPHA_MID, TEMPORAL_ALPHA_FAST,
-                        scene_cut_lockout / LOCKOUT_FRAMES);
-        } else {
-            alpha = base_alpha;
-        }
+        // impact frame) couple ~1:1 into every EMA as a visible pulse. On the
+        // cut frame itself lockout/LOCKOUT_FRAMES == 1, so the mix lands on
+        // TEMPORAL_ALPHA_FAST exactly — no dedicated cut branch needed.
+        float alpha = (scene_cut_lockout > 0.0)
+            ? mix(TEMPORAL_ALPHA_MID, TEMPORAL_ALPHA_FAST,
+                  scene_cut_lockout / LOCKOUT_FRAMES)
+            : base_alpha;
 
         // Growth-mode discriminator. Fires when:
         //   - spec_vel rises faster than bright_vel (hot core saturates first
@@ -938,8 +1001,12 @@ void hook() {
         // on cuts because bright_vel/spec_vel against a stale-scene baseline
         // would false-positive growth_mode for one frame; lockout already
         // provides fast adaptation via TEMPORAL_ALPHA_FAST.
-        bool gm_reset = (frame == 0) || scene_cut || (scene_cut_lockout > 0.0);
-        smoothed_growth_mode = gm_reset
+        // Transient reset window: frame 0 or anywhere inside the cut lockout
+        // (the cut frame included — it just set lockout to its max). ONE bool
+        // serves growth-mode, the scalar pump, and the per-cell pump: they
+        // must reset on the SAME frames or their baselines desync.
+        bool transient_reset = (frame == 0) || (scene_cut_lockout > 0.0);
+        smoothed_growth_mode = transient_reset
             ? 0.0
             : mix(smoothed_growth_mode, growth_mode_instant, alpha);
 
@@ -958,30 +1025,70 @@ void hook() {
         // so a cut transient or stale baseline can't manufacture drive (a
         // hard cut to a brighter scene must NOT pump). Self-contained — does
         // not touch the smoothed_* init block.
-        bool pump_reset = (frame == 0) || scene_cut || (scene_cut_lockout > 0.0);
-        if (pump_reset) {
+        if (transient_reset) {
+            #if ENABLE_SPATIAL_PUMP
+            // Cell lanes re-pin coherently with the scalar lanes so a cut
+            // transient can't manufacture per-cell drive either.
+            for (uint i = 0u; i < 144u; i++) {
+                float v = s_illum_v[i];
+                pump_fast_cell[i] = v;
+                pump_slow_cell[i] = v;
+                pump_env_cell[i]  = 0.0;
+            }
+            #endif
             pump_fast = pnorm_illum_v;
             pump_slow = pnorm_illum_v;
             pump_env  = 0.0;
         } else {
-            pump_fast = mix(pump_fast, pnorm_illum_v, PUMP_ALPHA_FAST);
-            pump_slow = mix(pump_slow, pnorm_illum_v, PUMP_ALPHA_SLOW);
-            float drive      = pump_fast - pump_slow;                    // SIGNED velocity
-            float drive_eff  = max(0.0, drive);
+            // Locals: the SSBO is coherent, so re-reading a lane just written
+            // is a real memory round-trip — compute once, store once.
+            float pf = mix(pump_fast, pnorm_illum_v, PUMP_ALPHA_FAST);
+            float ps = mix(pump_slow, pnorm_illum_v, PUMP_ALPHA_SLOW);
+            pump_fast = pf;
+            pump_slow = ps;
+            float drive      = pf - ps;                                  // SIGNED velocity
+            // Onset candidate — no max(0,·) clamp: smoothstep's onset edge
+            // (PUMP_DRIVE_LOW > 0) already maps any x <= 0 to exactly 0.
+            float drive_eff  = drive;
             #if ENABLE_SPATIAL_PUMP
-            // Localized onset: signed p-mean AGGREGATE of the per-cell drives
-            // (see PUMP_DRIVE_P block). Reads the cell lanes' PREVIOUS-frame
-            // values (this reducer runs before the cell block updates them —
-            // 1 frame of lag on 8/25-frame EMAs, immaterial). Deadzone shrinks
-            // |d| symmetrically (both signs), so cancellation is preserved.
-            // Sign is the reveal safety: rise+fall of a crossing occluder/pan
-            // cancels; only net-asymmetric brightening survives. ONSET ONLY —
-            // release stays on the global lanes + per-cell mask closure.
-            float loc_sum = 0.0;
+            // -------- per-cell band-pass (SUBTRACTIVE mask) + localized onset --------
+            // Two serial thread-0 loops do all of the spatial machinery —
+            // thread-0 owns every pump SSBO write, so there is no second
+            // barrier, no broadcast flag, and no cross-phase ordering to
+            // audit (the split-phase version needed all three):
+            //  (1) drive_loc terms, read from each cell's PRE-update lanes —
+            //      the same previous-frame timing the split design had (1
+            //      frame of lag on 8/25-frame EMAs, immaterial). Signed
+            //      p-mean AGGREGATE of the per-cell drives (see PUMP_DRIVE_P
+            //      block). Deadzone shrinks |d| symmetrically (both signs),
+            //      so cancellation is preserved. Sign is the reveal safety:
+            //      rise+fall of a crossing occluder/pan cancels; only
+            //      net-asymmetric brightening survives. ONSET ONLY — release
+            //      stays on the global lanes + per-cell mask closure.
+            //  (2) cell EMA update + mask env: pump_env_cell[144] = per-cell
+            //      "is this region BRIGHTENING" ∈[0,1]; PASS 6 bilinear-
+            //      upsamples it and MULTIPLIES the scalar pump by it.
+            //      SUBTRACTIVE: it can only SUPPRESS the scalar in non-
+            //      brightening regions, never ADD pump — a reveal / pan /
+            //      occluder-wake can't manufacture pump (no global event ⇒
+            //      scalar ~0 ⇒ product ~0 for any local rise). Driver =
+            //      coarse σ80 CELFLARE_ILLUM V at the cell center
+            //      (s_illum_v, stored by the lanes before the barrier) — the
+            //      SAME field the scalar p-norms over the frame. V = max
+            //      channel → colored blooms register.
+            // Loop 1: full pre-update snapshot + the UNGATED aggregates. The
+            // snapshot (thread-0 scratch, see decl) is required because the
+            // established-level test in loop 2 compares each riser against
+            // its neighbours' PRE-update slow lanes while the lanes are being
+            // rewritten in place. loc_sum (ungated) is the RELEASE statistic:
+            // balanced crossings cancel here, dying fires go net-negative.
+            float loc_sum = 0.0, loc_on_sum = 0.0;
             float fall_w = 0.0, fall_ratio = 0.0;
             for (uint i = 0u; i < 144u; i++) {
                 float cf = pump_fast_cell[i];
                 float cs = pump_slow_cell[i];
+                s_pump_snap_f[i] = cf;
+                s_pump_snap_s[i] = cs;
                 float di = cf - cs;
                 float m  = max(abs(di) - PUMP_CELL_DEADZONE, 0.0);
                 float w  = pow(m, PUMP_DRIVE_P);
@@ -993,8 +1100,62 @@ void hook() {
                     fall_ratio += w * (cf / cs);
                 }
             }
+            // Loop 2: established-level gate → gated ONSET aggregate, then the
+            // cell EMA update + mask env. A rise is FRESH only if the cell's
+            // pre-update fast exceeds every ring-2 neighbour's pre-update slow
+            // by PUMP_ESTABLISH_MARGIN (see knob block). Falls always enter
+            // the onset sum, so a light MOVING across cells self-cancels
+            // (fresh rise at the new position vs fall at the old); only
+            // NET-NEW light onsets.
+            for (uint i = 0u; i < 144u; i++) {
+                float cf = s_pump_snap_f[i];
+                float cs = s_pump_snap_s[i];
+                float di = cf - cs;
+                float m  = max(abs(di) - PUMP_CELL_DEADZONE, 0.0);
+                float w  = pow(m, PUMP_DRIVE_P);
+                bool fresh = false;
+                if (di > 0.0) {
+                    float nb_est = 0.0;
+                    int iy = int(i) / 16, ix = int(i) % 16;
+                    for (int ny = max(iy - 2, 0); ny <= min(iy + 2, 8); ny++)
+                        for (int nx = max(ix - 2, 0); nx <= min(ix + 2, 15); nx++)
+                            if (ny != iy || nx != ix)
+                                nb_est = max(nb_est, s_pump_snap_s[ny * 16 + nx]);
+                    fresh = cf - PUMP_ESTABLISH_MARGIN > nb_est;
+                    if (fresh) loc_on_sum += w;
+                } else {
+                    loc_on_sum -= w;    // sign(di)*w with di <= 0
+                }
+                // Cell EMA update + mask env (post-update d, as before).
+                float v = s_illum_v[i];
+                float f = mix(cf, v, PUMP_ALPHA_FAST);
+                float s = mix(cs, v, PUMP_ALPHA_SLOW);
+                pump_fast_cell[i] = f;
+                pump_slow_cell[i] = s;
+                float d = f - s;
+                // Idle-wobble cells read true zero: any d below the onset edge
+                // maps to exactly 0 (the former dead-zone shift is folded into
+                // PUMP_CELL_DRIVE_LOW/HIGH — see the knob block).
+                float a = smoothstep(PUMP_CELL_DRIVE_LOW, PUMP_CELL_DRIVE_HIGH, d);
+                #if PUMP_MASK_ESTABLISH
+                // Mask half of the gate: only a FRESH rise may OPEN the mask.
+                // An already-open cell max-holds and releases exactly as
+                // before — closing is never gated.
+                if (!fresh) a = 0.0;
+                #endif
+                // Velocity-matched release: the negative half of the band-pass
+                // is the region's own fall, so the mask eases out in lockstep
+                // (a suppressor that re-engages as a region stops brightening).
+                // Max-held + adapt floor.
+                float r = (d < 0.0 && s > 1e-3) ? (f / s) : 1.0;
+                pump_env_cell[i] = max(pump_env_cell[i] * r * PUMP_ADAPT_FLOOR, a);
+            }
+            // ONSET takes the gated aggregate; the release path below keeps
+            // the ungated drive_loc (sign + fall ratio), so reveal
+            // suppression can never manufacture a release.
             float drive_loc = sign(loc_sum) * pow(abs(loc_sum) / N_SAMPLES, 1.0 / PUMP_DRIVE_P);
-            drive_eff = max(drive_eff, drive_loc);
+            float drive_on  = sign(loc_on_sum) * pow(abs(loc_on_sum) / N_SAMPLES, 1.0 / PUMP_DRIVE_P);
+            drive_eff = max(drive_eff, drive_on);
             #endif
             float pump_gate  = smoothstep(PUMP_DRIVE_LOW, PUMP_DRIVE_HIGH, drive_eff);
             // Contrast-retention fade guard on the SAME V axis as the driver
@@ -1011,7 +1172,7 @@ void hook() {
             // (this is what made a held light's old timed release look like an
             // animated dim). PUMP_ADAPT_FLOOR is the only clock left: it relaxes
             // an indefinitely-held light imperceptibly slowly (eye-adapting).
-            float rel = (drive < 0.0 && pump_slow > 1e-3) ? (pump_fast / pump_slow) : 1.0;
+            float rel = (drive < 0.0 && ps > 1e-3) ? (pf / ps) : 1.0;
             #if ENABLE_SPATIAL_PUMP
             // Local release — velocity-matched on the LOCAL axis. When the net
             // local drive is a fall (a dying fire), release at the falling
@@ -1046,58 +1207,15 @@ void hook() {
             smoothed_log_avg      = mix(smoothed_log_avg, log_avg, alpha);
         }
 
-        // Publish the per-cell pump reset flag (cut / lockout / frame 0) so all
-        // lanes reset their cell band-pass coherently in the spatial block below.
-        #if ENABLE_SPATIAL_PUMP
-        s_pump_reset = pump_reset ? 1u : 0u;
-        #endif
-
         // Dummy write satisfies the 1×1 SAVE target; SSBO above is the
         // real product. Other lanes are out-of-bounds for the image and
         // would be no-ops, but the guard avoids 143 redundant store ops.
         imageStore(out_image, ivec2(0), vec4(0));
     }
-
-    // -------- per-cell pump band-pass (SUBTRACTIVE spatial mask) --------
-    // All 144 lanes; each owns one 16×9 grid cell and touches only its own SSBO
-    // slot (race-free). The barrier gates s_pump_reset visibility (published by
-    // thread-0). Emits pump_env_cell[144] = per-cell "is this region BRIGHTENING"
-    // ∈[0,1]; PASS 6 bilinear-upsamples it and MULTIPLIES the global scalar pump by
-    // it. Spatial is SUBTRACTIVE: it can only SUPPRESS the scalar in non-brightening
-    // regions — it can never ADD pump. So a re-exposed background (a reveal), a pan,
-    // an occluder wake, etc. can never MANUFACTURE pump: if the scene isn't globally
-    // brightening the scalar is ~0 and the product is ~0, regardless of any local
-    // rise. This is why the whole additive-mask machinery (novelty gate, habitual-V
-    // memory, established-exemption, localized-confidence gate, motion crossfade) is
-    // GONE — it only existed to stop an additive mask from over-firing on reveals.
-    //
-    // Driver = coarse σ80 CELFLARE_ILLUM V at the cell center (V_ill, sampled above)
-    // — the SAME field the scalar means over the frame, read per-cell. A cell that is
-    // rising builds env (mask→1, keeps the scalar); a static/darkening cell decays to
-    // 0 (mask→0, suppresses the scalar). V=max channel → colored blooms register.
-    #if ENABLE_SPATIAL_PUMP
-    barrier();
-    {
-        float v = V_ill;
-        if (s_pump_reset != 0u) {
-            pump_fast_cell[lid] = v;
-            pump_slow_cell[lid] = v;
-            pump_env_cell[lid]  = 0.0;
-        } else {
-            pump_fast_cell[lid] = mix(pump_fast_cell[lid], v, PUMP_ALPHA_FAST);
-            pump_slow_cell[lid] = mix(pump_slow_cell[lid], v, PUMP_ALPHA_SLOW);
-            float d = pump_fast_cell[lid] - pump_slow_cell[lid];
-            // Dead-zone: idle-wobble cells (drive under the zone) read true zero.
-            float a = smoothstep(PUMP_CELL_DRIVE_LOW, PUMP_CELL_DRIVE_HIGH, max(0.0, d - PUMP_CELL_DEADZONE));
-            // Velocity-matched release: the negative half of the band-pass is the
-            // region's own fall, so the mask eases out in lockstep (a suppressor that
-            // re-engages as a region stops brightening). Max-held + adapt floor.
-            float r = (d < 0.0 && pump_slow_cell[lid] > 1e-3)
-                    ? (pump_fast_cell[lid] / pump_slow_cell[lid]) : 1.0;
-            pump_env_cell[lid] = max(pump_env_cell[lid] * r * PUMP_ADAPT_FLOOR, a);
-        }
-    }
-    #endif
+    // (The per-cell pump band-pass used to run here as a second phase on all
+    // 144 lanes, behind a barrier + an s_pump_reset broadcast flag. Folded
+    // into the thread-0 reducer 2026-07-02 — see the SUBTRACTIVE mask block
+    // there. Same math, single writer, one barrier total in this pass.)
 }
 
 // =============================================================================
@@ -1121,7 +1239,7 @@ void hook() {
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
-//!DESC CelFlare v5.3
+//!DESC CelFlare v5.4
 
 // =============================================
 //  MAIN TUNING — start here
@@ -1164,20 +1282,23 @@ void hook() {
 // Perception agrees with V, not Y (Helmholtz–Kohlrausch: saturated colors
 // look brighter than their luminance), and the artist placed the accent at
 // the top of its channel range — so saturated pixels get a BOUNDED credit
-// from stabilized Y toward stabilized V on the ramp input. This is the base-
-// curve sibling of the spec path's v_drive escape, at a fraction of the
-// noise exposure: the base ramp's slope is ~10x gentler than the spec ramp
-// and the credit halves the coupling, so WEB-grade 4:2:0 chroma noise in V
-// works out to ~1-2 nits of wobble (vs the full-ramp speckle that killed
-// raw-V spec drivers). Near-neutrals are bit-identical (sat gate = 0).
+// from stabilized Y toward stabilized V on the ramp input. This survives
+// where the spec path's V escape (v_drive — field-rejected twice, deleted
+// 2026-07-02, see the spec block) did not, because its exposure is a
+// fraction of that one's: the base ramp's slope is ~10x gentler than the
+// spec ramp and the credit halves the coupling, so WEB-grade 4:2:0 chroma
+// noise in V works out to ~1-2 nits of wobble (vs the full-ramp speckle and
+// gradient crush that killed V spec drivers), and the bounded mix cannot go
+// flat where V clips. Near-neutrals are bit-identical (sat gate = 0).
 // The Y floor fade keeps the EARLY_EXIT_GAMMA boundary conservative-EXACT:
 // at/below BASE_V_Y_LO the credit is 0, so any pixel the early exit skips
 // would have computed expansion = 1.0 anyway — no contour at the boundary.
-// Consequence: dim saturated emissives (red LED Y~0.21) get no BASE credit;
-// that regime belongs to the spec escape, which already covers V >= 0.88.
+// Consequence: dim saturated emissives (red LED Y~0.21) get no BASE credit
+// and — with the spec V escape gone — no per-pixel V path at all: they keep
+// their SDR level BY DESIGN (the twice-field-rejected trade).
 #define ENABLE_BASE_V_CREDIT 1
 #define BASE_V_CREDIT        0.75   // fraction of the Y->V gap credited at full gate
-#define BASE_V_SAT_LO        0.10   // sat_gamma gate (same band as the spec v_drive)
+#define BASE_V_SAT_LO        0.10   // sat_gamma gate (the band the deleted spec v_drive used)
 #define BASE_V_SAT_HI        0.30
 #define BASE_V_Y_LO          0.32   // luma floor fade-in: 0 at/below the early exit (KNEE)
 #define BASE_V_Y_HI          0.48
@@ -1279,18 +1400,20 @@ void hook() {
 // (caused edge halos where bright met dark instead of bloom-like
 // center-out falloff). Bypasses APL/dynamic intensity dampening.
 #define ENABLE_SPECULAR_BONUS 1
-// Saturated-channel spec drive — mirrors PASS 5's tier counting on
-// V = max(R,G,B), so saturated primaries (red LED Y=0.21, V=1.0) qualify
-// for the ramp and escape the Y-based early exit.
-// NOTE: each HOOK block (pass) is a SEPARATE compilation unit — this define
-// must exist HERE. The PASS 5 copy is not visible to this pass, and an
-// undefined identifier inside #if silently evaluates to 0: that is exactly
-// how this path was compiled out of the expansion pass from v4.7 through
-// v5.0 while the detection half (PASS 5) kept running. If you add an
-// #if-gated feature spanning passes, duplicate the define in every pass that
-// tests it. (Do not write the literal directive prefix in prose anywhere in
-// this file — the libplacebo parser splits sections on it even mid-comment.)
-#define ENABLE_SATURATED_SPEC 0
+// (ENABLE_SATURATED_SPEC is PASS 5-only now. The per-pixel V escape it once
+// gated HERE was field-rejected twice and DELETED 2026-07-02: restoring it
+// crushed saturated speculars — in a saturated region the peak channel clips
+// before luma, so a V driver feeds the ramp a flat near-1.0 signal across a
+// core that still has luma gradient; the uniform spec add compresses the
+// gradient (rule-1 direction). PASS 5 keeps counting tiers on V — every
+// scene-gate tuning since f453fc4 was validated against that. History:
+// HANDOFF §12 + git. Two general lessons from this define's life, kept for
+// the next cross-pass feature: each HOOK block is a SEPARATE compilation
+// unit, so a define tested in two passes must be duplicated in both — and an
+// undefined identifier inside #if silently evaluates to 0, which is how this
+// path once compiled out for three versions without an error. Also: do not
+// write the literal directive prefix in prose anywhere in this file — the
+// libplacebo parser splits sections on it even mid-comment.)
 #define SPEC_Y_LOW          0.80    // Ramp onset — widened to soften "crunchy" clipped speculars.
                                     // Builds the spec as a gradient INTO the clipped core from
                                     // below; peak at Y=1.0 is unchanged, so no attenuation of the
@@ -1339,10 +1462,10 @@ void hook() {
 #define SPEC_OVERSHOOT_GAIN 0.3
 #define SPEC_RAMP_CEIL      1.10    // Hard cap on ramp; safety against extreme overshoot
 
-// Clip diffusion: blend near-white toward illum field to soften SDR clip edges
-#define ENABLE_CLIP_DIFFUSION 0      // GLSL #if needs integer — toggle this when tuning CLIP_DIFFUSION > 0
-#define CLIP_DIFFUSION       0.00    // Max blend at Y=1.0 (0.0=off, 0.5=strong)
-#define CLIP_DIFFUSION_FLOOR 0.95    // Y_gamma below: no softening
+// (Clip diffusion DELETED 2026-07-02. Zeroed since v4.4 — its one field result
+// was darkening small light cores against a dark illum field, i.e. attenuating
+// source clipping / inverting gradients: a structural rule-1 violation no
+// tuning can fix. History in git if it's ever reconsidered.)
 
 // =============================================
 //  CHROMA — expansion color behavior
@@ -1567,35 +1690,13 @@ vec3 oklab_to_rgb(vec3 lab) {
 // =============================================================================
 // ILLUMINATION FIELD UPSAMPLING (from 1/4 res)
 // =============================================================================
-// The illumination field is a sigma~100px Gaussian — extremely smooth.
-// BSPLINE_UPSAMPLE 1: C2 cubic B-spline (4 fetches, smooth gradients)
-// BSPLINE_UPSAMPLE 0: Hardware bilinear (1 fetch, sufficient for smooth fields)
-#define BSPLINE_UPSAMPLE 0
+// The illumination field is a sigma~100px Gaussian — extremely smooth, so
+// hardware bilinear (1 fetch) is sufficient. (A C2 cubic B-spline variant
+// lived behind BSPLINE_UPSAMPLE from v4.0 but was never once enabled —
+// deleted 2026-07-02; it's in git if gradients ever visibly kink.)
 
 vec3 upsample_illum_rgb() {
-    #if BSPLINE_UPSAMPLE
-    vec2 tc = CELFLARE_ILLUM_pos / CELFLARE_ILLUM_pt - 0.5;
-    vec2 f  = fract(tc);
-    tc = (floor(tc) + 0.5) * CELFLARE_ILLUM_pt;
-
-    vec2 f2  = f * f, f3 = f2 * f;
-    vec2 w0  = (1.0 - f) * (1.0 - f) * (1.0 - f) * (1.0 / 6.0);
-    vec2 w1  = (4.0 - 6.0 * f2 + 3.0 * f3) * (1.0 / 6.0);
-    vec2 w2  = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) * (1.0 / 6.0);
-    vec2 w3  = f3 * (1.0 / 6.0);
-
-    vec2 s01 = w0 + w1, s23 = w2 + w3;
-    vec2 p01 = tc + (-1.0 + w1 / s01) * CELFLARE_ILLUM_pt;
-    vec2 p23 = tc + ( 1.0 + w3 / s23) * CELFLARE_ILLUM_pt;
-
-    return
-        CELFLARE_ILLUM_tex(vec2(p01.x, p01.y)).rgb * s01.x * s01.y +
-        CELFLARE_ILLUM_tex(vec2(p23.x, p01.y)).rgb * s23.x * s01.y +
-        CELFLARE_ILLUM_tex(vec2(p01.x, p23.y)).rgb * s01.x * s23.y +
-        CELFLARE_ILLUM_tex(vec2(p23.x, p23.y)).rgb * s23.x * s23.y;
-    #else
     return CELFLARE_ILLUM_tex(CELFLARE_ILLUM_pos).rgb;
-    #endif
 }
 
 // =============================================================================
@@ -1651,8 +1752,8 @@ vec4 hook() {
     // PIXEL LUMA / PEAK CHANNEL
     // -------------------------------------------------------------------------
     float Y_gamma = get_luma(rgb_gamma);
-    // V_gamma (peak channel): lets saturated primaries (red LED Y=0.21,
-    // V=1.0) escape the Y-based early exit and qualify for the spec ramp.
+    // V_gamma (peak channel): feeds the spec block's emissive carve, the
+    // stabilized V for the base-ramp credit, and sat_gamma below.
     // sat_gamma (V − min): gamma-space saturation. Reused by the spec
     // sat gate and as the gate for the Oklab fast path on near-neutrals.
     float V_gamma   = max(max(rgb_gamma.r, rgb_gamma.g), rgb_gamma.b);
@@ -1662,38 +1763,19 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // ILLUMINATION FIELD
     // -------------------------------------------------------------------------
-    // Fetched AFTER the early exit unless clip diffusion (or the illum debug
-    // view) needs it for every pixel — with both disabled, dark pixels skip
-    // the texture fetch entirely.
-    #if ENABLE_CLIP_DIFFUSION || DEBUG_SHOW_ILLUM
-    vec3 illum_rgb = upsample_illum_rgb();
-    float Y_illum = get_luma(illum_rgb);
-
+    // Production fetch sits AFTER the early exit so dark pixels skip it; the
+    // debug view needs it for every pixel and is self-contained here.
     #if DEBUG_SHOW_ILLUM
-        return vec4(gamma709_to_pq2020(illum_rgb), 1.0);
-    #endif
+    return vec4(gamma709_to_pq2020(upsample_illum_rgb()), 1.0);
     #endif
 
-    // Early exit: no base expansion (Y < KNEE) AND no saturated-channel
-    // signal that could ever reach the spec ramp.
-    #if ENABLE_SATURATED_SPEC
-    // SPEC_Y_LOW is the LOWEST possible spec onset across scene-APL (the
-    // mid-APL bump only raises it), so this guard never exits a pixel that
-    // could fire spec in any scene — conservative-exact, unlike the earlier
-    // V < onset+bump form, which sacrificed dim emissives with V in
-    // [SPEC_Y_LOW, SPEC_Y_LOW + bump) at endpoint APLs (the documented v5.0
-    // ~4% loss — that loss class no longer exists).
-    if (Y_gamma < EARLY_EXIT_GAMMA && V_gamma < SPEC_Y_LOW) {
-        return vec4(gamma709_to_pq2020(color.rgb), 1.0);
-    }
-    #else
+    // Early exit: no base expansion possible below the knee. (A V-aware
+    // variant that kept dim saturated emissives alive for the spec V escape
+    // was deleted with the escape — see the spec block.)
     if (Y_gamma < EARLY_EXIT_GAMMA) return vec4(gamma709_to_pq2020(color.rgb), 1.0);
-    #endif
 
-    #if !(ENABLE_CLIP_DIFFUSION || DEBUG_SHOW_ILLUM)
     vec3 illum_rgb = upsample_illum_rgb();
     float Y_illum = get_luma(illum_rgb);
-    #endif
 
     // -------------------------------------------------------------------------
     // GRAIN STABILIZATION
@@ -1709,26 +1791,11 @@ vec4 hook() {
         Y_decision_gamma = color.a * 2.0;
     #endif
 
-    // -------------------------------------------------------------------------
-    // CLIP DIFFUSION — soften SDR clip edges via illumination field
-    // -------------------------------------------------------------------------
-    // Only modifies rgb_gamma — Y_decision_gamma stays grain-stabilized.
-    #if ENABLE_CLIP_DIFFUSION
-    {
-        float soften = smoothstep(CLIP_DIFFUSION_FLOOR, 1.0, Y_gamma) * CLIP_DIFFUSION;
-        rgb_gamma = mix(rgb_gamma, illum_rgb, soften);
-        Y_gamma = get_luma(rgb_gamma);
-    }
-    #endif
-
     // Grain-stabilized peak channel: the luma stabilizer's own measured
     // correction transplanted onto V (cancels achromatic grain exactly;
     // residual chroma noise is unfixable here — PASS 1 has no chroma
-    // decision). Computed once for both consumers: the base-ramp V credit
-    // below and the saturated-spec driver/emissive carve in the spec block.
-    // Placed AFTER clip diffusion so it matches the spec block's previous
-    // local computation bit-exactly in every config (diffusion rewrites
-    // Y_gamma; V_gamma stays pre-diffusion).
+    // decision). Sole consumer since the spec V escape was deleted
+    // (2026-07-02): the base-ramp V credit below.
     float V_stable = V_gamma + (Y_decision_gamma - Y_gamma);
 
     // -------------------------------------------------------------------------
@@ -1840,47 +1907,24 @@ vec4 hook() {
         float spec_apl = smoothstep(SPEC_APL_LOW, SPEC_APL_HIGH, smoothed_log_avg);
         float spec_peak = mix(SPEC_PEAK_DARK, SPEC_PEAK_BRIGHT, spec_apl);
         float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, spec_apl);
-        // Drive signal: stabilized Y, with a saturation-gated peak-channel
-        // escape. Saturated primaries at peak channel (V=1.0) qualify even
-        // when Y is low, so red LEDs and blue lasers get emissive pop. The
-        // v_drive gate keeps NEAR-NEUTRALS on the grain-stabilized luma
-        // exactly: a bare max(Y_dec, V) would let raw V rectify every
-        // positive grain excursion past the stabilizer (asymmetric sparkle
-        // + DC lift) on bright neutrals, where V ≈ raw Y.
-        //
-        // V itself must ALSO be grain-stabilized: a bright saturated sky
-        // (sat ~0.4-0.7, V ~0.95) drives v_drive to 1.0, putting raw V on
-        // the steep part of the spec ramp — per-frame grain in the peak
-        // channel became per-pixel spec flicker (speckling sky). Grain is
-        // overwhelmingly achromatic, so the luma stabilizer's own measured
-        // correction (Y_decision - Y_raw) transplants onto V directly.
-        // Where PASS 1 didn't stabilize (Y < its 0.30 early exit — the red
-        // LED / laser case — or super-white) the correction is exactly 0
-        // and V passes through raw, scene-damped by smoothed_spec_signal
-        // as before.
-        // The escape is additionally FADED OUT by stabilized luma: it exists
-        // for DIM saturated emissives (red LED Y=0.21, blue laser Y=0.07,
-        // magenta neon Y=0.29) whose Y can never reach the ramp. A bright
-        // saturated FIELD (blue/cyan sky: Y ~0.70, V ~0.95) is per-pixel
-        // indistinguishable from an emissive, and its V carries Cb chroma
-        // noise that NO luma-derived stabilization can remove (PASS 1 has no
-        // chroma decision) — so above the fade band the driver returns to
-        // the grain-stabilized luma exactly, which zeroes the ramp there.
-        // High-Y saturated emissives (green laser 0.72, cyan 0.79) lose the
-        // escape, same as every version before v5.1 — accepted.
-        #define SPEC_V_ESCAPE_Y_LO 0.45
-        #define SPEC_V_ESCAPE_Y_HI 0.60
-        #if ENABLE_SATURATED_SPEC
-        // V_stable hoisted to the base-curve entry (shared with the
-        // BASE_V_CREDIT ramp input) — same value, computed once.
-        float v_drive = smoothstep(0.10, 0.30, sat_gamma)
-                      * (1.0 - smoothstep(SPEC_V_ESCAPE_Y_LO,
-                                          SPEC_V_ESCAPE_Y_HI, Y_decision_gamma));
-        float spec_driver = mix(Y_decision_gamma,
-                                max(Y_decision_gamma, V_stable), v_drive);
-        #else
+        // Drive signal: grain-stabilized luma, Y ONLY — by design, twice
+        // field-rejected otherwise. A saturation-gated peak-channel (V)
+        // escape for dim saturated emissives (red LED Y=0.21, blue laser
+        // Y=0.07, magenta neon Y=0.29) lived here from v5.1 (v_drive +
+        // SPEC_V_ESCAPE luma fade 0.45-0.60) and was DELETED 2026-07-02
+        // after its restore crushed saturated speculars in the field.
+        // Mechanism: in a saturated region the peak channel clips before
+        // luma, so a V driver feeds this ramp a flat near-1.0 signal across
+        // a core that still has luma gradient — the uniform spec add (with
+        // the emissive carve holding the sat gate open at high V) compresses
+        // the gradient toward flat: rule-1 direction. The v5.1.1 pink-carpet
+        // speckle came from the same driver (Cr chroma noise in V is
+        // unstabilizable by the luma transplant). Dim saturated emissives
+        // therefore keep their SDR level BY DESIGN — do not re-add a V
+        // driver to THIS ramp. The surviving V path is the bounded
+        // BASE_V_CREDIT on the ~10x-gentler base ramp (see its block for
+        // why that one is safe where this one wasn't).
         float spec_driver = Y_decision_gamma;
-        #endif
         // APL-tiered onset: parabolic bump pushes the ramp threshold up in
         // mid-bright scenes where lots of pixels are 0.88–0.93 but aren't
         // genuine specular. Endpoints stay at SPEC_Y_LOW. Bump peaks at
@@ -1904,16 +1948,9 @@ vec4 hook() {
         // firing on the red car under the sun. Emissive carve-out preserves
         // light sources at V ≥ 0.92 (tungsten/fire/sodium) from being gated.
         // V_gamma + sat_gamma already computed at PASS 6 entry (shared with
-        // the Oklab fast-path bypass). The carve uses the grain-stabilized
-        // V where available — its 0.92-0.99 band has a ~14x/unit slope, so
-        // raw-V grain made the sat gate itself flicker on saturated skies.
-        #if ENABLE_SATURATED_SPEC
-        float emissive_carve = smoothstep(SPEC_SAT_EMISSIVE_LOW,
-                                          SPEC_SAT_EMISSIVE_HIGH, V_stable);
-        #else
+        // the Oklab fast-path bypass).
         float emissive_carve = smoothstep(SPEC_SAT_EMISSIVE_LOW,
                                           SPEC_SAT_EMISSIVE_HIGH, V_gamma);
-        #endif
         float sat_atten = mix(SPEC_SAT_ATTEN_DARK, SPEC_SAT_ATTEN_BRIGHT, spec_apl)
                         * (1.0 - emissive_carve);
         spec_strength *= 1.0 - smoothstep(SPEC_SAT_LOW, SPEC_SAT_HIGH, sat_gamma) * sat_atten;
@@ -1938,6 +1975,11 @@ vec4 hook() {
     // frame brightness rise, self-releasing at plateau. Capped for safety.
     #if ENABLE_LIGHT_PUMP
     float pump_gain = 0.0;
+    #if ENABLE_SPATIAL_PUMP
+    // Hoisted (same pattern as pump_gain/spec_strength) so DEBUG_SHOW_PUMP
+    // shows the exact mask the apply used — no hand-synced debug resample.
+    float pump_mask = 1.0;
+    #endif
     {
         float pump_w = smoothstep(PUMP_Y_LOW, 1.0, Y_decision_gamma);
         // Spatial vs scene-global drive. Spatial: bilinear-sample the per-cell
@@ -1949,20 +1991,21 @@ vec4 hook() {
         vec2  pg  = vec2(HOOKED_pos.x * 16.0 - 0.5, HOOKED_pos.y * 9.0 - 0.5);
         vec2  pgf = fract(pg);
         pgf = pgf * pgf * (3.0 - 2.0 * pgf);    // #5: smoothstep-ease → C1, kills bilinear kink seams
-        ivec2 pi0 = clamp(ivec2(floor(pg)),     ivec2(0), ivec2(15, 8));
-        ivec2 pi1 = clamp(ivec2(floor(pg)) + 1, ivec2(0), ivec2(15, 8));
+        ivec2 pib = ivec2(floor(pg));
+        ivec2 pi0 = clamp(pib,     ivec2(0), ivec2(15, 8));
+        ivec2 pi1 = clamp(pib + 1, ivec2(0), ivec2(15, 8));
         float m00 = pump_env_cell[pi0.y * 16 + pi0.x];
         float m10 = pump_env_cell[pi0.y * 16 + pi1.x];
         float m01 = pump_env_cell[pi1.y * 16 + pi0.x];
         float m11 = pump_env_cell[pi1.y * 16 + pi1.x];
-        float mask = mix(mix(m00, m10, pgf.x), mix(m01, m11, pgf.x), pgf.y);
+        pump_mask = mix(mix(m00, m10, pgf.x), mix(m01, m11, pgf.x), pgf.y);
         // SUBTRACTIVE: the mask (per-cell "is this region brightening" ∈[0,1]) only
         // SUPPRESSES the global scalar pump — it can't add pump. pump_env already
         // carries the scalar's amplitude, contrast/cover guard, and velocity release.
         // A brightening region has mask→1 (keeps the scalar); a static/darkening one
         // decays to 0 (suppressed). A reveal/pan/occluder-wake can't manufacture pump:
         // no global event ⇒ pump_env ~0 ⇒ product ~0 regardless of any local rise.
-        float pump_local = pump_env * mask;
+        float pump_local = pump_env * pump_mask;
         #else
         float pump_local = pump_env;
         #endif
@@ -1983,14 +2026,8 @@ vec4 hook() {
         #if ENABLE_SPATIAL_PUMP
         // Red = scalar pump (global amplitude); Green = per-pixel applied gain;
         // Blue = per-cell suppression mask (1 = brightening/kept, 0 = suppressed).
-        vec2  pg  = vec2(HOOKED_pos.x * 16.0 - 0.5, HOOKED_pos.y * 9.0 - 0.5);
-        vec2  pgf = fract(pg);
-        pgf = pgf * pgf * (3.0 - 2.0 * pgf);    // match application: eased C1 sampling
-        ivec2 pi0 = clamp(ivec2(floor(pg)),     ivec2(0), ivec2(15, 8));
-        ivec2 pi1 = clamp(ivec2(floor(pg)) + 1, ivec2(0), ivec2(15, 8));
-        float mask = mix(mix(pump_env_cell[pi0.y*16+pi0.x], pump_env_cell[pi0.y*16+pi1.x], pgf.x),
-                         mix(pump_env_cell[pi1.y*16+pi0.x], pump_env_cell[pi1.y*16+pi1.x], pgf.x), pgf.y);
-        return vec4(gamma709_to_pq2020(vec3(pump_env, pump_gain, mask)), 1.0);
+        // pump_mask is the hoisted value the apply block actually used.
+        return vec4(gamma709_to_pq2020(vec3(pump_env, pump_gain, pump_mask)), 1.0);
         #else
         // Red = scene-global trigger; Green = per-pixel applied gain.
         return vec4(gamma709_to_pq2020(vec3(pump_env, pump_gain, 0.0)), 1.0);
@@ -2104,7 +2141,10 @@ vec4 hook() {
         // ---- PALE SKIN PROTECTION ----
         #if ENABLE_PALE_SKIN
             #if ENABLE_GRAIN_STABLE
-            float Y_decision = eotf_gamma(color.a * 2.0);
+            // Y_decision_gamma == color.a * 2.0 on this path — reuse it so the
+            // alpha-protocol decode lives at one production site (the debug WP
+            // block keeps its own copy by design; it is self-contained).
+            float Y_decision = eotf_gamma(Y_decision_gamma);
             #else
             float Y_decision = get_luma(rgb_linear);
             #endif

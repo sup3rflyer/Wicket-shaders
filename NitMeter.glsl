@@ -1,4 +1,4 @@
-// NitMeter v1.1 — HDR peak-nit analysis overlay for mpv (gpu-next)
+// NitMeter v1.3 — HDR peak-nit analysis overlay for mpv (gpu-next)
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Companion dev tool for CelFlare: decodes the PQ frame and displays
@@ -60,16 +60,22 @@
 //
 // KNOBS (PASS 3, "MAIN TUNING")
 //   NITMETER_SDR_GUARD (default 1) — SDR-input tripwire. A user shader
-//     cannot query the frame's tagged transfer, so detection is heuristic:
-//     any clipped SDR white misread as PQ decodes to 10000 nits, while real
-//     masters stay <= ~4000 and CelFlare output sits far below that. If the
-//     smoothed MAX 16x16-BLOCK-AVERAGE exceeds NM_SDR_SUSPECT_NITS (8000,
-//     PASS 2) the panel blanks its readouts to "---" and draws a red border
-//     instead of reporting nonsense. Block-mean, not pixel max, so a lone
-//     YUV-overshoot pixel on legit HDR can't false-trip it; an SDR source
-//     trips as soon as any 16x16 clipped-white area is on screen ~0.5 s.
-//     Session MaxCLL/MaxFALL reset while tripped (no garbage poisoning).
-//     Disable if you ever feed legit 8000+ nit material.
+//     cannot query the frame's tagged transfer, so detection is heuristic,
+//     on two OR'd signals (PASS 2): (a) smoothed max 16x16-block-average
+//     above NM_SDR_SUSPECT_NITS (8000) — a solid clipped-white AREA; (b)
+//     fraction of frame pixels at the signal ceiling (code >= 0.9995,
+//     ~9990 nits) above NM_SDR_CEIL_FRAC (0.05% ~ one small line of white
+//     text). Clipped SDR whites decode to exactly 10000 in droves, while
+//     graded HDR essentially never reaches ceiling codes (masters cap
+//     ~1000-4000 nits, code <= ~0.92, and YUV-overshoot ringing from there
+//     cannot climb to 0.9995) — so (b) catches ordinary SDR frames whose
+//     whites are scattered pixels, not solid blocks. Fast attack (~0.3 s),
+//     slow release (~2 s) so scene-to-scene evidence doesn't strobe the
+//     panel. While tripped: readouts blank to "---", red border, and ALL
+//     temporal state is quarantined. Limitation: SDR frames with no
+//     clipped whites at all (dark scenes) are undetectable — numbers
+//     return until the next white. Disable if you ever feed legit
+//     8000+ nit material.
 //   NITMETER_CORNER — 0 TL / 1 TR (default) / 2 BL / 3 BR
 //   NITMETER_SCALE  — panel size multiplier (1.0 = ~136x182 px at 1080p)
 //
@@ -135,6 +141,7 @@ void hook() {
     vec2 base = vec2(bpos) * 16.0;
     float emax = 0.0;   // block max PQ code of per-pixel max(R,G,B)
     float lsum = 0.0;   // block sum of linear CLL (1.0 = 10000 nits)
+    float ceil_cnt = 0.0;   // pixels at the signal ceiling (SDR-tripwire evidence)
     for (int j = 0; j < 16; j++) {
         for (int i = 0; i < 16; i++) {
             vec2 uv = (base + vec2(float(i), float(j)) + 0.5) * HOOKED_pt;
@@ -144,11 +151,12 @@ void hook() {
             float e = max(rgb.r, max(rgb.g, rgb.b));
             emax = max(emax, e);
             lsum += pq_eotf_norm(e);
+            ceil_cnt += step(0.9995, e);
         }
     }
     // Store PQ codes (perceptually uniform in [0,1]) so the intermediate is
     // robust to whatever SAVE format the fbo setting picks.
-    imageStore(out_image, bpos, vec4(emax, pq_oetf_norm(lsum / 256.0), 0.0, 1.0));
+    imageStore(out_image, bpos, vec4(emax, pq_oetf_norm(lsum / 256.0), ceil_cnt / 256.0, 1.0));
     // Threads past the padded right/bottom edge imageStore out of bounds —
     // a defined no-op, same pattern as CelFlare's prefilter dispatch.
 }
@@ -175,14 +183,17 @@ float pq_eotf_norm(float e) {   // PQ code -> linear, 1.0 = 10000 nits
 #define NM_HIST_BINS   24       // MUST match PASS 3 (hist drawing)
 #define NM_HIST_LOG_HI 13.2877  // log2(10000) — MUST match PASS 3
 #define NM_HOLD_FRAMES 72.0     // ~3 s @24p before the hold starts decaying
-#define NM_HOLD_DECAY  0.985    // per-frame decay once expired (halves in ~1.4 s)
-#define NM_SDR_SUSPECT_NITS 8000.0  // sustained block-mean above this = SDR misread as PQ
-#define NM_SDR_ALPHA        0.06    // suspicion EMA (~0.5 s to engage/release @24p)
+#define NM_HOLD_DECAY  0.985    // per-frame decay once expired (halves in ~1.9 s @24p)
+#define NM_SDR_SUSPECT_NITS 8000.0  // block-mean gate: solid clipped-white AREA
+#define NM_SDR_CEIL_FRAC    0.0005  // ceiling-pixel area gate (0.05% of frame)
+#define NM_SDR_ALPHA_UP     0.10    // suspicion attack (~0.3 s @24p)
+#define NM_SDR_ALPHA_DN     0.015   // suspicion release (~2 s @24p)
 #define NM_SHOW_FRAMES      12.0    // ~0.5 s @24p numeric sample-and-hold (readability)
 
 shared float s_max[144];
 shared float s_sum[144];
-shared float s_mmean[144];   // max block-MEAN — SDR-tripwire driver
+shared float s_mmean[144];   // max block-MEAN — SDR-tripwire driver (a)
+shared float s_ceil[144];    // ceiling-pixel fraction sum — SDR-tripwire driver (b)
 shared uint  s_hist[NM_HIST_BINS];
 
 void hook() {
@@ -196,16 +207,18 @@ void hook() {
     float lmax = 0.0;
     float lsum = 0.0;
     float lmm  = 0.0;
+    float lcf  = 0.0;
     for (uint i = lid; i < total; i += 144u) {
         // texelFetch, not center-sampling: a sub-ULP off-center uv through
         // the LINEAR sampler could bleed a neighbor block into a MAX
-        vec2 s = (NITMETER_BLK_mul *
-                  texelFetch(NITMETER_BLK_raw, ivec2(int(i % W), int(i / W)), 0)).rg;
+        vec3 s = (NITMETER_BLK_mul *
+                  texelFetch(NITMETER_BLK_raw, ivec2(int(i % W), int(i / W)), 0)).rgb;
         float bmax  = pq_eotf_norm(s.r) * 10000.0;   // block peak CLL, nits
         float bmean = pq_eotf_norm(s.g) * 10000.0;   // block mean CLL, nits
         lmax = max(lmax, bmax);
         lsum += bmean;
         lmm  = max(lmm, bmean);
+        lcf  += s.b;
         // area histogram over block means; everything <= 1 nit lands in bin 0
         float hx = clamp(log2(max(bmean, 1.0)) / NM_HIST_LOG_HI, 0.0, 0.99999);
         // shared-atomic histogram (InterlockedAdd on groupshared via
@@ -216,16 +229,19 @@ void hook() {
     s_max[lid]   = lmax;
     s_sum[lid]   = lsum;
     s_mmean[lid] = lmm;
+    s_ceil[lid]  = lcf;
     barrier();
 
     if (lid == 0u) {
         float pk  = 0.0;
         float sm  = 0.0;
         float pkm = 0.0;
+        float cfs = 0.0;
         for (uint i = 0u; i < 144u; i++) {
             pk  = max(pk, s_max[i]);
             sm  += s_sum[i];
             pkm = max(pkm, s_mmean[i]);
+            cfs += s_ceil[i];
         }
         float inv = 1.0 / max(float(total), 1.0);
         nm_peak = pk;
@@ -240,19 +256,29 @@ void hook() {
             if (nm_hold_age > NM_HOLD_FRAMES)
                 nm_hold = max(pk, nm_hold * NM_HOLD_DECAY);
         }
-        // SDR-input tripwire (heuristic): gamma misread as PQ decodes any
-        // clipped white to 10000 nits, and real PQ masters stay <= ~4000.
-        // Driven by the max 16x16-block MEAN, not the pixel max: an SDR
-        // clipped-white AREA still reads 10000, but a lone YUV-overshoot
-        // pixel on legit HDR can't lift a 256-px average past the gate.
-        // EMA'd so a single hot frame can't trip it either.
-        nm_sdr += NM_SDR_ALPHA * (((pkm > NM_SDR_SUSPECT_NITS) ? 1.0 : 0.0) - nm_sdr);
+        // SDR-input tripwire (heuristic), two OR'd signals — see header:
+        // (a) a solid clipped-white AREA (block mean past the gate);
+        // (b) enough scattered pixels at the exact signal ceiling — SDR
+        //     whites clip to code 1.0 en masse, graded HDR never gets
+        //     there (masters cap ~0.92) and lone YUV-overshoot pixels
+        //     stay far under the area threshold.
+        // Asymmetric EMA: fast attack, slow release (no scene strobing).
+        float cf  = cfs * inv;   // frame fraction of ceiling pixels
+        float sus = ((pkm > NM_SDR_SUSPECT_NITS) || (cf > NM_SDR_CEIL_FRAC)) ? 1.0 : 0.0;
+        nm_sdr += ((sus > nm_sdr) ? NM_SDR_ALPHA_UP : NM_SDR_ALPHA_DN) * (sus - nm_sdr);
         // session maxima (MaxCLL/MaxFALL semantics; reset per shader load,
         // which the cycle script triggers on every toggle step). Reset while
         // the tripwire is engaged so SDR garbage can't poison them.
         if (nm_sdr > 0.5) {
             nm_maxcll  = 0.0;
             nm_maxfall = 0.0;
+            // quarantine ALL temporal readout state while tripped, not just
+            // the session maxima: the hold and P/A snapshots used to survive
+            // a trip carrying garbage, so after recovery H decayed from
+            // ~10000 and sat ABOVE C for seconds (field-observed). Hold
+            // re-latches instantly from clean content on release.
+            nm_hold     = 0.0;
+            nm_hold_age = 0.0;
         } else {
             nm_maxcll  = max(nm_maxcll, pk);
             nm_maxfall = max(nm_maxfall, nm_fall);
@@ -260,7 +286,9 @@ void hook() {
         // numeric sample-and-hold (Lilium-style ~0.5 s readout refresh):
         // measurement stays per-frame, only the SHOWN digits are held.
         // Countdown from 0 so the very first frame populates immediately.
-        if (nm_show_ctr <= 0.0) {
+        // while tripped, refresh every frame (blanked anyway) so the
+        // FIRST unblanked frame shows current values, not a stale snapshot
+        if (nm_show_ctr <= 0.0 || nm_sdr > 0.5) {
             nm_show_peak = pk;
             nm_show_fall = nm_fall;
             nm_show_ctr  = NM_SHOW_FRAMES;
@@ -276,7 +304,7 @@ void hook() {
 //!BIND HOOKED
 //!BIND NITMETER_STATE
 //!BIND NITMETER_STATS
-//!DESC NitMeter v1.1: overlay draw
+//!DESC NitMeter v1.3: overlay draw
 
 // NITMETER_STATS is bound only as the explicit data dependency on PASS 2 —
 // the stats themselves arrive through the NITMETER_STATE SSBO (same pattern

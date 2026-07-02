@@ -1,4 +1,4 @@
-// CelFlare v5.5 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.6 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Two-layer architecture:
@@ -31,6 +31,7 @@
 //!VAR float pump_fast_cell[144]
 //!VAR float pump_slow_cell[144]
 //!VAR float pump_env_cell[144]
+//!VAR float pump_mask_cell[144]
 //!STORAGE
 
 //!HOOK MAIN
@@ -476,6 +477,24 @@ vec4 hook() {
 // Specular detection (source brightness tiers, no illum field)
 #define HIGHLIGHT_THRESH    0.75    // Source highlight tier
 #define SPECULAR_THRESH     0.92    // Source specular tier
+// SOFT tier membership (v5.6 hardening). The tier counters rest on 144
+// SINGLE-TEXEL samples; with hard compares a pan/tilt over textured content
+// (sparkle clusters, glinting water) slides samples across the thresholds and
+// the fracs jitter in 1/144 quanta — right through the shutoff/tier-ratio
+// fade bands (clusters sit at spec_frac 0.10-0.16 = exactly the shutoff
+// band), which read as scene-wide specular FLICKER. Each intensity compare is
+// now a smoothstep over ±this half-band, so a sample sliding across a tier
+// contributes continuously instead of popping a whole 1/144 step, and the
+// fracs become continuous (also retires the "spec_onset is functionally
+// boolean at 1/144" §11 note structurally). Samples farther than the band
+// from every threshold count exactly as before — calibration drift exists
+// only where the old counts were unstable anyway. Keep > 0: smoothstep with
+// equal edges is UNDEFINED in GLSL, so 0.0 is not a valid "hard compare"
+// fallback — A/B toward hard behavior with 0.005, or git-revert.
+#define TIER_SOFT_HALFBAND  0.02
+// (The bright-spec SAT fence below stays a hard compare — near-white
+// speculars sit far from 0.30, and softening it would re-tune the pink-carpet
+// fence; revisit only if sat-edge flicker is ever observed.)
 #define SPEC_FRAC_MIN       0.007   // ~1/144 noise floor
 #define SPEC_FRAC_MAX       0.10    // Fade begins (sparkle clusters can reach 12-15%)
 #define SPEC_FRAC_CEIL      0.16    // Full shutoff (large bright skies)
@@ -653,9 +672,9 @@ vec4 hook() {
 // per-cell "is this region brightening" env. How PASS 6 consumes it is that pass's
 // SPATIAL_PUMP_ADDITIVE knob (additive = env is the local pump amplitude;
 // subtractive = env only suppresses the global scalar). 0 = scalar-only.
-// ⚠ FOOTGUN — this define is DUPLICATED in PASS 6 (line ~1428) and the two MUST
+// ⚠ FOOTGUN — this define is DUPLICATED in PASS 6 (line ~1516) and the two MUST
 // match: no compile-time guard. A PASS5=0/PASS6=1 mismatch COMPILES but leaves
-// pump_env_cell unwritten → PASS 6 reads a stale/garbage mask and the pump
+// pump_mask_cell unwritten → PASS 6 reads a stale/garbage mask and the pump
 // misbehaves. (Found flipped to 0 twice this session — keep BOTH at the same value.)
 #define ENABLE_SPATIAL_PUMP 1
 // drive_loc rectification/noise floor ONLY (§10): shrinks |d| symmetrically
@@ -712,6 +731,22 @@ vec4 hook() {
 // safety, not an A/B lever — an ungated additive mask is exactly the pre-v5.2
 // artifact machine. Keep it 1 while the additive experiment is on.
 #define PUMP_MASK_ESTABLISH 1
+// Mask softening (v5.6 hardening, field report: cels read diamond-shaped and
+// a large event's BOUNDARY cells — whose cell-mean drive dilutes below
+// CELL_DRIVE_LOW — never open, leaving hard mosaic edges mid-event). The
+// PUBLISHED mask (pump_mask_cell, what PASS 6 samples) becomes
+// max(env, 3×3 binomial blur of env): max-preserving, so an isolated fire
+// keeps its FULL peak (a plain blur would cut a lone open cell 4× — kills the
+// flagship multi-fire amplitude) while every open cell grows a soft ≤1-cell
+// skirt that fills partially-covered boundary cells and rounds the bilinear
+// diamond. DYNAMICS ARE UNTOUCHED: the band-pass state, velocity release,
+// max-hold, and establish gate all still live on pump_env_cell — softening is
+// presentation-only, applied after the state update each frame. Safety: the
+// skirt can bleed ≤0.25 amplitude one cell past a genuinely-open cell (only
+// next to a real event by construction — the killer clip has no open cells to
+// bleed from), and per-pixel pump_w still holds dark pixels down under it.
+// 0 = publish the raw env (pre-v5.6 look).
+#define PUMP_MASK_SOFTEN    1
 // SPATIAL MODEL — two apply modes, selected by PASS 6's SPATIAL_PUMP_ADDITIVE:
 //  - SUBTRACTIVE (v5.2–v5.4, field-confirmed): pump_local = pump_env × mask.
 //    The env is a [0,1] SUPPRESSOR — spatial can only REMOVE the global scalar
@@ -759,9 +794,10 @@ float get_luma(vec3 c) {
 // Per-lane scratch for the cross-lane reduction. 7 arrays × 144 elements ×
 // 4 bytes (all 32-bit) = 4032 bytes — well under any GPU's 16-32 KB
 // shared-memory floor. The tier counters (bright/spec/high/bright-spec) are
-// NOT stored as per-lane booleans: the reducer re-derives them from the raw
-// values below (bit-identical compares on the same floats), keeping each
-// threshold single-sourced next to the count it feeds.
+// NOT stored as per-lane values: the reducer re-derives them from the raw
+// values below (soft smoothstep memberships since v5.6 — see
+// TIER_SOFT_HALFBAND), keeping each threshold single-sourced next to the
+// sum it feeds.
 shared float s_illum[144];
 shared float s_log_luma[144];
 shared uint  s_valid[144];
@@ -835,11 +871,11 @@ void hook() {
         float illum_sum         = 0.0;
         float log_luma_sum      = 0.0;
         uint  valid_luma        = 0u;
-        uint  bright_count      = 0u;
-        uint  spec_count        = 0u;
-        uint  high_count        = 0u;
+        float bright_sum        = 0.0;
+        float spec_sum          = 0.0;
+        float high_sum          = 0.0;
         uint  change_count      = 0u;
-        uint  bright_spec_count = 0u;
+        float bright_spec_sum   = 0.0;
         float illum_min         = 1.0;
         float illum_max         = 0.0;
         float illum_v_psum      = 0.0;
@@ -861,20 +897,27 @@ void hook() {
             log_luma_sum      += s_log_luma[i];
             valid_luma        += s_valid[i];
             change_count      += s_change[i];
-            // Tier counts, re-derived from the raw per-lane values (identical
-            // compares on the same floats the lanes sampled — single-sourced
-            // thresholds next to the counts they feed).
+            // Tier sums, re-derived from the raw per-lane values (single-
+            // sourced thresholds next to the sums they feed). SOFT membership
+            // (see TIER_SOFT_HALFBAND): each compare is a smoothstep over the
+            // ±band so single-texel samples sliding across a tier on a pan
+            // contribute continuously — no 1/144 count pops.
             float ii           = s_intensity[i];
-            bright_count      += (yi > BRIGHT_STAT_THRESH)   ? 1u : 0u;
-            spec_count        += (ii > SPECULAR_THRESH)      ? 1u : 0u;
-            high_count        += (ii > HIGHLIGHT_THRESH)     ? 1u : 0u;
-            bright_spec_count += (ii > BRIGHT_SPEC_THRESH &&
-                                  s_sat[i] < BRIGHT_SPEC_SAT_MAX) ? 1u : 0u;
+            bright_sum        += smoothstep(BRIGHT_STAT_THRESH - TIER_SOFT_HALFBAND,
+                                            BRIGHT_STAT_THRESH + TIER_SOFT_HALFBAND, yi);
+            spec_sum          += smoothstep(SPECULAR_THRESH - TIER_SOFT_HALFBAND,
+                                            SPECULAR_THRESH + TIER_SOFT_HALFBAND, ii);
+            high_sum          += smoothstep(HIGHLIGHT_THRESH - TIER_SOFT_HALFBAND,
+                                            HIGHLIGHT_THRESH + TIER_SOFT_HALFBAND, ii);
+            bright_spec_sum   += (s_sat[i] < BRIGHT_SPEC_SAT_MAX)
+                                 ? smoothstep(BRIGHT_SPEC_THRESH - TIER_SOFT_HALFBAND,
+                                              BRIGHT_SPEC_THRESH + TIER_SOFT_HALFBAND, ii)
+                                 : 0.0;
         }
 
         const float N_SAMPLES = 144.0;
         float avg_illum   = illum_sum / N_SAMPLES;
-        float bright_frac = float(bright_count) / N_SAMPLES;
+        float bright_frac = bright_sum / N_SAMPLES;
 
         // Contrast: dynamic range from illumination field (stable, noise-free).
         // max/min >= 1 by construction: both are running extrema of one sample set.
@@ -901,8 +944,8 @@ void hook() {
             : avg_illum;
 
         // Specular signal: present when small fraction at specular tier
-        float spec_frac          = float(spec_count) / N_SAMPLES;
-        float highlight_frac_src = float(high_count) / N_SAMPLES;
+        float spec_frac          = spec_sum / N_SAMPLES;
+        float highlight_frac_src = high_sum / N_SAMPLES;
         float spec_onset         = smoothstep(0.0, SPEC_FRAC_MIN, spec_frac);
         float spec_shutoff       = 1.0 - smoothstep(SPEC_FRAC_MAX, SPEC_FRAC_CEIL, spec_frac);
         // Tier separation: specular must be rarer than highlights.
@@ -926,7 +969,7 @@ void hook() {
         // ramps don't introduce a step into spec_raw_natural that would
         // false-trigger the growth-mode discriminator via spec_vel.
         // Supplements only — uses max(spec_raw, bs_raw).
-        float bs_frac     = float(bright_spec_count) / N_SAMPLES;
+        float bs_frac     = bright_spec_sum / N_SAMPLES;
         float bs_onset    = smoothstep(0.0, SPEC_FRAC_MIN, bs_frac);
         float bs_shutoff  = 1.0 - smoothstep(BRIGHT_SPEC_FRAC_MAX,
                                              BRIGHT_SPEC_FRAC_CEIL, bs_frac);
@@ -1041,6 +1084,7 @@ void hook() {
                 pump_fast_cell[i] = v;
                 pump_slow_cell[i] = v;
                 pump_env_cell[i]  = 0.0;
+                pump_mask_cell[i] = 0.0;
             }
             #endif
             pump_fast = pnorm_illum_v;
@@ -1193,7 +1237,33 @@ void hook() {
                 // (a suppressor that re-engages as a region stops brightening).
                 // Max-held + adapt floor.
                 float r = (d < 0.0 && s > 1e-3) ? (f / s) : 1.0;
-                pump_env_cell[i] = max(pump_env_cell[i] * r * PUMP_ADAPT_FLOOR, a);
+                float e = max(pump_env_cell[i] * r * PUMP_ADAPT_FLOOR, a);
+                pump_env_cell[i] = e;
+                // Post-update env stash for the softening pass below. Reusing
+                // s_pump_snap_f is safe: this iteration already consumed its
+                // own cf, and no iteration reads another cell's snap_f (the
+                // neighbour scan reads snap_s only).
+                s_pump_snap_f[i] = e;
+            }
+            // Publish the PRESENTATION mask (see PUMP_MASK_SOFTEN): the raw
+            // env stays the dynamics state; PASS 6 samples pump_mask_cell.
+            for (uint i = 0u; i < 144u; i++) {
+                #if PUMP_MASK_SOFTEN
+                int cy = int(i) / 16, cx = int(i) % 16;
+                float b = 0.0;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int ny = clamp(cy + dy, 0, 8);
+                        int nx = clamp(cx + dx, 0, 15);
+                        // (1,2,1)⊗(1,2,1)/16 binomial; edge cells replicate
+                        // (index clamp), keeping border amplitude full.
+                        b += s_pump_snap_f[ny * 16 + nx]
+                           * float((2 - abs(dy)) * (2 - abs(dx)));
+                    }
+                pump_mask_cell[i] = max(s_pump_snap_f[i], b * (1.0 / 16.0));
+                #else
+                pump_mask_cell[i] = s_pump_snap_f[i];
+                #endif
             }
             // ONSET takes the gated aggregate; the release path below keeps
             // the ungated drive_loc (sign + fall ratio), so reveal
@@ -1250,8 +1320,22 @@ void hook() {
             smoothed_log_avg      = log_avg;
             scene_cut_lockout     = 0.0;
         } else {
+            // Spec-gate hardening (v5.6): the APPLIED spec gate gets its own
+            // alpha that does NOT speed up with vel_mag. During a pan/tilt
+            // vel_mag holds base_alpha at MID (~8-frame) for the whole move,
+            // so the gate used to TRACK the residual tier jitter of textured
+            // content (clustered speculars breathing scene-wide). Pan jitter
+            // is zero-mean — a SLOW EMA reads its mean and the ripple dies
+            // (~±1% vs ~±20%); cuts still lock on via the lockout alpha, and
+            // a slower ease-in on genuine scene changes is the house
+            // philosophy (eyes adjusting). smoothed_spec_natural deliberately
+            // KEEPS the shared alpha: spec_vel (growth-mode driver) is
+            // calibrated against it — do not slow that one. If a fireball's
+            // spec bonus ever feels lagged, the lever is
+            // mix(TEMPORAL_ALPHA_SLOW, base_alpha, smoothed_growth_mode).
+            float alpha_spec = (scene_cut_lockout > 0.0) ? alpha : TEMPORAL_ALPHA_SLOW;
             smoothed_bright_frac  = mix(smoothed_bright_frac, bright_frac, alpha);
-            smoothed_spec_signal  = mix(smoothed_spec_signal, spec_raw, alpha);
+            smoothed_spec_signal  = mix(smoothed_spec_signal, spec_raw, alpha_spec);
             smoothed_spec_natural = mix(smoothed_spec_natural, spec_raw_natural, alpha);
             smoothed_contrast     = mix(smoothed_contrast, contrast, alpha);
             smoothed_log_avg      = mix(smoothed_log_avg, log_avg, alpha);
@@ -1289,7 +1373,7 @@ void hook() {
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
-//!DESC CelFlare v5.5
+//!DESC CelFlare v5.6
 
 // =============================================
 //  MAIN TUNING — start here
@@ -1424,10 +1508,11 @@ void hook() {
 #define PUMP_Y_LOW          0.35   // per-pixel weight onset — low/broad so the whole bright region lifts (not a pinpoint)
 #define PUMP_GAIN_CEIL      1.5    // hard cap on the pump multiplier (safety against runaway expansion)
 #define PUMP_GROWTH_DAMP    0.6    // down-gate pump where growth-mode already lifts expansion (anti double-stack on fireballs)
-// Spatial pump. ⚠ MUST match the PASS 5 copy (line ~660) — no compile guard; a
-// mismatch leaves pump_env_cell unwritten and PASS 6 reads a garbage mask.
-// PASS 5 produces the per-cell brightening mask (pump_env_cell[144], 16×9);
-// this pass bilinear-samples it. 0 = scalar-only.
+// Spatial pump. ⚠ MUST match the PASS 5 copy (line ~679) — no compile guard; a
+// mismatch leaves pump_mask_cell unwritten and PASS 6 reads a garbage mask.
+// PASS 5 produces the per-cell brightening mask (pump_mask_cell[144], 16×9 —
+// the softened presentation of pump_env_cell); this pass bilinear-samples it.
+// 0 = scalar-only.
 #define ENABLE_SPATIAL_PUMP 1
 // Apply mode (PASS 6-only knob — PASS 5 needs no copy). 1 = ADDITIVE (v5.5
 // experiment, the HANDOFF §13 "additive door"): pump_local = mask ×
@@ -2055,10 +2140,14 @@ vec4 hook() {
         ivec2 pib = ivec2(floor(pg));
         ivec2 pi0 = clamp(pib,     ivec2(0), ivec2(15, 8));
         ivec2 pi1 = clamp(pib + 1, ivec2(0), ivec2(15, 8));
-        float m00 = pump_env_cell[pi0.y * 16 + pi0.x];
-        float m10 = pump_env_cell[pi0.y * 16 + pi1.x];
-        float m01 = pump_env_cell[pi1.y * 16 + pi0.x];
-        float m11 = pump_env_cell[pi1.y * 16 + pi1.x];
+        // pump_mask_cell = the PRESENTATION mask (max-preserving 3×3 soften of
+        // the raw per-cell env — see PASS 5's PUMP_MASK_SOFTEN): rounds the
+        // bilinear diamond and fills a large event's under-driven boundary
+        // cells. The raw env (pump_env_cell) stays the dynamics state.
+        float m00 = pump_mask_cell[pi0.y * 16 + pi0.x];
+        float m10 = pump_mask_cell[pi0.y * 16 + pi1.x];
+        float m01 = pump_mask_cell[pi1.y * 16 + pi0.x];
+        float m11 = pump_mask_cell[pi1.y * 16 + pi1.x];
         pump_mask = mix(mix(m00, m10, pgf.x), mix(m01, m11, pgf.x), pgf.y);
         #if SPATIAL_PUMP_ADDITIVE
         // ADDITIVE: the mask (per-cell established-gated brightening env) is the

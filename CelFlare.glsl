@@ -198,17 +198,26 @@ void hook() {
     float weight_k = 0.25 * effective_sharpness / (GRAIN_THRESHOLD * GRAIN_THRESHOLD);
     float asym_scale_sq = asym_scale * asym_scale;
 
-    // -------- 3 antipodal pairs per ring --------
-    // Original outer[6] and inner[6] are each 3 antipodal pairs at the
-    // same basis directions, just signed. Rotate the basis once per pair,
-    // sample +r and -r explicitly. 6 rotation matmuls saved per pixel.
-    const vec2 outer_basis[3] = vec2[3](
-        vec2( 1.000, 0.000),
+    // -------- 12 taps: 2 rings x 3 antipodal pairs, one fused loop --------
+    // Taps 0-2 are the outer ring (radius R), taps 3-5 the inner (R/2).
+    // Each basis direction is rotated once and sampled at +o and -o
+    // (6 rotation matmuls saved per pixel vs rotating all 12). The tap
+    // chain (sample -> raw diff -> asym -> weight) lives ONCE here; the
+    // four formerly hand-synced copies differed only in offset/gradient
+    // sign and the per-ring params below. Accumulation order (outer pairs
+    // then inner, + before -) is preserved — bit-identical to the old
+    // unrolled form. Per original tuning, the inner ring:
+    //  - blur weights take INNER_RING_BOOST (inner ring carries 2:1 weight)
+    //  - gradient weights use the un-boosted w so the boost only amplifies
+    //    blur trust, not gradient estimation (grad_w += w on both rings)
+    //  - gradient direction scaled by 2.0 to match outer-ring units
+    //    (raw_diff at half radius is half the linear-gradient response;
+    //    multiply back to keep gx/gy comparable across rings).
+    const vec2 tap_basis[6] = vec2[6](
+        vec2( 1.000, 0.000),   // outer ring
         vec2( 0.500, 0.866),
-        vec2(-0.500, 0.866)
-    );
-    const vec2 inner_basis[3] = vec2[3](
-        vec2( 0.866, 0.500),
+        vec2(-0.500, 0.866),
+        vec2( 0.866, 0.500),   // inner ring
         vec2( 0.000, 1.000),
         vec2(-0.866, 0.500)
     );
@@ -220,73 +229,28 @@ void hook() {
     float total_w = 1.0;
     float gx = 0.0, gy = 0.0, grad_w = 0.0;
 
-    // Outer ring (radius R) — gradient projection uses rotated.xy directly
-    // (the - sample contributes via -r.x, -r.y, hence the gx -=/gy -= form).
-    for (int i = 0; i < 3; i++) {
-        vec2 h = outer_basis[i];
+    for (int i = 0; i < 6; i++) {
+        bool inner   = i >= 3;
+        float boost  = inner ? INNER_RING_BOOST : 1.0;
+        float gscale = inner ? 2.0 : 1.0;
+        vec2 h = tap_basis[i];
         vec2 r = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
-        vec2 o = r * float(GRAIN_BLUR_RADIUS);
+        vec2 o = r * (inner ? float(GRAIN_BLUR_RADIUS) * 0.5
+                            : float(GRAIN_BLUR_RADIUS));
 
-        // + sample
-        float s_p  = tile_bilinear(tile_center + o);
-        float rd_p = s_p - Y_gamma;
-        float a2_p = rd_p < 0.0 ? asym_scale_sq : 1.0;
-        float t_p  = max(0.0, 1.0 - weight_k * rd_p * rd_p * a2_p);
-        float w_p  = t_p * t_p;
-        blurred += s_p * w_p;
-        total_w += w_p;
-        gx += rd_p * w_p * r.x;
-        gy += rd_p * w_p * r.y;
-        grad_w += w_p;
-
-        // - sample (antipodal), gradient direction is -r
-        float s_m  = tile_bilinear(tile_center - o);
-        float rd_m = s_m - Y_gamma;
-        float a2_m = rd_m < 0.0 ? asym_scale_sq : 1.0;
-        float t_m  = max(0.0, 1.0 - weight_k * rd_m * rd_m * a2_m);
-        float w_m  = t_m * t_m;
-        blurred += s_m * w_m;
-        total_w += w_m;
-        gx -= rd_m * w_m * r.x;
-        gy -= rd_m * w_m * r.y;
-        grad_w += w_m;
-    }
-
-    // Inner ring (radius R/2). Per original tuning:
-    //  - blur weights take INNER_RING_BOOST (inner ring carries 2:1 weight)
-    //  - gradient weights use the un-boosted w so the boost only amplifies
-    //    blur trust, not gradient estimation
-    //  - gradient direction scaled by 2.0 to match outer-ring units
-    //    (raw_diff at half radius is half the linear-gradient response;
-    //    multiply back to keep gx/gy comparable across rings).
-    for (int i = 0; i < 3; i++) {
-        vec2 h = inner_basis[i];
-        vec2 r = vec2(h.x * ca - h.y * sa, h.x * sa + h.y * ca);
-        vec2 o = r * (float(GRAIN_BLUR_RADIUS) * 0.5);
-
-        // + sample
-        float s_p  = tile_bilinear(tile_center + o);
-        float rd_p = s_p - Y_gamma;
-        float a2_p = rd_p < 0.0 ? asym_scale_sq : 1.0;
-        float t_p  = max(0.0, 1.0 - weight_k * rd_p * rd_p * a2_p);
-        float w_p  = t_p * t_p;
-        blurred += s_p * w_p * INNER_RING_BOOST;
-        total_w += w_p * INNER_RING_BOOST;
-        gx += rd_p * w_p * r.x * 2.0;
-        gy += rd_p * w_p * r.y * 2.0;
-        grad_w += w_p;
-
-        // - sample
-        float s_m  = tile_bilinear(tile_center - o);
-        float rd_m = s_m - Y_gamma;
-        float a2_m = rd_m < 0.0 ? asym_scale_sq : 1.0;
-        float t_m  = max(0.0, 1.0 - weight_k * rd_m * rd_m * a2_m);
-        float w_m  = t_m * t_m;
-        blurred += s_m * w_m * INNER_RING_BOOST;
-        total_w += w_m * INNER_RING_BOOST;
-        gx -= rd_m * w_m * r.x * 2.0;
-        gy -= rd_m * w_m * r.y * 2.0;
-        grad_w += w_m;
+        for (int k = 0; k < 2; k++) {
+            float sgn = (k == 0) ? 1.0 : -1.0;   // + sample, then antipodal -
+            float s  = tile_bilinear(tile_center + o * sgn);
+            float rd = s - Y_gamma;
+            float a2 = rd < 0.0 ? asym_scale_sq : 1.0;
+            float tw = max(0.0, 1.0 - weight_k * rd * rd * a2);
+            float w  = tw * tw;
+            blurred += s * w * boost;
+            total_w += w * boost;
+            gx += rd * w * r.x * gscale * sgn;
+            gy += rd * w * r.y * gscale * sgn;
+            grad_w += w;
+        }
     }
 
     float inv_grad_w = grad_w > 0.0 ? 1.0 / grad_w : 0.0;
@@ -1565,14 +1529,14 @@ void hook() {
                                     // below; peak at Y=1.0 is unchanged, so no attenuation of the
                                     // source clip. Lower = wider/gentler phase-in (floor ~0.75
                                     // before spec starts catching bright-but-not-specular pixels).
-#define SPEC_Y_LOW_MID_BUMP 0.05    // Parabolic bump pushes onset to 0.93 at spec_apl=0.5,
+#define SPEC_Y_LOW_MID_BUMP 0.05    // Parabolic bump pushes onset to 0.93 at apl_t=0.5,
                                     // which corresponds to smoothed_log_avg ≈ 0.16 —
                                     // normally-lit interiors, dusk exteriors, mid-key
                                     // cinematic lighting. Adds selectivity in scenes
                                     // with abundant mid-bright surfaces (lampshades,
                                     // faces, fabrics, TV screens) by requiring V > 0.93
                                     // before spec fires. Endpoints (dark/bright APL)
-                                    // are unaffected — bump is zero at spec_apl=0 and 1.
+                                    // are unaffected — bump is zero at apl_t=0 and 1.
 #define SPEC_PEAK_DARK      1.9     // Specular boost in dark scenes (highlight pop)
 #define SPEC_PEAK_BRIGHT    0.7     // Specular boost in bright scenes (modest — eye whites
                                     // and hair highlights kept perceptually cool)
@@ -1584,8 +1548,10 @@ void hook() {
                                     // Walks back part of the v5.0 hair-trim hardening
                                     // (was 1.25); paired with SPEC_PEAK_BRIGHT=0.7 the
                                     // total bright-scene spec stays modest.
-#define SPEC_APL_LOW        0.03    // Scene APL below → dark-scene specular params
-#define SPEC_APL_HIGH       0.30    // Scene APL above → bright-scene specular params
+// (SPEC_APL_LOW/HIGH deleted 2026-07-02 — the pair was numerically identical
+// to APL_KEY_DARK/BRIGHT since introduction and never diverged. The spec
+// params now read the shared apl_t scene axis; retune via APL_KEY_DARK/BRIGHT,
+// or re-split deliberately if specular ever needs its own APL window.)
 // Saturation gate. Genuine specular is near-white; bright clothing/hair/skin
 // have chroma at high luminance. Gamma-space max−min saturation. Scene-aware:
 // dark scenes preserve saturated emissives (red LEDs, blue lasers should still
@@ -2014,9 +1980,13 @@ vec4 hook() {
     // STEP 4: APL MODULATION (brightness-driven scaling)
     // -------------------------------------------------------------------------
     // Dark scenes get more headroom, bright scenes get dampened.
+    // Scene APL axis (0 = dark key, 1 = bright key) — shared by the APL
+    // modulation below AND the specular-bonus params. ONE axis BY DESIGN
+    // (merged 2026-07-02): the former SPEC_APL_LOW/HIGH knob pair was
+    // numerically identical to APL_KEY_DARK/BRIGHT and never diverged.
+    float apl_t = smoothstep(APL_KEY_DARK, APL_KEY_BRIGHT, smoothed_log_avg);
     #if ENABLE_APL_MOD
     {
-        float apl_t = smoothstep(APL_KEY_DARK, APL_KEY_BRIGHT, smoothed_log_avg);
         float apl_factor = mix(APL_BOOST_DARK, APL_DAMPEN_BRIGHT, apl_t);
         // Mid-scene notch: parabolic dampener at apl_t=0.5. Trims the APL
         // multiplier on mid-key interiors / dusk exteriors specifically;
@@ -2049,10 +2019,10 @@ vec4 hook() {
     float spec_strength;
     {
         // Scene-level APL drives peak/gamma — dark *scenes* get more pop,
-        // but no spatial edge bias within a single bright region.
-        float spec_apl = smoothstep(SPEC_APL_LOW, SPEC_APL_HIGH, smoothed_log_avg);
-        float spec_peak = mix(SPEC_PEAK_DARK, SPEC_PEAK_BRIGHT, spec_apl);
-        float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, spec_apl);
+        // but no spatial edge bias within a single bright region. apl_t is
+        // the shared scene axis hoisted above STEP 4.
+        float spec_peak = mix(SPEC_PEAK_DARK, SPEC_PEAK_BRIGHT, apl_t);
+        float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, apl_t);
         // Drive signal: grain-stabilized luma, Y ONLY — by design, twice
         // field-rejected otherwise. A saturation-gated peak-channel (V)
         // escape for dim saturated emissives (red LED Y=0.21, blue laser
@@ -2074,9 +2044,9 @@ vec4 hook() {
         // APL-tiered onset: parabolic bump pushes the ramp threshold up in
         // mid-bright scenes where lots of pixels are 0.88–0.93 but aren't
         // genuine specular. Endpoints stay at SPEC_Y_LOW. Bump peaks at
-        // spec_apl=0.5 with value SPEC_Y_LOW_MID_BUMP.
+        // apl_t=0.5 with value SPEC_Y_LOW_MID_BUMP.
         float spec_y_low = SPEC_Y_LOW
-                         + SPEC_Y_LOW_MID_BUMP * spec_apl * (1.0 - spec_apl) * 4.0;
+                         + SPEC_Y_LOW_MID_BUMP * apl_t * (1.0 - apl_t) * 4.0;
         float spec_t = smoothstep(spec_y_low, 1.0, spec_driver);
         // Super-white overshoot: upscaler can produce signal > 1.0. Treat
         // it as evidence that the source was SDR-clipped — add linear bonus
@@ -2097,7 +2067,7 @@ vec4 hook() {
         // the Oklab fast-path bypass).
         float emissive_carve = smoothstep(SPEC_SAT_EMISSIVE_LOW,
                                           SPEC_SAT_EMISSIVE_HIGH, V_gamma);
-        float sat_atten = mix(SPEC_SAT_ATTEN_DARK, SPEC_SAT_ATTEN_BRIGHT, spec_apl)
+        float sat_atten = mix(SPEC_SAT_ATTEN_DARK, SPEC_SAT_ATTEN_BRIGHT, apl_t)
                         * (1.0 - emissive_carve);
         spec_strength *= 1.0 - smoothstep(SPEC_SAT_LOW, SPEC_SAT_HIGH, sat_gamma) * sat_atten;
 

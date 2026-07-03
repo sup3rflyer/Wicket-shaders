@@ -1,4 +1,4 @@
-// NitMeter v1.3 — HDR peak-nit analysis overlay for mpv (gpu-next)
+// NitMeter v1.4 — HDR peak-nit analysis overlay for mpv (gpu-next)
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Companion dev tool for CelFlare: decodes the PQ frame and displays
@@ -10,7 +10,15 @@
 //   Per-pixel light level = pixel CLL: PQ-EOTF(max(R,G,B)) * 10000 — the
 //   same convention as MaxCLL/MaxFALL in HDR10 static metadata.
 //   Panel rows (7-seg letter labels):
-//     P (white)  — frame peak CLL in nits (sample-and-hold, ~0.5 s refresh)
+//     P (white)  — frame peak CLL in nits (sample-and-hold, ~0.5 s refresh).
+//                  STRICT max pixel — on web re-encodes this is often codec
+//                  ringing, not content (calibration vs a DoVi-labeled
+//                  reference measured spike pixels ~4x the master's peak)
+//     9 (grey)   — 99.99th-percentile pixel CLL: the practical/content
+//                  peak, immune to lone spike pixels (~830 px ignored at
+//                  4K). Same convention as madVR measurements and the
+//                  ST 2094-40 maxscl distribution. P >> 9 means the "peak"
+//                  is encode noise; P close to 9 means it is real content
 //     H (yellow) — peak hold: held ~3 s after the last new peak, then decays
 //     A (cyan)   — FALL: frame-average CLL (letterbox bars included, same as
 //                  the MaxFALL averaging; ~0.5 s refresh; dilution on scope)
@@ -77,7 +85,9 @@
 //     return until the next white. Disable if you ever feed legit
 //     8000+ nit material.
 //   NITMETER_CORNER — 0 TL / 1 TR (default) / 2 BL / 3 BR
-//   NITMETER_SCALE  — panel size multiplier (1.0 = ~136x182 px at 1080p)
+//   NITMETER_SCALE  — panel size multiplier (1.0 = ~136x207 px at 1080p)
+//   NM_PEAK_PCT_FRAC (PASS 2) — fraction of frame pixels allowed ABOVE the
+//     9-row readout (default 0.0001 = 99.99th percentile)
 //
 // The two measurement passes run BEFORE the overlay draw, so the panel and
 // heatmap never contaminate their own statistics.
@@ -104,20 +114,34 @@
 //!VAR float nm_sdr
 //!VAR float nm_maxcll
 //!VAR float nm_maxfall
+//!VAR float nm_p9999
 //!VAR float nm_show_peak
+//!VAR float nm_show_p9999
 //!VAR float nm_show_fall
 //!VAR float nm_show_ctr
 //!VAR float nm_hist[24]
+//!VAR uint nm_phist[256]
 //!STORAGE
 
 //!HOOK MAIN
 //!BIND HOOKED
+//!BIND NITMETER_STATE
 //!SAVE NITMETER_BLK
-//!WIDTH HOOKED.w 15 + 16 /
-//!HEIGHT HOOKED.h 15 + 16 /
+//!WIDTH HOOKED.w 7 + 16 /
+//!HEIGHT HOOKED.h 7 + 16 /
 //!COMPUTE 16 16
-//!DESC NitMeter: block reduce (16x16 max/mean CLL)
+//!DESC NitMeter: block reduce (16x16 max/mean CLL) + pixel histogram
 
+// SIZE RPN: libplacebo evaluates the expression in FLOAT and roundf()s the
+// result (half away from zero) — it is NOT C integer division. The naive
+// ceil-divide idiom (dim+15)/16 therefore lands one block HIGH whenever
+// dim%16 is 0 or 9..15 (i.e. nearly every standard resolution), leaving a
+// phantom column/row that PASS 2 reads but nothing writes. (dim+7)/16 under
+// roundf equals floor((dim+15)/16) = ceil(dim/16) exactly, for every dim —
+// that is what the WIDTH/HEIGHT above encode. Audit-caught in v1.4; in
+// v1.1-v1.3 the oversized texture was masked by unguarded edge-clamped
+// writes filling the phantom texels with duplicated edge content.
+//
 // ST.2084 PQ, exact forms only (this is a measurement tool — no fast
 // approx). Duplicated in every NitMeter pass: separate translation units,
 // keep in sync.
@@ -136,29 +160,48 @@ float pq_oetf_norm(float L) {   // linear (1.0 = 10000 nits) -> PQ code
     return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
 }
 
+// Per-workgroup staging for the frame-global 256-bin pixel-code histogram
+// (percentile peak, PASS 2). Each invocation reduces one 16x16 block, so a
+// workgroup covers 256 blocks; staging in shared memory keeps the SSBO
+// atomic traffic to at most 256 adds per workgroup instead of per pixel.
+shared uint s_ph[256];
+
 void hook() {
+    uint lid = gl_LocalInvocationIndex;
+    s_ph[lid] = 0u;
+    barrier();
+
     ivec2 bpos = ivec2(gl_GlobalInvocationID.xy);
-    vec2 base = vec2(bpos) * 16.0;
-    float emax = 0.0;   // block max PQ code of per-pixel max(R,G,B)
-    float lsum = 0.0;   // block sum of linear CLL (1.0 = 10000 nits)
-    float ceil_cnt = 0.0;   // pixels at the signal ceiling (SDR-tripwire evidence)
-    for (int j = 0; j < 16; j++) {
-        for (int i = 0; i < 16; i++) {
-            vec2 uv = (base + vec2(float(i), float(j)) + 0.5) * HOOKED_pt;
-            // clamp-to-edge duplicates at the frame edge: no effect on max,
-            // negligible edge-weighting on the mean
-            vec3 rgb = HOOKED_tex(uv).rgb;
-            float e = max(rgb.r, max(rgb.g, rgb.b));
-            emax = max(emax, e);
-            lsum += pq_eotf_norm(e);
-            ceil_cnt += step(0.9995, e);
+    // live = this invocation's block exists in the grid. Padded-dispatch
+    // phantom blocks used to be handled by the imageStore OOB no-op alone;
+    // the histogram is an SSBO (no OOB safety net), so gate explicitly.
+    bool live = all(lessThan(bpos, (ivec2(HOOKED_size) + 15) / 16));
+    if (live) {
+        vec2 base = vec2(bpos) * 16.0;
+        float emax = 0.0;   // block max PQ code of per-pixel max(R,G,B)
+        float lsum = 0.0;   // block sum of linear CLL (1.0 = 10000 nits)
+        float ceil_cnt = 0.0;   // pixels at the signal ceiling (SDR-tripwire evidence)
+        for (int j = 0; j < 16; j++) {
+            for (int i = 0; i < 16; i++) {
+                vec2 uv = (base + vec2(float(i), float(j)) + 0.5) * HOOKED_pt;
+                // clamp-to-edge duplicates at the frame edge: no effect on
+                // max, negligible edge-weighting on the mean and histogram
+                vec3 rgb = HOOKED_tex(uv).rgb;
+                float e = max(rgb.r, max(rgb.g, rgb.b));
+                emax = max(emax, e);
+                lsum += pq_eotf_norm(e);
+                ceil_cnt += step(0.9995, e);
+                atomicAdd(s_ph[uint(clamp(e, 0.0, 0.999999) * 256.0)], 1u);
+            }
         }
+        // Store PQ codes (perceptually uniform in [0,1]) so the intermediate
+        // is robust to whatever SAVE format the fbo setting picks.
+        imageStore(out_image, bpos, vec4(emax, pq_oetf_norm(lsum / 256.0), ceil_cnt / 256.0, 1.0));
     }
-    // Store PQ codes (perceptually uniform in [0,1]) so the intermediate is
-    // robust to whatever SAVE format the fbo setting picks.
-    imageStore(out_image, bpos, vec4(emax, pq_oetf_norm(lsum / 256.0), ceil_cnt / 256.0, 1.0));
-    // Threads past the padded right/bottom edge imageStore out of bounds —
-    // a defined no-op, same pattern as CelFlare's prefilter dispatch.
+    barrier();
+    // flush this workgroup's staging bins; PASS 2 reads then zeroes them
+    uint c = s_ph[lid];
+    if (c > 0u) atomicAdd(nm_phist[lid], c);
 }
 
 //!HOOK MAIN
@@ -189,6 +232,8 @@ float pq_eotf_norm(float e) {   // PQ code -> linear, 1.0 = 10000 nits
 #define NM_SDR_ALPHA_UP     0.10    // suspicion attack (~0.3 s @24p)
 #define NM_SDR_ALPHA_DN     0.015   // suspicion release (~2 s @24p)
 #define NM_SHOW_FRAMES      12.0    // ~0.5 s @24p numeric sample-and-hold (readability)
+#define NM_PEAK_PCT_FRAC    0.0001  // 9-row: 99.99th percentile (frame fraction above)
+#define NM_PHIST_BINS       256     // pixel-code histogram bins — MUST match PASS 1 s_ph
 
 shared float s_max[144];
 shared float s_sum[144];
@@ -283,15 +328,57 @@ void hook() {
             nm_maxcll  = max(nm_maxcll, pk);
             nm_maxfall = max(nm_maxfall, nm_fall);
         }
+        // pixel-level percentile peak from the 256-bin code histogram:
+        // walk from the top bin until NM_PEAK_PCT_FRAC of the frame's
+        // pixels lie above, then interpolate inside the stopping bin
+        // (uniform-within-bin). Immune to the lone codec-ringing spike
+        // pixels that dominate a strict max on web re-encodes — the same
+        // practical-peak convention as madVR measurements / ST 2094-40.
+        // Total from the histogram itself (== frame pixel count: PASS 1
+        // gates phantom padded blocks off the histogram).
+        uint tot = 0u;
+        for (int b = 0; b < NM_PHIST_BINS; b++) tot += nm_phist[b];
+        nm_p9999 = 0.0;
+        if (tot > 0u) {
+            // floor at 1 px so small frames still ignore the single hottest
+            // pixel instead of degenerating into a second P row; compare in
+            // uint (acc can pass 2^24 at 8K, where float comparisons drift)
+            uint target = max(uint(NM_PEAK_PCT_FRAC * float(tot)), 1u);
+            uint acc = 0u;
+            int bi = NM_PHIST_BINS - 1;
+            for (; bi >= 0; bi--) {
+                acc += nm_phist[bi];
+                if (acc >= target) break;
+            }
+            bi = max(bi, 0);
+            float bcnt = max(float(nm_phist[bi]), 1.0);
+            // target sits 'into' of the way down from the bin's top edge
+            float into = clamp((float(target) - (float(acc) - bcnt)) / bcnt, 0.0, 1.0);
+            float code = (float(bi) + 1.0 - into) / float(NM_PHIST_BINS);
+            // a percentile can never exceed the max; the min also snaps the
+            // uniform-frame case (everything in one bin, interpolation lands
+            // on the bin's upper edge) back to the exact frame value
+            nm_p9999 = min(pq_eotf_norm(code) * 10000.0, pk);
+        }
+        // zero the bins for the next frame's PASS 1 accumulation
+        for (int b = 0; b < NM_PHIST_BINS; b++) nm_phist[b] = 0u;
         // numeric sample-and-hold (Lilium-style ~0.5 s readout refresh):
         // measurement stays per-frame, only the SHOWN digits are held.
         // Countdown from 0 so the very first frame populates immediately.
         // while tripped, refresh every frame (blanked anyway) so the
-        // FIRST unblanked frame shows current values, not a stale snapshot
-        if (nm_show_ctr <= 0.0 || nm_sdr > 0.5) {
-            nm_show_peak = pk;
-            nm_show_fall = nm_fall;
-            nm_show_ctr  = NM_SHOW_FRAMES;
+        // FIRST unblanked frame shows current values, not a stale snapshot.
+        // jolt = hard discontinuity (seek, scene cut): resample NOW instead
+        // of showing digits from up to 12 rendered frames ago — matters
+        // most when paused-and-seeking, where renders are scarce and the
+        // hold used to span several seek points (field-observed). Floors
+        // keep near-black scenes from churning the digits every frame.
+        bool jolt = abs(pk - nm_show_peak)      > 0.5 * max(nm_show_peak, 100.0)
+                 || abs(nm_fall - nm_show_fall) > 0.5 * max(nm_show_fall, 20.0);
+        if (nm_show_ctr <= 0.0 || jolt || nm_sdr > 0.5) {
+            nm_show_peak  = pk;
+            nm_show_p9999 = nm_p9999;
+            nm_show_fall  = nm_fall;
+            nm_show_ctr   = NM_SHOW_FRAMES;
         }
         nm_show_ctr -= 1.0;
         for (int b = 0; b < NM_HIST_BINS; b++)
@@ -304,7 +391,7 @@ void hook() {
 //!BIND HOOKED
 //!BIND NITMETER_STATE
 //!BIND NITMETER_STATS
-//!DESC NitMeter v1.3: overlay draw
+//!DESC NitMeter v1.4: overlay draw
 
 // NITMETER_STATS is bound only as the explicit data dependency on PASS 2 —
 // the stats themselves arrive through the NITMETER_STATE SSBO (same pattern
@@ -322,7 +409,7 @@ void hook() {
 #define NM_HIST_BINS   24          // MUST match PASS 2
 #define NM_HIST_LOG_HI 13.2877     // MUST match PASS 2
 #define NM_PANEL_W     136.0
-#define NM_PANEL_H     182.0
+#define NM_PANEL_H     207.0
 
 // PQ duplicate — keep in sync with the other passes.
 float pq_eotf_norm(float e) {   // PQ code -> linear, 1.0 = 10000 nits
@@ -355,8 +442,8 @@ vec3 heat_lin(float n) {
 
 // 7-segment glyphs. Bits: A=1 B=2 C=4 D=8 E=16 F=32 G=64.
 const int NM_SEG[10] = int[10](0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F);
-// row label glyphs: P, H, A, C, F
-const int NM_LBL[5] = int[5](0x73, 0x76, 0x77, 0x39, 0x71);
+// row label glyphs: P, 9 (99.99th-pct peak), H, A, C, F
+const int NM_LBL[6] = int[6](0x73, 0x6F, 0x76, 0x77, 0x39, 0x71);
 
 float seg_rect(vec2 p, vec2 c, vec2 h) {
     vec2 d = abs(p - c) - h;
@@ -411,11 +498,13 @@ float dashes_mask(vec2 p, float h) {
     return seg_rect(vec2(xl / h, p.y / h), vec2(0.33, 0.50), vec2(0.21, 0.05));
 }
 
-// panel geometry: 5 label+digit rows, then the histogram strip
-const float NM_ROW_Y[5] = float[5](8.0, 33.0, 58.0, 83.0, 108.0);
-// row colors as display nits: P white, H yellow, A cyan, C orange, F green
-const vec3 NM_ROW_NITS[5] = vec3[5](
+// panel geometry: 6 label+digit rows, then the histogram strip
+const float NM_ROW_Y[6] = float[6](8.0, 33.0, 58.0, 83.0, 108.0, 133.0);
+// row colors as display nits: P white, 9 dim grey-white, H yellow, A cyan,
+// C orange, F green
+const vec3 NM_ROW_NITS[6] = vec3[6](
     vec3(230.0, 230.0, 230.0),
+    vec3(150.0, 150.0, 150.0),
     vec3(220.0, 180.0, 15.0),
     vec3(15.0,  190.0, 230.0),
     vec3(230.0, 110.0, 15.0),
@@ -465,7 +554,7 @@ vec4 hook() {
         float rx = NM_PANEL_W - 8.0;
         float m;
         // row labels (always drawn, even while tripped — they say what's blank)
-        for (int r = 0; r < 5; r++) {
+        for (int r = 0; r < 6; r++) {
             m = glyph_mask(NM_LBL[r], vec2((lp.x - 8.0) / 20.0, (lp.y - NM_ROW_Y[r]) / 20.0));
             col = mix(col, pq_nits(NM_ROW_NITS[r]), m);
         }
@@ -480,17 +569,19 @@ vec4 hook() {
             vec2 db = min(lp, vec2(NM_PANEL_W, NM_PANEL_H) - lp);
             col = mix(col, pq_nits(vec3(180.0, 8.0, 8.0)),
                       0.9 * step(min(db.x, db.y), 3.0));
-            for (int r = 0; r < 5; r++) {
+            for (int r = 0; r < 6; r++) {
                 m = dashes_mask(vec2(rx - lp.x, lp.y - NM_ROW_Y[r]), 20.0);
                 col = mix(col, pq_nits(NM_ROW_NITS[r]), m);
             }
             return vec4(col, color.a);
         }
 
-        // digit rows: P peak (shown, ~0.5 s hold), H peak-hold, A FALL
-        // (shown), C session MaxCLL, F session MaxFALL
-        float vals[5] = float[5](nm_show_peak, nm_hold, nm_show_fall, nm_maxcll, nm_maxfall);
-        for (int r = 0; r < 5; r++) {
+        // digit rows: P peak (shown, ~0.5 s hold), 9 percentile peak
+        // (shown), H peak-hold, A FALL (shown), C session MaxCLL,
+        // F session MaxFALL
+        float vals[6] = float[6](nm_show_peak, nm_show_p9999, nm_hold,
+                                 nm_show_fall, nm_maxcll, nm_maxfall);
+        for (int r = 0; r < 6; r++) {
             m = value_mask(vals[r], vec2(rx - lp.x, lp.y - NM_ROW_Y[r]), 20.0);
             col = mix(col, pq_nits(NM_ROW_NITS[r]), m);
         }
@@ -504,7 +595,7 @@ vec4 hook() {
         col = mix(col, pq_nits(tc), tm);
 
         // histogram strip: log2 axis, 1 -> 10000 nits
-        if (lp.x >= 8.0 && lp.x < 128.0 && lp.y >= 134.0 && lp.y < 174.0) {
+        if (lp.x >= 8.0 && lp.x < 128.0 && lp.y >= 159.0 && lp.y < 199.0) {
             float hx = (lp.x - 8.0) / 120.0;
             // reference ticks at 100 / 203 / 1000 / 4000 nits
             float tick = step(abs(hx - 0.5000), 0.004);
@@ -517,7 +608,7 @@ vec4 hook() {
             // geometry edit can't silently reopen an OOB SSBO read
             int bin = clamp(int(hx * float(NM_HIST_BINS)), 0, NM_HIST_BINS - 1);
             float bh = pow(clamp(nm_hist[bin], 0.0, 1.0), 0.4);   // gamma'd so small areas stay visible
-            float yy = (174.0 - lp.y) / 40.0;                     // 0 bottom .. 1 top
+            float yy = (199.0 - lp.y) / 40.0;                     // 0 bottom .. 1 top
             if (yy < bh) {
                 float cn = exp2((float(bin) + 0.5) / float(NM_HIST_BINS) * NM_HIST_LOG_HI);
                 vec3 bc = (cn < 100.0) ? vec3(0.5) : heat_lin(cn);

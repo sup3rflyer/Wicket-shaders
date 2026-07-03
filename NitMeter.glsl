@@ -1,4 +1,4 @@
-// NitMeter v1.4 — HDR peak-nit analysis overlay for mpv (gpu-next)
+// NitMeter v1.5 — HDR peak-nit analysis overlay for mpv (gpu-next)
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Companion dev tool for CelFlare: decodes the PQ frame and displays
@@ -19,7 +19,8 @@
 //                  4K). Same convention as madVR measurements and the
 //                  ST 2094-40 maxscl distribution. P >> 9 means the "peak"
 //                  is encode noise; P close to 9 means it is real content
-//     H (yellow) — peak hold: held ~3 s after the last new peak, then decays
+//     H (yellow) — hold of the 9 row: latches its highest recent value,
+//                  sits ~3 s, then decays — spike-free recent content peak
 //     A (cyan)   — FALL: frame-average CLL (letterbox bars included, same as
 //                  the MaxFALL averaging; ~0.5 s refresh; dilution on scope)
 //     C (orange) — session MaxCLL: running max frame peak since toggle-on
@@ -291,43 +292,6 @@ void hook() {
         float inv = 1.0 / max(float(total), 1.0);
         nm_peak = pk;
         nm_fall = sm * inv;
-        // classic peak hold: latch upward instantly, sit for NM_HOLD_FRAMES,
-        // then decay multiplicatively but never below the live peak
-        if (pk >= nm_hold) {
-            nm_hold = pk;
-            nm_hold_age = 0.0;
-        } else {
-            nm_hold_age += 1.0;
-            if (nm_hold_age > NM_HOLD_FRAMES)
-                nm_hold = max(pk, nm_hold * NM_HOLD_DECAY);
-        }
-        // SDR-input tripwire (heuristic), two OR'd signals — see header:
-        // (a) a solid clipped-white AREA (block mean past the gate);
-        // (b) enough scattered pixels at the exact signal ceiling — SDR
-        //     whites clip to code 1.0 en masse, graded HDR never gets
-        //     there (masters cap ~0.92) and lone YUV-overshoot pixels
-        //     stay far under the area threshold.
-        // Asymmetric EMA: fast attack, slow release (no scene strobing).
-        float cf  = cfs * inv;   // frame fraction of ceiling pixels
-        float sus = ((pkm > NM_SDR_SUSPECT_NITS) || (cf > NM_SDR_CEIL_FRAC)) ? 1.0 : 0.0;
-        nm_sdr += ((sus > nm_sdr) ? NM_SDR_ALPHA_UP : NM_SDR_ALPHA_DN) * (sus - nm_sdr);
-        // session maxima (MaxCLL/MaxFALL semantics; reset per shader load,
-        // which the cycle script triggers on every toggle step). Reset while
-        // the tripwire is engaged so SDR garbage can't poison them.
-        if (nm_sdr > 0.5) {
-            nm_maxcll  = 0.0;
-            nm_maxfall = 0.0;
-            // quarantine ALL temporal readout state while tripped, not just
-            // the session maxima: the hold and P/A snapshots used to survive
-            // a trip carrying garbage, so after recovery H decayed from
-            // ~10000 and sat ABOVE C for seconds (field-observed). Hold
-            // re-latches instantly from clean content on release.
-            nm_hold     = 0.0;
-            nm_hold_age = 0.0;
-        } else {
-            nm_maxcll  = max(nm_maxcll, pk);
-            nm_maxfall = max(nm_maxfall, nm_fall);
-        }
         // pixel-level percentile peak from the 256-bin code histogram:
         // walk from the top bin until NM_PEAK_PCT_FRAC of the frame's
         // pixels lie above, then interpolate inside the stopping bin
@@ -362,6 +326,48 @@ void hook() {
         }
         // zero the bins for the next frame's PASS 1 accumulation
         for (int b = 0; b < NM_PHIST_BINS; b++) nm_phist[b] = 0u;
+        // classic peak hold: latch upward instantly, sit for NM_HOLD_FRAMES,
+        // then decay multiplicatively but never below the live value.
+        // Driven by the PERCENTILE peak, not the strict max — H is "recent
+        // content peak", spike-free; a hold latched to strict max would
+        // pin the worst codec-ringing pixel of the last 3 s instead.
+        // (Must stay upstream of the tripwire quarantine below, which
+        // zeroes it on tripped frames.)
+        if (nm_p9999 >= nm_hold) {
+            nm_hold = nm_p9999;
+            nm_hold_age = 0.0;
+        } else {
+            nm_hold_age += 1.0;
+            if (nm_hold_age > NM_HOLD_FRAMES)
+                nm_hold = max(nm_p9999, nm_hold * NM_HOLD_DECAY);
+        }
+        // SDR-input tripwire (heuristic), two OR'd signals — see header:
+        // (a) a solid clipped-white AREA (block mean past the gate);
+        // (b) enough scattered pixels at the exact signal ceiling — SDR
+        //     whites clip to code 1.0 en masse, graded HDR never gets
+        //     there (masters cap ~0.92) and lone YUV-overshoot pixels
+        //     stay far under the area threshold.
+        // Asymmetric EMA: fast attack, slow release (no scene strobing).
+        float cf  = cfs * inv;   // frame fraction of ceiling pixels
+        float sus = ((pkm > NM_SDR_SUSPECT_NITS) || (cf > NM_SDR_CEIL_FRAC)) ? 1.0 : 0.0;
+        nm_sdr += ((sus > nm_sdr) ? NM_SDR_ALPHA_UP : NM_SDR_ALPHA_DN) * (sus - nm_sdr);
+        // session maxima (MaxCLL/MaxFALL semantics; reset per shader load,
+        // which the cycle script triggers on every toggle step). Reset while
+        // the tripwire is engaged so SDR garbage can't poison them.
+        if (nm_sdr > 0.5) {
+            nm_maxcll  = 0.0;
+            nm_maxfall = 0.0;
+            // quarantine ALL temporal readout state while tripped, not just
+            // the session maxima: the hold and P/A snapshots used to survive
+            // a trip carrying garbage, so after recovery H decayed from
+            // ~10000 and sat ABOVE C for seconds (field-observed). Hold
+            // re-latches instantly from clean content on release.
+            nm_hold     = 0.0;
+            nm_hold_age = 0.0;
+        } else {
+            nm_maxcll  = max(nm_maxcll, pk);
+            nm_maxfall = max(nm_maxfall, nm_fall);
+        }
         // numeric sample-and-hold (Lilium-style ~0.5 s readout refresh):
         // measurement stays per-frame, only the SHOWN digits are held.
         // Countdown from 0 so the very first frame populates immediately.
@@ -391,7 +397,7 @@ void hook() {
 //!BIND HOOKED
 //!BIND NITMETER_STATE
 //!BIND NITMETER_STATS
-//!DESC NitMeter v1.4: overlay draw
+//!DESC NitMeter v1.5: overlay draw
 
 // NITMETER_STATS is bound only as the explicit data dependency on PASS 2 —
 // the stats themselves arrive through the NITMETER_STATE SSBO (same pattern

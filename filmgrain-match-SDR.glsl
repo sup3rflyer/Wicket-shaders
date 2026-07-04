@@ -77,6 +77,7 @@
 // to invalidate the persisted GRAIN_STATE live.
 //@shampv input sdr
 //@shampv ref-white-param grain_ref_white
+//@shampv toggle grain_hdr debug_match density_combine grid_snap
 
 //!PARAM match_grain
 //!TYPE DYNAMIC float

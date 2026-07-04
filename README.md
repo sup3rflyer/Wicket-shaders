@@ -198,6 +198,8 @@ Runtime controls (live-toggleable via `glsl-shader-opts`):
 |-------|--------|
 | `match_grain` | 0 = bit-identical to the fixed Light tier, 1 = matched. `mix()` between, so A/B is non-destructive. |
 | `grain_sharpness` | Global crispness dial (1 = crisp 4K-scan default, 0 = a softer look). |
+| `grain_rate` | Grain animation cadence, as a fraction of rendered frames (default 0.5 = re-seed every 2nd frame — blends with the surviving source grain; 1 = fresh grain every frame). |
+| `grain_base_sat` | Per-channel independence of the base grain — the subtle baked-in hue speckle (default 0.25 = calibrated look; 0 = mono grain). |
 | `restore_gain` | How far to extrapolate past the surviving grain toward the camera original. |
 | `density_combine` | 0 = additive, 1 = multiplicative density (grain rides the tone/bloom gradients). |
 | `grain_hdr` | 1 = PQ BT.2020 output chain (e.g. CelFlare): grain is keyed and applied in the measured SDR domain via a per-pixel PQ bridge, fading out shortly above reference white. 0 = plain SDR (exact prior behavior). |

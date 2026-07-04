@@ -76,6 +76,7 @@
 // glsl-shader-opts changes apply next frame, no recompile; bump state_epoch
 // to invalidate the persisted GRAIN_STATE live.
 //@shampv input sdr
+//@shampv ref-white-param grain_ref_white
 
 //!PARAM match_grain
 //!TYPE DYNAMIC float
@@ -184,6 +185,20 @@
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
+
+//!PARAM grain_hdr
+//!DESC HDR chain mode — set 1 when the output is PQ BT.2020 (the CelFlare sdr-to-hdr chain). Keys and applies grain in the measured SDR domain via a per-pixel PQ bridge; grain fades to zero shortly above reference white. 0 = exact prior SDR behavior.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM grain_ref_white
+//!DESC SDR reference white in nits for the HDR bridge — must match hdr-reference-white (and CelFlare's cf_ref_white).
+//!TYPE DYNAMIC float
+//!MINIMUM 80.0
+//!MAXIMUM 480.0
+100.0
 
 //!BUFFER GRAIN_STATE
 //!VAR float m_intensity_raw
@@ -1338,6 +1353,26 @@ float rand_triangular(inout uint state, float variance_scale) {
     return (u + v - 1.0) * 0.612 * variance_scale;
 }
 
+// --- HDR (PQ BT.2020 output) domain bridge, grain_hdr=1 — for the CelFlare
+// chain. The grain model is measured on gamma-encoded SDR source codes, but
+// under the sdr-to-hdr retag the OUTPUT pixels are true PQ (CelFlare decodes,
+// expands, PQ-encodes). Bridge per pixel: PQ code -> nits -> SDR-equivalent
+// 2.4-gamma code vs grain_ref_white; key + apply the model there; re-encode.
+// Grain lands exactly as the SDR path wherever the image sits at SDR levels
+// (CelFlare holds midtones) and fades to zero shortly above reference white
+// (the measured bell extrapolates; grain does not persist into expanded
+// highlight cores). ST 2084
+// constants match CelFlare's own encode so the round-trip shares a transfer.
+float pq_eotf_nits(float e) {
+    float p = pow(e, 1.0 / 78.84375);
+    return 10000.0 * pow(max(p - 0.8359375, 0.0)
+                         / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125);
+}
+float pq_oetf_code(float nits) {
+    float y = pow(clamp(nits / 10000.0, 0.0, 1.0), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+}
+
 float grain_scale(float lum, float mid, float steepness) {
     float d2 = steepness * (lum - mid) * (lum - mid);
     float t = 1.0 - d2 * TUKEY_SCALE;
@@ -1766,17 +1801,46 @@ void hook() {
 
     vec4 color = GRAIN_SRC_tex(GRAIN_SRC_pos);
 
-    float color_luma = dot(color.rgb, luma_coeff);
-    float color_sat = rgb_saturation(color.rgb);
+    // grain_hdr bridge: work in the measured SDR domain (see helpers above).
+    // Clamp the PQ input codes — YUV->RGB overshoot above 1.0 explodes the
+    // PQ EOTF. SDR-equivalent codes may exceed 1.0 where CelFlare expanded;
+    // the tone bell extrapolates toward zero grain shortly above 1.0.
+    bool hdr_bridge = grain_hdr > 0.5;
+    vec3 work_rgb = color.rgb;
+    if (hdr_bridge) {
+        vec3 nits = vec3(pq_eotf_nits(clamp(color.r, 0.0, 1.0)),
+                         pq_eotf_nits(clamp(color.g, 0.0, 1.0)),
+                         pq_eotf_nits(clamp(color.b, 0.0, 1.0)));
+        work_rgb = pow(max(nits / grain_ref_white, vec3(0.0)), vec3(1.0 / 2.4));
+    }
+
+    float color_luma = dot(work_rgb, luma_coeff);
+    float color_sat = rgb_saturation(work_rgb);
     float tone_scale = grain_scale(color_luma, eff_mid, eff_steep);
     float eff_sat_response = mix(1.0, m_sat, w);
     float sat_gate = mix(1.0, eff_sat_response, smoothstep(SAT_LO_CEIL, SAT_HI_FLOOR, color_sat));
     vec3 vsum = vec3(vsum_r, vsum_g, vsum_b);
     vec3 scale_vec = vec3(tone_scale * sat_gate);
+    vec3 pre_grain = work_rgb;
     if (density_combine > 0.5)
-        color.rgb *= exp(eff_render * DENSITY_GAIN * vsum * scale_vec);
+        work_rgb *= exp(eff_render * DENSITY_GAIN * vsum * scale_vec);
     else
-        color.rgb += eff_render * vsum * scale_vec;
+        work_rgb += eff_render * vsum * scale_vec;
+
+    if (hdr_bridge) {
+        // Grain is texture, not signal: it may never push a pixel above
+        // max(its own pre-grain level, reference white). The SDR path gets
+        // this clip for free downstream at code 1.0; without it a broad
+        // bright-keyed bell + a large density excursion re-encodes into the
+        // PQ range ABOVE ref white and a grain frame can flash toward
+        // display peak (design-audit finding, 2026-07-04).
+        work_rgb = min(work_rgb, max(pre_grain, vec3(1.0)));
+        vec3 out_nits = grain_ref_white * pow(max(work_rgb, vec3(0.0)), vec3(2.4));
+        color.rgb = vec3(pq_oetf_code(out_nits.r), pq_oetf_code(out_nits.g),
+                         pq_oetf_code(out_nits.b));
+    } else {
+        color.rgb = work_rgb;
+    }
 
     if (debug_match > 0.5) {
         const int X_OFF = 24, Y_OFF = 400, BW = 10, BH = 10;

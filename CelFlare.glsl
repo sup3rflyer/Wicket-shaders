@@ -1,4 +1,4 @@
-// CelFlare v5.11 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.12 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Design goal: emulate a professional HDR grade of the source — midtones hold
@@ -1909,6 +1909,170 @@ void hook() {
 #define DEBUG_SHOW_WP        (cf_debug == 7)   // Warm shift + pale skin
 #define DEBUG_SHOW_STATS     (cf_debug == 8)   // avg_illum + bright_frac + contrast + log_avg bars
 
+// ---------------------------------------------------------------------------
+// Debug legend overlay — title + color key, bottom-left panel
+// ---------------------------------------------------------------------------
+// Every active debug view draws a small self-describing panel: a title line
+// ("6 LIGHT PUMP") plus one swatch+label row per channel, so a screenshot or
+// a mid-session eyeball needs no trip back to the cf_debug DESC. Swatches
+// repeat the exact colors the view emits. Feature-gated views (specular,
+// pump, warm/skin) advertise DISABLED when their toggle is off — the view
+// body falls through to the production render in that case and the panel is
+// the only tell. The whole overlay, font included, is preprocessed out at
+// cf_debug == 0; production pays nothing.
+#if cf_debug != 0
+
+// 5x6 bitmap font. Bit index = y*5 + x (x=0 left, y=0 top), bit set = pixel
+// on. Glyph order: A-Z, 0-9, then - . / = ( ). Generated and round-trip
+// verified by dev/gen-debug-font.py (gitignored) — regenerate there, don't
+// hand-edit hex.
+const uint DBG_FONT[42] = uint[42](
+    0x231fc62eu, 0x1f18be2fu, 0x3c10843eu, 0x1f18c62fu, 0x3e10bc3fu, 0x0210bc3fu,   // A B C D E F
+    0x3d18e43eu, 0x2318fe31u, 0x3e42109fu, 0x1d184210u, 0x23149d31u, 0x3e108421u,   // G H I J K L
+    0x2318d771u, 0x231cd671u, 0x1d18c62eu, 0x0210be2fu, 0x2c9ac62eu, 0x2314be2fu,   // M N O P Q R
+    0x1f08383eu, 0x0842109fu, 0x1d18c631u, 0x08a8c631u, 0x23bac631u, 0x22a21151u,   // S T U V W X
+    0x08421151u, 0x3e11111fu, 0x1d19d72eu, 0x3e4210c4u, 0x3e22222eu, 0x1f08320fu,   // Y Z 0 1 2 3
+    0x108fa988u, 0x1f083c3fu, 0x1d18bc2eu, 0x0842221fu, 0x1d18ba2eu, 0x1d087a2eu,   // 4 5 6 7 8 9
+    0x00007c00u, 0x08400000u, 0x02221110u, 0x000f83e0u, 0x08210844u, 0x08842104u    // - . / = ( )
+);
+
+// Labels are packed 6 bits/char, 5 chars per uint, LSB first — one uvec4
+// holds up to 20 chars. Char codes: 0 = space, 1-26 = A-Z, 27-36 = 0-9,
+// 37-42 = - . / = ( ). The plain-text string rides in a comment beside each
+// constant; the generator script emits both.
+//
+// Coverage of one text pixel at glyph-space p (one unit = one font pixel;
+// caller divides by its pixel scale AFTER clamping negatives out — GLSL int
+// division truncates toward zero, so -1/sc would alias onto column 0).
+float dbg_line(ivec2 p, uvec4 txt, int len) {
+    if (p.x < 0 || p.y < 0 || p.y >= 6) return 0.0;
+    int ci = p.x / 6;                    // 5px glyph + 1px advance
+    int gx = p.x - ci * 6;
+    if (ci >= len || gx > 4) return 0.0;
+    uint ch = (txt[ci / 5] >> uint((ci % 5) * 6)) & 63u;
+    if (ch == 0u || ch > 42u) return 0.0;
+    return float((DBG_FONT[ch - 1u] >> uint(p.y * 5 + gx)) & 1u);
+}
+
+// Per-view panel content. DBG_TITLE_CH / DBG_NROWS / DBG_ROW_MAXCH size the
+// panel; dbg_row() below supplies swatch color + label per key row.
+#if DEBUG_BYPASS
+    #define DBG_TITLE     uvec4(0x1064201cu, 0x000134c1u, 0u, 0u)               // 1 BYPASS
+    #define DBG_TITLE_CH  8
+    #define DBG_NROWS     0
+    #define DBG_ROW_MAXCH 0
+#elif DEBUG_SHOW_ILLUM
+    #define DBG_TITLE     uvec4(0x0c30901du, 0x09180355u, 0x00004305u, 0u)      // 2 ILLUM FIELD
+    #define DBG_TITLE_CH  13
+    #define DBG_NROWS     1
+    #define DBG_ROW_MAXCH 19
+#elif DEBUG_SHOW_EXPANSION
+    #define DBG_TITLE     uvec4(0x1060501eu, 0x0f253381u, 0x0000000eu, 0u)      // 3 EXPANSION
+    #define DBG_TITLE_CH  11
+    #define DBG_NROWS     1
+    #define DBG_ROW_MAXCH 19
+#elif DEBUG_SHOW_DETAIL
+    #define DBG_TITLE     uvec4(0x1414401fu, 0x0000c241u, 0u, 0u)               // 4 DETAIL
+    #define DBG_TITLE_CH  8
+    #define DBG_NROWS     1
+    #define DBG_ROW_MAXCH 16
+#elif DEBUG_SHOW_SPECULAR
+    #define DBG_TITLE     uvec4(0x05413020u, 0x1204c543u, 0u, 0u)               // 5 SPECULAR
+    #define DBG_TITLE_CH  10
+    #define DBG_NROWS     1
+    #define DBG_ROW_MAXCH 18
+#elif DEBUG_SHOW_PUMP
+    #define DBG_TITLE     uvec4(0x0724c021u, 0x15400508u, 0x0000040du, 0u)      // 6 LIGHT PUMP
+    #define DBG_TITLE_CH  12
+    #if !ENABLE_LIGHT_PUMP
+        #define DBG_NROWS     1
+        #define DBG_ROW_MAXCH 8
+    #elif ENABLE_SPATIAL_PUMP
+        #define DBG_NROWS     3
+        #define DBG_ROW_MAXCH 14
+    #else
+        #define DBG_NROWS     2
+        #define DBG_ROW_MAXCH 14
+    #endif
+#elif DEBUG_SHOW_WP
+    #define DBG_TITLE     uvec4(0x12057022u, 0x092d39cdu, 0x0000000eu, 0u)      // 7 WARM/SKIN
+    #define DBG_TITLE_CH  11
+    #if !ENABLE_WARM_SHIFT && !ENABLE_PALE_SKIN
+        #define DBG_NROWS     1
+        #define DBG_ROW_MAXCH 8
+    #else
+        #define DBG_NROWS     (ENABLE_PALE_SKIN + ENABLE_WARM_SHIFT)
+        #define DBG_ROW_MAXCH 16
+    #endif
+#else  // DEBUG_SHOW_STATS
+    #define DBG_TITLE     uvec4(0x01513023u, 0x000004d4u, 0u, 0u)               // 8 STATS
+    #define DBG_TITLE_CH  7
+    #define DBG_NROWS     4
+    #define DBG_ROW_MAXCH 11
+#endif
+
+// Swatch color + packed label for key row i of the active view. Swatch
+// values repeat what the view actually writes (channel primaries, the stats
+// bar colors), so the key doubles as a sanity check on the view itself.
+void dbg_row(int i, out vec3 col, out uvec4 txt, out int len) {
+    col = vec3(0.4); txt = uvec4(0u); len = 0;
+#if DEBUG_SHOW_ILLUM
+    if (i == 0) { col = vec3(0.7);
+        txt = uvec4(0x28641487u, 0x0d54c309u, 0x0d1c94c0u, 0x006e3001u); len = 19; } // GRAY=ILLUM SIGMA 80
+#elif DEBUG_SHOW_EXPANSION
+    if (i == 0) { col = vec3(1.0, 0.3, 0.0);
+        txt = uvec4(0x18169a12u, 0x094ce050u, 0x2a72538fu, 0x00826767u); len = 19; } // R=(EXPANSION-1)/2.5
+#elif DEBUG_SHOW_DETAIL
+    if (i == 0) { col = vec3(0.0, 1.0, 0.0);
+        txt = uvec4(0x010a9a07u, 0x18140153u, 0x18a9c950u, 0x0000001du); len = 16; } // G=(BASE EXP-1)X2
+#elif DEBUG_SHOW_SPECULAR
+    #if ENABLE_SPECULAR_BONUS
+    if (i == 0) { col = vec3(0.0, 1.0, 1.0);
+        txt = uvec4(0x28381643u, 0x000c5413u, 0x0e152513u, 0x00008507u); len = 18; } // CYAN=SPEC STRENGTH
+    #else
+    if (i == 0) { txt = uvec4(0x02053244u, 0x0000414cu, 0u, 0u); len = 8; }          // DISABLED
+    #endif
+#elif DEBUG_SHOW_PUMP
+    #if ENABLE_LIGHT_PUMP
+    if (i == 0) { col = vec3(1.0, 0.0, 0.0);
+        txt = uvec4(0x010d3a12u, 0x0501204cu, 0x0000058eu, 0u); len = 12; }          // R=SCALAR ENV
+    else if (i == 1) { col = vec3(0.0, 1.0, 0.0);
+        txt = uvec4(0x10401a07u, 0x0010524cu, 0x00389047u, 0u); len = 14; }          // G=APPLIED GAIN
+    #if ENABLE_SPATIAL_PUMP
+    else if (i == 2) { col = vec3(0.0, 0.0, 1.0);
+        txt = uvec4(0x0c143a02u, 0x1304d00cu, 0x0000000bu, 0u); len = 11; }          // B=CELL MASK
+    #endif
+    #else
+    if (i == 0) { txt = uvec4(0x02053244u, 0x0000414cu, 0u, 0u); len = 8; }          // DISABLED
+    #endif
+#elif DEBUG_SHOW_WP
+    int r = i;
+    #if ENABLE_PALE_SKIN
+    if (r == 0) { col = vec3(1.0, 0.0, 0.0);
+        txt = uvec4(0x0c050a12u, 0x092d3005u, 0x1b71800eu, 0u); len = 15; return; }  // R=PALE SKIN X10
+    r--;
+    #endif
+    #if ENABLE_WARM_SHIFT
+    if (r == 0) { col = vec3(0.0, 1.0, 0.0);
+        txt = uvec4(0x12057a07u, 0x0921300du, 0x20600506u, 0x0000001bu); len = 16; } // G=WARM SHIFT X50
+    #endif
+    #if !ENABLE_PALE_SKIN && !ENABLE_WARM_SHIFT
+    if (r == 0) { txt = uvec4(0x02053244u, 0x0000414cu, 0u, 0u); len = 8; }          // DISABLED
+    #endif
+#elif DEBUG_SHOW_STATS
+    if (i == 0) { col = vec3(0.6, 0.6, 0.0);
+        txt = uvec4(0x081c9482u, 0x01486014u, 0x00000003u, 0u); len = 11; }          // BRIGHT FRAC
+    else if (i == 1) { col = vec3(0.7, 0.4, 0.0);
+        txt = uvec4(0x1250e3c3u, 0x239d44c1u, 0u, 0u); len = 10; }                   // CONTRAST/8
+    else if (i == 2) { col = vec3(0.0, 0.6, 0.0);
+        txt = uvec4(0x010073ccu, 0x000001d6u, 0u, 0u); len = 7; }                    // LOG AVG
+    else if (i == 3) { col = vec3(0.0, 0.6, 0.6);
+        txt = uvec4(0x000c5413u, 0x01387253u, 0x0000000cu, 0u); len = 11; }          // SPEC SIGNAL
+#endif
+}
+
+#endif  // cf_debug != 0
+
 // =============================================================================
 // HELPER FUNCTIONS
 // =============================================================================
@@ -2061,6 +2225,42 @@ vec3 upsample_illum_rgb() {
 vec4 hook() {
     vec4 color = HOOKED_texOff(0);
     vec3 rgb_gamma = color.rgb;
+
+    // -------------------------------------------------------------------------
+    // DEBUG: legend panel (bottom-left) — title + color key for the active view
+    // -------------------------------------------------------------------------
+    // Drawn before every debug return path (bypass included) so each view is
+    // labeled. Opaque panel, early return — nothing downstream sees it.
+    #if cf_debug != 0
+    {
+        int sc = max(1, int(HOOKED_size.y) / 540);   // 12px text at 1080p, 24px at 4K
+        int pad = 4 * sc;
+        int lh  = 8 * sc;                            // line advance: 6px glyph + 2 gap
+        int key_w = DBG_NROWS > 0 ? 8 * sc : 0;      // swatch column incl. gap
+        int box_w = 2 * pad + max(DBG_TITLE_CH * 6 * sc, key_w + DBG_ROW_MAXCH * 6 * sc);
+        int box_h = 2 * pad + lh * (1 + DBG_NROWS);
+        ivec2 q = ivec2(HOOKED_pos * HOOKED_size)
+                - ivec2(2 * pad, int(HOOKED_size.y) - 2 * pad - box_h);
+        if (q.x >= 0 && q.y >= 0 && q.x < box_w && q.y < box_h) {
+            vec3 leg = vec3(0.04);                   // panel ground
+            int line = (q.y - pad) / lh;             // 0 = title, 1.. = key rows
+            ivec2 tp = ivec2(q.x - pad, (q.y - pad) - line * lh - sc);
+            if (q.y >= pad && tp.x >= 0 && tp.y >= 0) {
+                if (line == 0) {
+                    leg = mix(leg, vec3(0.85), dbg_line(tp / sc, DBG_TITLE, DBG_TITLE_CH));
+                } else if (line <= DBG_NROWS) {
+                    vec3 rc; uvec4 rt; int rl;
+                    dbg_row(line - 1, rc, rt, rl);
+                    if (tp.x < 6 * sc && tp.y < 6 * sc) leg = rc;   // swatch block
+                    else if (tp.x >= 8 * sc)
+                        leg = mix(leg, vec3(0.85),
+                                  dbg_line(ivec2(tp.x - 8 * sc, tp.y) / sc, rt, rl));
+                }
+            }
+            return vec4(gamma709_to_pq2020(leg), 1.0);
+        }
+    }
+    #endif
 
     #if DEBUG_BYPASS
         return vec4(gamma709_to_pq2020(color.rgb), color.a);

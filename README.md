@@ -193,13 +193,13 @@ Runtime controls (live-toggleable via `glsl-shader-opts`):
 | `density_combine` | 0 = additive, 1 = multiplicative density (grain rides the tone/bloom gradients). |
 | `debug_match` | Machine-readable state overlay for tuning. |
 
-**Requirements:** mpv with `vo=gpu-next`; compute shaders (GLSL 4.30+) — Vulkan/D3D11, or OpenGL 4.3+. SDR content (an HDR variant is planned).
+**Requirements:** mpv with `vo=gpu-next`; compute shaders (GLSL 4.30+) — Vulkan/D3D11, or OpenGL 4.3+. SDR content; for SDR→HDR chains (e.g. CelFlare, PQ BT.2020 out) set `grain_hdr=1` + `grain_ref_white=<your hdr-reference-white>` in `glsl-shader-opts`.
 
 **Usage:**
 
 ```ini
 # mpv.conf
-glsl-shaders-append=~~/shaders/filmgrain-match-SDR.glsl
+glsl-shaders-append=~~/shaders/filmgrain-match.glsl
 ```
 
 Use it *instead of* a fixed Film Grain tier (above), not on top of one.

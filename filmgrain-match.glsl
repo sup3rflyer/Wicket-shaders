@@ -49,6 +49,15 @@
 //                    preserving; the value-domain cousin of grain_contrast.    [Alt+F3]
 //   grain_sharpness  GLOBAL crispness dial: 1 = crisp 4K-film-scan (matched to plates),
 //                    0 = BIT-IDENTICAL to the old soft Light look.
+//   chroma_amp       amplitude of the coarse independent chroma layer (pure hue
+//                    fluctuation, luma-removed; 0 = base grain only).
+//   grain_rate       temporal cadence: fraction of rendered frames that re-seed the
+//                    grain (0.5 = every 2nd frame, ~12 Hz at 24p — the feel-confirmed
+//                    default; 1 = per-frame re-randomization).
+//   grain_base_sat   per-channel independence of the BASE grain (the baked-in hue
+//                    speckle). 0.25 = calibrated look; 0 = true mono. NB the RMS
+//                    bookkeeping (value_warp / chroma_amp scaling) assumes 0.25, so
+//                    off-default drifts per-channel grain RMS by a few percent.
 //
 //  == RESTORATION (how much grain to rebuild on degraded sources) ===========
 //   restore_gain     upward extrapolation past surviving grain (compensatory). 1 = match only
@@ -134,6 +143,18 @@
 //!MAXIMUM 1.0
 1.0
 
+//!PARAM grain_rate
+//!TYPE DYNAMIC float
+//!MINIMUM 0.1
+//!MAXIMUM 1.0
+0.5
+
+//!PARAM grain_base_sat
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.25
+
 //!PARAM restore_gain
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
@@ -206,7 +227,6 @@
 //!VAR float m_intensity_raw
 //!VAR float m_mid
 //!VAR float m_steepness
-//!VAR float m_sat
 //!VAR float m_log_avg
 //!VAR float m_measured
 //!VAR float m_prev_ready
@@ -231,10 +251,6 @@
 //!VAR float hist_amp[16]
 //!VAR float hist_temporal[16]
 //!VAR float hist_spatial[16]
-//!VAR float diag_sat_amp_lo
-//!VAR float diag_sat_amp_hi
-//!VAR float diag_sat_count_lo
-//!VAR float diag_sat_count_hi
 //!VAR float hist_held[16]
 //!VAR float m_held_count
 //!VAR float m_film_level
@@ -317,9 +333,6 @@
 #define SPATIAL_STATIC_RATIO_LO 0.45
 #define SPATIAL_STATIC_RATIO_HI 0.80
 #define CONTENT_HELD_EPS   0.0025
-#define SAT_LO_CEIL       0.18
-#define SAT_HI_FLOOR      0.45
-#define SAT_MIN_CELLS     96.0
 // STEP 2 held-cel firing gate (texture-safe). held_run = contiguous luma bins of
 // the held-cel temporal-grain curve above the dither floor. Overlay grain fires
 // via held_run directly; film grain fires via spatial amplitude but only when
@@ -376,7 +389,7 @@
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
 
 shared uint s_hist[NBINS][AMP_BINS];
-shared uint s_sat_hist[2][AMP_BINS];
+shared uint s_content_hist[AMP_BINS];
 shared uint s_update_prev_grid;
 shared uint s_coh_incoh;
 shared uint s_coh_norm;
@@ -414,26 +427,12 @@ float grain_scale(float lum, float mid, float steepness) {
     return curve * protection;
 }
 
-float rgb_saturation(vec3 rgb) {
-    float mx = max(rgb.r, max(rgb.g, rgb.b));
-    float mn = min(rgb.r, min(rgb.g, rgb.b));
-    return mx > 1e-5 ? (mx - mn) / mx : 0.0;
-}
-
 float gaussian_weight(float dx, float sigma) {
     return exp(-0.5 * dx * dx / max(sigma * sigma, 1e-6));
 }
 
 float measure_luma(vec2 uv) {
     return HOOKED_tex(uv).r;
-}
-
-// LUMA measure has no chroma -> always 0. This parks the whole saturation-
-// response chain at neutral (spatial s_sat_hist[1] never fills -> sat_response
-// stays 1.0 -> m_sat 1.0 -> render-side sat_gate is a no-op) until a
-// chroma-capable measure exists.
-float measure_saturation(vec2 uv) {
-    return 0.0;
 }
 
 void hook() {
@@ -465,8 +464,8 @@ void hook() {
         }
         for (uint k = lid; k < uint(NBINS * AMP_BINS); k += num_threads)
             s_hist[k / uint(AMP_BINS)][k % uint(AMP_BINS)] = 0u;
-        for (uint k = lid; k < uint(2 * AMP_BINS); k += num_threads)
-            s_sat_hist[k / uint(AMP_BINS)][k % uint(AMP_BINS)] = 0u;
+        for (uint k = lid; k < uint(AMP_BINS); k += num_threads)
+            s_content_hist[k] = 0u;
     }
     barrier();
 
@@ -588,7 +587,7 @@ void hook() {
                 float cur_smooth = (cur_luma + gxm + gxp + gym + gyp) * 0.2;
                 float prev_smooth = (prev_grid[k] + prev_grid[km] + prev_grid[kp] + prev_grid[ku] + prev_grid[kd]) * 0.2;
                 int cab = clamp(int(abs(cur_smooth - prev_smooth) / AMP_MAX * float(AMP_BINS)), 0, AMP_BINS - 1);
-                atomicAdd(s_sat_hist[0][cab], 1u);
+                atomicAdd(s_content_hist[cab], 1u);
             }
         }
     }
@@ -608,13 +607,11 @@ void hook() {
         m_source_height = HOOKED_size.y;
         if (!state_ok || !prev_ready || frame == 0u) {
             m_mid = MID_FLOOR; m_steepness = STEEP_FLOOR; m_intensity_raw = 0.0;
-            m_sat = 1.0; m_log_avg = 0.0; m_measured = 0.0; m_debug_tick = 0.0;
+            m_log_avg = 0.0; m_measured = 0.0; m_debug_tick = 0.0;
             m_prev_ready = 1.0; m_state_magic = STATE_MAGIC; m_state_epoch = state_epoch; m_sat_frac = 0.0;
             m_held_frames = 0.0; m_distinct_frames = 0.0; m_hold_run = 0.0;
             m_content_held = 0.0; m_content_distinct = 0.0; m_content_hold_run = 0.0; m_content_log_avg = 0.0;
             m_coherence = 0.0; m_coh_frac = 0.0; m_coh_samples = 0.0;
-            diag_sat_amp_lo = 0.0; diag_sat_amp_hi = 0.0;
-            diag_sat_count_lo = 0.0; diag_sat_count_hi = 0.0;
             m_held_count = 0.0; m_film_level = 0.0; m_pan_px = 0.0;
             for (int b = 0; b < NBINS; b++) {
                 hist_amp[b] = 0.0; hist_temporal[b] = 0.0; hist_spatial[b] = 0.0;
@@ -635,7 +632,7 @@ void hook() {
                     if (ab >= SAT_BIN) sat += c;
                 }
             for (int ab = 0; ab < AMP_BINS; ab++) {
-                float c = float(s_sat_hist[0][ab]);
+                float c = float(s_content_hist[ab]);
                 content_total += c;
                 content_sum_abs += c * (float(ab) + 0.5) * binw;
             }
@@ -878,8 +875,6 @@ void hook() {
     if (is_measure_wg) {
         for (uint k = lid; k < uint(NBINS * AMP_BINS); k += num_threads)
             s_hist[k / uint(AMP_BINS)][k % uint(AMP_BINS)] = 0u;
-        for (uint k = lid; k < uint(2 * AMP_BINS); k += num_threads)
-            s_sat_hist[k / uint(AMP_BINS)][k % uint(AMP_BINS)] = 0u;
     }
     barrier();
 
@@ -903,7 +898,6 @@ void hook() {
             float mean_y = sy / 25.0;
             float var_y = max(syy / 25.0 - mean_y * mean_y, 0.0);
             float slope = length(vec2(gx, gy)) / 50.0;
-            float sat = measure_saturation(uv);
 
             if (mean_y > BLACK_FLOOR && mean_y < WHITE_CEIL
                 && slope < SPATIAL_EDGE_GATE && var_y < SPATIAL_VAR_MAX) {
@@ -916,10 +910,6 @@ void hook() {
                 int lb = clamp(int(mean_y * float(NBINS)), 0, NBINS - 1);
                 int ab = clamp(int(amp / AMP_MAX * float(AMP_BINS)), 0, AMP_BINS - 1);
                 atomicAdd(s_hist[lb][ab], 1u);
-                if (sat <= SAT_LO_CEIL)
-                    atomicAdd(s_sat_hist[0][ab], 1u);
-                else if (sat >= SAT_HI_FLOOR)
-                    atomicAdd(s_sat_hist[1][ab], 1u);
             }
         }
     }
@@ -1094,45 +1084,6 @@ void hook() {
             }
             float irraw = max(spatial_for_intensity, temporal_level) / NOISE_STD_PER_INTENSITY;
 
-            float sat_count_lo = 0.0, sat_count_hi = 0.0;
-            for (int ab = 0; ab < AMP_BINS; ab++) {
-                sat_count_lo += float(s_sat_hist[0][ab]);
-                sat_count_hi += float(s_sat_hist[1][ab]);
-            }
-
-            float sat_amp_lo = 0.0, sat_amp_hi = 0.0;
-            if (sat_count_lo >= SAT_MIN_CELLS) {
-                float target = SPATIAL_PCTL * sat_count_lo, acc = 0.0;
-                for (int ab = 0; ab < AMP_BINS; ab++) {
-                    float c = float(s_sat_hist[0][ab]);
-                    if (acc + c >= target) {
-                        sat_amp_lo = (float(ab) + (target - acc) / max(c, 1.0)) * binw;
-                        break;
-                    }
-                    acc += c;
-                }
-            }
-            if (sat_count_hi >= SAT_MIN_CELLS) {
-                float target = SPATIAL_PCTL * sat_count_hi, acc = 0.0;
-                for (int ab = 0; ab < AMP_BINS; ab++) {
-                    float c = float(s_sat_hist[1][ab]);
-                    if (acc + c >= target) {
-                        sat_amp_hi = (float(ab) + (target - acc) / max(c, 1.0)) * binw;
-                        break;
-                    }
-                    acc += c;
-                }
-            }
-
-            diag_sat_amp_lo = sat_amp_lo;
-            diag_sat_amp_hi = sat_amp_hi;
-            diag_sat_count_lo = sat_count_lo;
-            diag_sat_count_hi = sat_count_hi;
-
-            float sat_response = 1.0;
-            if (sat_amp_lo > 0.0 && sat_amp_hi > 0.0)
-                sat_response = clamp(sat_amp_hi / sat_amp_lo, 0.35, 1.25);
-
             bool first = m_measured < 8.0;
             bool warming = m_measured < 32.0;
             float alpha = warming ? ALPHA_FAST : ALPHA_SLOW;
@@ -1145,7 +1096,7 @@ void hook() {
             // to settle back down before any grain becomes visible. During the
             // post-cut/warmup window the DOWN direction is allowed to be fast
             // (ALPHA_FAST) so a grainy->clean cut sheds grain in a few frames --
-            // removing grain is never "overkill". Tone-shape params (mid/steep/sat)
+            // removing grain is never "overkill". Tone-shape params (mid/steep)
             // keep the symmetric warmup alpha; they only shape grain, never add it.
             // Freeze the RISE of the intensity EMA while a real global pan is present
             // (m_pan_px): a translating baked texture can no longer BUILD grain up over
@@ -1158,12 +1109,11 @@ void hook() {
                             ? rise_alpha
                             : (warming ? ALPHA_FAST : grain_decay);
             if (first) {
-                m_mid = mid; m_steepness = steep; m_intensity_raw = irraw; m_sat = sat_response;
+                m_mid = mid; m_steepness = steep; m_intensity_raw = irraw;
             } else {
                 m_mid = mix(m_mid, mid, alpha);
                 m_steepness = mix(m_steepness, steep, alpha);
                 m_intensity_raw = mix(m_intensity_raw, irraw, int_alpha);
-                m_sat = mix(m_sat, sat_response, alpha);
             }
             m_measured += 1.0;
         }
@@ -1180,7 +1130,6 @@ void hook() {
 //!COMPUTE 32 32
 //!DESC Film Grain Match: OUTPUT render + debug
 
-#define GRAIN_RATE 0.5
 // 9-tap support (was 7): the blue channel's base sigma (1.20) reaches ~1.15 even at
 // the crisp neutral and higher when coarse, where 7 taps (clean only to sigma ~1.0)
 // truncate the Gaussian into a box and ripple the spectrum. 9 taps hold sigma up to
@@ -1192,7 +1141,6 @@ void hook() {
 #define INT_CEIL     0.85
 #define MID_FLOOR    0.15
 #define STEEP_FLOOR  2.6
-#define SATURATION   0.25
 
 // Crisp NEUTRAL render sigma scale (the no-fire 4K-film-scan default). 0.75 puts the
 // green-channel sigma at ~0.75 px @4K = a 35mm scan (matched to the real grain
@@ -1264,8 +1212,6 @@ void hook() {
 #define SHAPE_AMP_LOW     0.08
 #define SHAPE_AMP_HIGH    0.25
 #define SHAPE_MAX_BLEND   0.40
-#define SAT_LO_CEIL       0.18
-#define SAT_HI_FLOOR      0.45
 // STEP 2 held-cel firing gate (texture-safe). held_run = contiguous luma bins of
 // the held-cel temporal-grain curve above the dither floor. Overlay grain fires
 // via held_run directly; film grain fires via spatial amplitude but only when
@@ -1374,12 +1320,6 @@ float grain_scale(float lum, float mid, float steepness) {
     float curve = t > 0.0 ? t * t : 0.0;
     float protection = smoothstep(0.0, 0.12, lum);
     return curve * protection;
-}
-
-float rgb_saturation(vec3 rgb) {
-    float mx = max(rgb.r, max(rgb.g, rgb.b));
-    float mn = min(rgb.r, min(rgb.g, rgb.b));
-    return mx > 1e-5 ? (mx - mn) / mx : 0.0;
 }
 
 float gaussian_weight(float dx, float sigma) {
@@ -1496,15 +1436,16 @@ void hook() {
 
     // Seed from the frame counter, not content cadence — the old content-
     // cadence seed froze grain on held cels of clean sources (no grain +
-    // identical cel -> counter stalls -> static "dirt" look). GRAIN_RATE 0.5
-    // re-seeds every 2nd rendered frame (~12 Hz at 24p) — a DELIBERATE half-
-    // rate, feel-confirmed 2026-07-04: it blends with the surviving source
-    // grain (encoders smear grain temporally, so the residual animates below
-    // frame rate) and sits with animation on twos, where full-rate
-    // re-randomization reads as a detached synthetic overlay. The measured
-    // distinct counter is retained for held-grain-cadence detection
-    // (twos/threes), deferred until source-grain cadence is measured directly.
-    uint frame_seed = uint(max(0.0, floor(float(frame) * GRAIN_RATE)));
+    // identical cel -> counter stalls -> static "dirt" look). grain_rate is
+    // the cadence dial: the default 0.5 re-seeds every 2nd rendered frame
+    // (~12 Hz at 24p) — a DELIBERATE half-rate, feel-confirmed 2026-07-04:
+    // it blends with the surviving source grain (encoders smear grain
+    // temporally, so the residual animates below frame rate) and sits with
+    // animation on twos, where full-rate re-randomization (grain_rate 1)
+    // reads as a detached synthetic overlay. The measured distinct counter is
+    // retained for held-grain-cadence detection (twos/threes), deferred until
+    // source-grain cadence is measured directly.
+    uint frame_seed = uint(max(0.0, floor(float(frame) * grain_rate)));
 
     // GRAIN SIZE/SHARPNESS + OPERATING POINT (re-anchored 2026-06-03, grain-stock
     // calibration). The generator MODEL is fine: tested against real 4K film plates,
@@ -1658,9 +1599,9 @@ void hook() {
         float g_g = rand_triangular(seed_init, GREEN_VARIANCE_SCALE);
         float g_b = rand_triangular(seed_init, BLUE_VARIANCE_SCALE);
         float grain_lum = dot(vec3(g_r, g_g, g_b), vec3(0.299, 0.587, 0.114));
-        grain_r[local_pos.y][local_pos.x] = mix(grain_lum, g_r, RED_SATURATION * SATURATION);
-        grain_g[local_pos.y][local_pos.x] = mix(grain_lum, g_g, GREEN_SATURATION * SATURATION);
-        grain_b[local_pos.y][local_pos.x] = mix(grain_lum, g_b, BLUE_SATURATION * SATURATION);
+        grain_r[local_pos.y][local_pos.x] = mix(grain_lum, g_r, RED_SATURATION * grain_base_sat);
+        grain_g[local_pos.y][local_pos.x] = mix(grain_lum, g_g, GREEN_SATURATION * grain_base_sat);
+        grain_b[local_pos.y][local_pos.x] = mix(grain_lum, g_b, BLUE_SATURATION * grain_base_sat);
     }
     barrier();
     for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
@@ -1700,9 +1641,9 @@ void hook() {
             float g_g = rand_triangular(seed_init, GREEN_VARIANCE_SCALE);
             float g_b = rand_triangular(seed_init, BLUE_VARIANCE_SCALE);
             float grain_lum = dot(vec3(g_r, g_g, g_b), vec3(0.299, 0.587, 0.114));
-            grain_r[local_pos.y][local_pos.x] = mix(grain_lum, g_r, RED_SATURATION * SATURATION);
-            grain_g[local_pos.y][local_pos.x] = mix(grain_lum, g_g, GREEN_SATURATION * SATURATION);
-            grain_b[local_pos.y][local_pos.x] = mix(grain_lum, g_b, BLUE_SATURATION * SATURATION);
+            grain_r[local_pos.y][local_pos.x] = mix(grain_lum, g_r, RED_SATURATION * grain_base_sat);
+            grain_g[local_pos.y][local_pos.x] = mix(grain_lum, g_g, GREEN_SATURATION * grain_base_sat);
+            grain_b[local_pos.y][local_pos.x] = mix(grain_lum, g_b, BLUE_SATURATION * grain_base_sat);
         }
         barrier();
         for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
@@ -1768,6 +1709,16 @@ void hook() {
         }
     }
 
+    // PLANNED — luma-keyed grain COARSENESS (per-pixel size variation, ~free):
+    // vsum1 (sigma s1) and vsum2 (1.8*s1) are the SAME noise at two sizes, both
+    // already computed. A luma-keyed per-pixel mix between them varies apparent
+    // grain size across the tone range (real stock grain is not size-constant
+    // in luma) at the cost of one mix() — no extra generation. Needs: analytic
+    // RMS renorm as a function of the blend (Var(mix) from the s1c/s2c/s12c
+    // sums already computed above, same algebra as bp_norm), an interaction
+    // story with the DoG (blend the pair pre- or post-combine), and the
+    // direction/curve taken from real plates (stocks differ) — plate-matching
+    // work, so parked until reference material is at hand.
     // bandpass combine (DoG = blur(s1) - a*blur(s2)), RMS-normalized so strength holds.
     float vsum_r = bp_norm[0] * (vsum1_r - bp_alpha * vsum2_r);
     float vsum_g = bp_norm[1] * (vsum1_g - bp_alpha * vsum2_g);
@@ -1813,12 +1764,9 @@ void hook() {
     }
 
     float color_luma = dot(work_rgb, luma_coeff);
-    float color_sat = rgb_saturation(work_rgb);
     float tone_scale = grain_scale(color_luma, eff_mid, eff_steep);
-    float eff_sat_response = mix(1.0, m_sat, w);
-    float sat_gate = mix(1.0, eff_sat_response, smoothstep(SAT_LO_CEIL, SAT_HI_FLOOR, color_sat));
     vec3 vsum = vec3(vsum_r, vsum_g, vsum_b);
-    vec3 scale_vec = vec3(tone_scale * sat_gate);
+    vec3 scale_vec = vec3(tone_scale);
     vec3 pre_grain = work_rgb;
     if (density_combine > 0.5)
         work_rgb *= exp(eff_render * DENSITY_GAIN * vsum * scale_vec);
@@ -1851,7 +1799,7 @@ void hook() {
             if      (row == 0) v = m_intensity_raw * 30000.0;
             else if (row == 1) v = m_mid * 65000.0;
             else if (row == 2) v = m_steepness * 7000.0;
-            else if (row == 3) v = m_sat * 65000.0;
+            else if (row == 3) v = 0.0;   // retired (m_sat) — row layout kept stable
             else if (row == 4) v = m_log_avg * 1000000.0;
             else if (row == 5) v = m_measured;
             else if (row == 6) v = m_debug_tick;
@@ -1863,10 +1811,7 @@ void hook() {
             else if (row == 41) v = hist_spatial[15] * 65000.0;
             else if (row < 42) v = hist_spatial[row - 26] * 2000000.0;
             else if (row == 42) v = m_sat_frac * 65000.0;
-            else if (row == 43) v = diag_sat_amp_lo * 2000000.0;
-            else if (row == 44) v = diag_sat_amp_hi * 2000000.0;
-            else if (row == 45) v = diag_sat_count_lo;
-            else if (row == 46) v = diag_sat_count_hi;
+            else if (row <= 46) v = 0.0;  // rows 43-46 retired (diag_sat_*) — layout kept stable
             else if (row < 61)  v = hist_temporal[row - 47] * 2000000.0;
             else if (row == 61) v = m_held_frames;
             else if (row == 62) v = m_distinct_frames;

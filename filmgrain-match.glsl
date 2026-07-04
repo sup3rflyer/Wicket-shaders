@@ -19,12 +19,12 @@
 // texture.
 //
 // Architecture (LUMA measure, OUTPUT render, one persistent buffer):
-//   PASS 1 - Compute 32x32 at LUMA: one fixed 16:9 workgroup samples HOOKED.r
-//            directly, builds temporal/spatial grain state, and writes only
-//            GRAIN_STATE. No textures are passed across stages.
-//   PASS 2 - Fragment passthrough at OUTPUT: captures display-resolution frame
-//            as GRAIN_SRC for rendering/debug only.
-//   PASS 3 - Compute 32x32 at OUTPUT: renders grain from GRAIN_SRC using the
+//   PASS 1 - Compute 32x32 at LUMA, measurement only: saves to a 1x1 dummy
+//            (WIDTH/HEIGHT 1 -> a single workgroup; the LUMA plane itself is
+//            untouched -- the old full-plane passthrough copy was the shader's
+//            entire measurable GPU cost at 4K). Samples HOOKED.r across the
+//            full frame and writes only GRAIN_STATE.
+//   PASS 2 - Compute 32x32 at OUTPUT: renders grain onto HOOKED using the
 //            LUMA-measured GRAIN_STATE.
 //
 // Runtime params. Only match_grain / debug_match / value_warp are on keys (F3 / Ctrl+F3 /
@@ -78,6 +78,7 @@
 //@shampv input sdr
 //@shampv ref-white-param grain_ref_white
 //@shampv toggle grain_hdr debug_match density_combine grid_snap
+//@shampv measures LUMA
 
 //!PARAM match_grain
 //!TYPE DYNAMIC float
@@ -247,10 +248,11 @@
 //!HOOK LUMA
 //!BIND HOOKED
 //!BIND GRAIN_STATE
+//!SAVE GRAIN_STATS
+//!WIDTH 1
+//!HEIGHT 1
 //!COMPUTE 32 32
 //!DESC Film Grain Match: LUMA measure
-
-#define MAX_TAPS 3
 
 #define MID_FLOOR    0.15
 #define STEEP_FLOOR  2.6
@@ -372,14 +374,7 @@
 #define STEEP_MAX     9.0
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
-const uvec2 isize = uvec2(gl_WorkGroupSize) + uvec2(2 * MAX_TAPS);
 
-shared float grain_r[isize.y][isize.x];
-shared float grain_g[isize.y][isize.x];
-shared float grain_b[isize.y][isize.x];
-shared float dyn_wr[2 * MAX_TAPS + 1];
-shared float dyn_wg[2 * MAX_TAPS + 1];
-shared float dyn_wb[2 * MAX_TAPS + 1];
 shared uint s_hist[NBINS][AMP_BINS];
 shared uint s_sat_hist[2][AMP_BINS];
 shared uint s_update_prev_grid;
@@ -433,6 +428,10 @@ float measure_luma(vec2 uv) {
     return HOOKED_tex(uv).r;
 }
 
+// LUMA measure has no chroma -> always 0. This parks the whole saturation-
+// response chain at neutral (spatial s_sat_hist[1] never fills -> sat_response
+// stays 1.0 -> m_sat 1.0 -> render-side sat_gate is a no-op) until a
+// chroma-capable measure exists.
 float measure_saturation(vec2 uv) {
     return 0.0;
 }
@@ -440,15 +439,16 @@ float measure_saturation(vec2 uv) {
 void hook() {
     uint lid = gl_LocalInvocationIndex;
     uint num_threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
-    uvec2 measure_wg = uvec2(min(30u, gl_NumWorkGroups.x - 1u), min(16u, gl_NumWorkGroups.y - 1u));
-    bool is_measure_wg = (gl_WorkGroupID.xy == measure_wg);
+    // The 1x1 SAVE target means exactly one workgroup dispatches: this pass is
+    // measurement-only and never rewrites the LUMA plane.
+    const bool is_measure_wg = true;
 
     bool state_ok = abs(m_state_magic - STATE_MAGIC) < 0.0001
                  && abs(m_state_epoch - state_epoch) < 0.5;
     bool prev_ready = state_ok && m_prev_ready > 0.5;
 
     // =========================================================================
-    // MEASUREMENT — center workgroup samples HOOKED_tex across full frame
+    // MEASUREMENT — the single workgroup samples HOOKED_tex across full frame
     // =========================================================================
 
     if (is_measure_wg) {
@@ -1170,18 +1170,12 @@ void hook() {
     }
     barrier();
 
-    vec4 pass_color = HOOKED_tex(HOOKED_pos);
-    imageStore(out_image, ivec2(gl_GlobalInvocationID), pass_color);
+    if (lid == 0u)
+        imageStore(out_image, ivec2(0), vec4(0.0));
 }
 
 //!HOOK OUTPUT
 //!BIND HOOKED
-//!SAVE GRAIN_SRC
-//!DESC Film Grain Match: source capture
-vec4 hook() { return HOOKED_tex(HOOKED_pos); }
-
-//!HOOK OUTPUT
-//!BIND GRAIN_SRC
 //!BIND GRAIN_STATE
 //!COMPUTE 32 32
 //!DESC Film Grain Match: OUTPUT render + debug
@@ -1500,12 +1494,15 @@ void hook() {
     float temporal_tone = softness_temporal * softness_conf;
     eff_steep = min(STEEP_MAX, eff_steep * mix(1.0, TEMPORAL_TONE_STEEPEN, temporal_tone));
 
-    // Grain must animate every frame like real film grain — a held cel still
-    // gets fresh grain each frame, because the film was exposed per frame. The
-    // previous content-cadence seed froze grain on held cels of clean sources
-    // (no grain + identical cel -> counter stalls -> static "dirt" look). Seed
-    // from the per-frame counter so grain always dances at frame cadence. The
-    // measured distinct counter is retained for held-grain-cadence detection
+    // Seed from the frame counter, not content cadence — the old content-
+    // cadence seed froze grain on held cels of clean sources (no grain +
+    // identical cel -> counter stalls -> static "dirt" look). GRAIN_RATE 0.5
+    // re-seeds every 2nd rendered frame (~12 Hz at 24p) — a DELIBERATE half-
+    // rate, feel-confirmed 2026-07-04: it blends with the surviving source
+    // grain (encoders smear grain temporally, so the residual animates below
+    // frame rate) and sits with animation on twos, where full-rate
+    // re-randomization reads as a detached synthetic overlay. The measured
+    // distinct counter is retained for held-grain-cadence detection
     // (twos/threes), deferred until source-grain cadence is measured directly.
     uint frame_seed = uint(max(0.0, floor(float(frame) * GRAIN_RATE)));
 
@@ -1552,9 +1549,9 @@ void hook() {
     //    we match what's actually on screen, which IS just the scaled source.
     // In the AnimeJaNai pipeline LUMA(post-upscale)=OUTPUT so both ratios are 1.0
     // (no-op); they only diverge when libplacebo scales the source to the display.
-    float src_h = (m_source_height > 1.0) ? m_source_height : GRAIN_SRC_size.y;
-    float vis_scale = GRAIN_SRC_size.y * (1.0 / GRAIN_RES_REF);   // OUTPUT / 4K-ref
-    float src_scale = GRAIN_SRC_size.y / src_h;                   // OUTPUT / SOURCE
+    float src_h = (m_source_height > 1.0) ? m_source_height : HOOKED_size.y;
+    float vis_scale = HOOKED_size.y * (1.0 / GRAIN_RES_REF);      // OUTPUT / 4K-ref
+    float src_scale = HOOKED_size.y / src_h;                      // OUTPUT / SOURCE
     float k_neutral = mix(1.0, K_NEUTRAL * vis_scale, gs);
     float k_size = mix(k_neutral, gs_k_tgt * src_scale, gs * gs_fire);
     // grain_size: live size multiplier (1.0 = calibrated). <1 finer, >1 coarser. Lets
@@ -1800,7 +1797,7 @@ void hook() {
         vsum_b += cs_b - cl;
     }
 
-    vec4 color = GRAIN_SRC_tex(GRAIN_SRC_pos);
+    vec4 color = HOOKED_tex(HOOKED_pos);
 
     // grain_hdr bridge: work in the measured SDR domain (see helpers above).
     // Clamp the PQ input codes — YUV->RGB overshoot above 1.0 explodes the
@@ -1906,7 +1903,7 @@ void hook() {
         if (swatch_pos.x >= 0 && swatch_pos.x < 60 && swatch_pos.y >= 0 && swatch_pos.y < 60)
             color.rgb = vec3(m_measure_swatch_r, m_measure_swatch_g, m_measure_swatch_b);
         else if (swatch_pos.x >= 70 && swatch_pos.x < 130 && swatch_pos.y >= 0 && swatch_pos.y < 60)
-            color = GRAIN_SRC_tex(vec2(0.5, 0.5));
+            color = HOOKED_tex(vec2(0.5, 0.5));
 
         // GRAIN-ON-CLEAN patches (right of the readout). The real source is already
         // grainy, so A/B is hard; these show the rendered grain on a FLAT base. Each

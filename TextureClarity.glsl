@@ -1,14 +1,43 @@
 // Copyright (C) 2026 Ágúst Ari
 // Licensed under GPL-3.0 — see LICENSE
 
+// User tuning: the four tc_* params below (DYNAMIC — glsl-shader-opts
+// changes apply on the next frame, no recompile). Defaults = the shipped
+// tune. Everything below the param block is internal.
+// shampv shader API (plain comments to libplacebo):
+//@shampv input any
+
+//!PARAM tc_strength
+//!DESC Sharpening strength. 12 = shipped tune, 0 = off.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 24.0
+12.0
+
+//!PARAM tc_coring
+//!DESC Coring threshold — high-pass deltas below this are ignored (keeps noise from being sharpened). Raise for noisier sources.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 0.003
+0.0005
+
+//!PARAM tc_texture_thresh
+//!DESC Texture floor — minimum local variance that counts as real texture rather than noise. Raise to sharpen only stronger detail.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.005
+//!MAXIMUM 0.08
+0.02
+
+//!PARAM tc_max_delta
+//!DESC Per-pixel luma change cap — hard ceiling on how much sharpening may move any pixel.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.001
+//!MAXIMUM 0.05
+0.012
+
 //!DESC Texture Clarity
 //!HOOK LUMA
 //!BIND HOOKED
-
-#define PARAM 12.0
-#define THRESHOLD 0.0005
-#define MIN_NOISE_THRESHOLD 0.020
-#define BRIGHTNESS_CLAMP 0.012
 
 // Grain suppression parameters
 const float grain_threshold = 0.045;
@@ -87,7 +116,7 @@ vec4 hook() {
             float thresh = grain_threshold + 0.5 * local_mean_dev;
             float grain = 1.0 - smoothstep(thresh, thresh + grain_transition_width, max_dev);
             float variance = max_val - min_val;
-            float texture = smoothstep(MIN_NOISE_THRESHOLD, MIN_NOISE_THRESHOLD + texture_transition_width, variance);
+            float texture = smoothstep(tc_texture_thresh, tc_texture_thresh + texture_transition_width, variance);
 
             sum_grain += grain;
             sum_texture += texture;
@@ -132,7 +161,7 @@ vec4 hook() {
                      + (get_grid(1,1,grid)  + get_grid(-1,1,grid) +
                         get_grid(1,-1,grid) + get_grid(-1,-1,grid))) * (1.0 / 16.0);
     float t = p.x - blurred;
-    float t_sharp = t - clamp(t, -THRESHOLD, THRESHOLD);
+    float t_sharp = t - clamp(t, -tc_coring, tc_coring);
 
     // Sobel edge detection
     float sobel_h = (grid[8] - grid[6]) + 2.0 * (grid[13] - grid[11]) + (grid[18] - grid[16]);
@@ -145,7 +174,7 @@ vec4 hook() {
 
     // Combine influences
     float combined = edge_factor * final_grain * final_texture * detail_saturation;
-    float sharpen_amount = t_sharp * PARAM * combined;
+    float sharpen_amount = t_sharp * tc_strength * combined;
 
     // -----------------------
     // Mild-detail boost (applied BEFORE black/white mask)
@@ -175,7 +204,7 @@ vec4 hook() {
     sharpen_amount *= mask;
 
     // Clamp final brightness changes
-    float result = clamp(p.x + sharpen_amount, p.x - BRIGHTNESS_CLAMP, p.x + BRIGHTNESS_CLAMP);
+    float result = clamp(p.x + sharpen_amount, p.x - tc_max_delta, p.x + tc_max_delta);
 
     return vec4(result, 0.0, 0.0, 1.0);
 }

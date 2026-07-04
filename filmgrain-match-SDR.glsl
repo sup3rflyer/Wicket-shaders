@@ -72,110 +72,115 @@
 //                    canvas-pan overfire; established grain HOLDS). 0 = prior. A/B-safe.
 // ============================================================================
 
+// shampv shader API (plain comments to libplacebo). All params are DYNAMIC:
+// glsl-shader-opts changes apply next frame, no recompile; bump state_epoch
+// to invalidate the persisted GRAIN_STATE live.
+//@shampv input sdr
+
 //!PARAM match_grain
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM debug_match
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
 //!PARAM state_epoch
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 65535.0
 0.0
 
 //!PARAM grain_gain
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 12.0
 2.0
 
 //!PARAM grain_size
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.3
 //!MAXIMUM 2.5
 1.0
 
 //!PARAM grain_contrast
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
 1.0
 
 //!PARAM value_warp
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 4.0
 0.0
 
 //!PARAM chroma_amp
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
 //!PARAM grain_sharpness
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM restore_gain
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 4.0
 4.0
 
 //!PARAM restore_floor
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.40
 
 //!PARAM grain_restore_taper
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
 //!PARAM density_combine
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grid_snap
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grain_attack
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.002
 //!MAXIMUM 0.30
 0.02
 
 //!PARAM grain_decay
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.002
 //!MAXIMUM 0.30
 0.04
 
 //!PARAM hardcut_frac
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.40
 //!MAXIMUM 1.0
 0.85
 
 //!PARAM pan_freeze
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0

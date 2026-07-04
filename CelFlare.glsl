@@ -1,4 +1,4 @@
-// CelFlare v5.9 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.11 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Design goal: emulate a professional HDR grade of the source — midtones hold
@@ -28,54 +28,64 @@
 // cf_* knobs are neutral overlays on those anchors — deep values stay
 // canonical, knobs scale them.
 
+// ---- shampv shader API — machine-readable contract (plain comments to
+// libplacebo; read by the shampv tuner script). Declares that this shader
+// consumes SDR, emits PQ BT.2020 (the pipeline must retag the frame), and
+// that cf_ref_white must track the player's hdr-reference-white.
+//@shampv input sdr
+//@shampv output trc=pq primaries=bt.2020
+//@shampv ref-white-param cf_ref_white
+
 // =============================================================================
 //  USER TUNING
 // =============================================================================
 // Each control is the plain number on the last line of its block. Sliders
 // first, then feature toggles (1 = on, 0 = off; changing a toggle recompiles
-// the shader). Ranges are enforced; defaults = the shipped tune. Anything not
+// the shader). Sliders are DYNAMIC since v5.10: glsl-shader-opts changes
+// apply on the next frame, no recompile, scene/pump state preserved.
+// Ranges are enforced; defaults = the shipped tune. Anything not
 // listed here is internal — tune it in the passes below at your own peril.
 // NOTE: no comment lines may sit between a PARAM directive block and the next
 // directive — the parser folds them into the value and fails to load.
 
 //!PARAM cf_ref_white
 //!DESC SDR white level in nits — MUST match hdr-reference-white in mpv.conf. On Windows this is your "SDR content brightness" slider (see README for the slider-to-nits table).
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 80.0
 //!MAXIMUM 480.0
 116.0
 
 //!PARAM cf_strength
 //!DESC Overall HDR strength. 1 = the shipped tune, 0 = plain SDR (no expansion at all), 2 = double. Scales everything: base expansion, specular pop, and light pump.
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
 1.0
 
 //!PARAM cf_curve
 //!DESC How harshly expansion ramps up. Below 1 = gentle, broad lift spread across the highlights; above 1 = expansion concentrated hard against the brightest pixels for a punchier pop. Peak brightness itself does not change.
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.6
 //!MAXIMUM 1.8
 1.0
 
 //!PARAM cf_shoulder
 //!DESC Highlight shoulder — softens how hard expansion arrives at the brightest pixels. 0 = shipped look (steepest near-clip differentiation); 1 = expansion reaches its peak with no extra steepening. Raise it for sources whose highlights are already harsh or clipped hard.
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
-0.0
+0.4
 
 //!PARAM cf_spec
 //!DESC Specular pop — extra punch on glints, light sources, and clipped highlights. 1 = shipped tune, 0 = off.
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
-1.0
+0.5
 
 //!PARAM cf_pump
 //!DESC Light pump — a temporary surge on sudden sustained brightening (explosions, tunnel exits, spells). 1 = shipped tune, 0 = off.
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
 1.0
@@ -1696,7 +1706,7 @@ void hook() {
 // EXAGGERATED defaults for first validation — the gain ceil dominates so the
 // effect is unmissable. Drop PUMP_STRENGTH to ~0.3-0.6 for the subtle target.
 #define ENABLE_LIGHT_PUMP   cf_light_pump   // top-of-file toggle
-#define PUMP_STRENGTH       1      // gain per unit pump_env at full pixel weight. At = CEIL the response is
+#define PUMP_STRENGTH       0.5      // gain per unit pump_env at full pixel weight. At = CEIL the response is
                                    // PROPORTIONAL (peak reserved for full-detection events, not roof-pinned);
                                    // > CEIL slams moderate events to the roof (aggressive); subtle ≈ 0.4
 #define PUMP_Y_LOW          0.35   // per-pixel weight onset — low/broad so the whole bright region lifts (not a pinpoint)
@@ -1768,7 +1778,7 @@ void hook() {
                                     // faces, fabrics, TV screens) by requiring V > 0.93
                                     // before spec fires. Endpoints (dark/bright APL)
                                     // are unaffected — bump is zero at apl_t=0 and 1.
-#define SPEC_PEAK_DARK      1.9     // Specular boost in dark scenes (highlight pop)
+#define SPEC_PEAK_DARK      1.2     // Specular boost in dark scenes (highlight pop)
 #define SPEC_PEAK_BRIGHT    0.7     // Specular boost in bright scenes (modest — eye whites
                                     // and hair highlights kept perceptually cool)
 #define SPEC_GAMMA_DARK     1.3     // Gentler concentration in dark scenes — broadens the

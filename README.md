@@ -100,6 +100,15 @@ Uses the same mpv profile as CelFlare, but keeps the classic in-file setup: set 
 
 Operates on the luma channel only. Uses a 5x5 neighborhood with variance-based texture/grain discrimination and Sobel edge detection to selectively sharpen real texture while leaving edges, grain, and flat areas untouched. Works best when it's barely noticeable. This is meant to restore subtle texture detail affected by encoding.
 
+Runtime controls (live via `glsl-shader-opts`, no recompile):
+
+| Param | Effect |
+|-------|--------|
+| `tc_strength` | Sharpening strength (12 = shipped tune, 0 = off). |
+| `tc_coring` | High-pass deltas below this are ignored (keeps noise from being sharpened). |
+| `tc_texture_thresh` | Minimum local variance that counts as real texture rather than noise. |
+| `tc_max_delta` | Hard cap on how much sharpening may move any pixel. |
+
 **Usage:**
 
 ```ini
@@ -177,7 +186,7 @@ HDR-signal-safe: never clamps the backbuffer. Works on SDR (sRGB), HDR10 (PQ BT.
 
 ---
 
-### Match Grain (SDR)
+### Match Grain
 
 **Adaptive grain restoration.** Instead of applying a fixed tier, it *measures* the source's own surviving film grain and auto-tunes the grain model to restore it. Compression and intermediates smooth camera-original grain unevenly; this reads what survived and rebuilds a fuller, source-matched grain rather than laying a generic overlay on top.
 
@@ -191,6 +200,8 @@ Runtime controls (live-toggleable via `glsl-shader-opts`):
 | `grain_sharpness` | Global crispness dial (1 = crisp 4K-scan default, 0 = a softer look). |
 | `restore_gain` | How far to extrapolate past the surviving grain toward the camera original. |
 | `density_combine` | 0 = additive, 1 = multiplicative density (grain rides the tone/bloom gradients). |
+| `grain_hdr` | 1 = PQ BT.2020 output chain (e.g. CelFlare): grain is keyed and applied in the measured SDR domain via a per-pixel PQ bridge, fading out shortly above reference white. 0 = plain SDR (exact prior behavior). |
+| `grain_ref_white` | SDR reference white in nits for the HDR bridge — match `hdr-reference-white`. |
 | `debug_match` | Machine-readable state overlay for tuning. |
 
 **Requirements:** mpv with `vo=gpu-next`; compute shaders (GLSL 4.30+) — Vulkan/D3D11, or OpenGL 4.3+. SDR content; for SDR→HDR chains (e.g. CelFlare, PQ BT.2020 out) set `grain_hdr=1` + `grain_ref_white=<your hdr-reference-white>` in `glsl-shader-opts`.

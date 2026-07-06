@@ -15,6 +15,10 @@ __pycache__/
 *.bak
 *.bak-*
 
+# macOS junk
+.DS_Store
+**/.DS_Store
+
 # Dev docs — local to this working copy, NEVER published (see CLAUDE.md §policy).
 # CHANGELOG has internal audit/tuning notes; publish a cleaned version deliberately
 # if ever wanted — don't let it leak here by default.

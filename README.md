@@ -190,7 +190,7 @@ HDR-signal-safe: never clamps the backbuffer. Works on SDR (sRGB), HDR10 (PQ BT.
 
 **Adaptive grain restoration.** Instead of applying a fixed tier, it *measures* the source's own surviving film grain and auto-tunes the grain model to restore it. Compression and intermediates smooth camera-original grain unevenly; this reads what survived and rebuilds a fuller, source-matched grain rather than laying a generic overlay on top.
 
-Two-stage compute pipeline: grain character is measured on the `LUMA` plane (pre-scale, where the signal survives), and grain is rendered on `OUTPUT` (native display resolution), with a persistent buffer carrying the measured state between stages. Per source it adapts grain **amplitude** (how much survived, extrapolated up toward the original), **tone** (which luminance range the grain occupies), and **sharpness/size** (fine "sandpaper" vs soft grain) — with motion-, cut-, and pan-aware gating so static texture, smoke, and busy detail aren't mistaken for grain.
+Three-stage compute pipeline: grain character is **measured** on the `LUMA` plane (pre-scale, where the signal survives); the grain field is **generated** once per *source frame* on a fixed 3840×2160 grid (a "4K film scan", independent of source resolution and display refresh); and a thin `OUTPUT` pass **composites** it, sampled scaled to the display so grain holds a constant visual angle (it tracks image scale like a real 4K source on any panel). A persistent buffer carries the measured state between stages. Because generation is source-locked, grain cadence no longer rides the display refresh (previously, high-refresh `display-resample` chains re-generated — and re-seeded — grain per *present*), and re-presents of the same frame cost almost nothing. Per source it adapts grain **amplitude** (how much survived, extrapolated up toward the original), **tone** (which luminance range the grain occupies), and **sharpness/size** (fine "sandpaper" vs soft grain) — with motion-, cut-, and pan-aware gating so static texture, smoke, and busy detail aren't mistaken for grain.
 
 Runtime controls (live-toggleable via `glsl-shader-opts`):
 
@@ -198,7 +198,7 @@ Runtime controls (live-toggleable via `glsl-shader-opts`):
 |-------|--------|
 | `match_grain` | 0 = bit-identical to the fixed Light tier, 1 = matched. `mix()` between, so A/B is non-destructive. |
 | `grain_sharpness` | Global crispness dial (1 = crisp 4K-scan default, 0 = a softer look). |
-| `grain_rate` | Grain animation cadence, as a fraction of rendered frames (default 0.5 = re-seed every 2nd frame — blends with the surviving source grain; 1 = fresh grain every frame). |
+| `grain_rate` | Grain animation cadence, as a fraction of *source* frames (default 1 = fresh grain every source frame; 0.5 = every 2nd source frame, "on twos"). Display-refresh independent. |
 | `grain_base_sat` | Per-channel independence of the base grain — the subtle baked-in hue speckle (default 0.25 = calibrated look; 0 = mono grain). |
 | `restore_gain` | How far to extrapolate past the surviving grain toward the camera original. |
 | `density_combine` | 0 = additive, 1 = multiplicative density (grain rides the tone/bloom gradients). |

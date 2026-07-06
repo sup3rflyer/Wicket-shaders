@@ -259,8 +259,18 @@
 //!VAR float m_source_height
 //!VAR float m_pan_px
 //!VAR float m_gen_frame
+//!VAR float m_eff_render
+//!VAR float m_eff_mid
+//!VAR float m_eff_steep
+//!VAR float m_conf
+//!VAR float m_shape_w
 //!VAR float prev_grid[9216]
 //!VAR float prev_grid_off[9216]
+//!STORAGE
+
+//!TEXTURE GRAIN_FIELD
+//!SIZE 3840 2160
+//!FORMAT rgba16f
 //!STORAGE
 
 //!HOOK LUMA
@@ -616,6 +626,8 @@ void hook() {
             m_coherence = 0.0; m_coh_frac = 0.0; m_coh_samples = 0.0;
             m_held_count = 0.0; m_film_level = 0.0; m_pan_px = 0.0;
             m_gen_frame = 0.0;
+            m_eff_render = 0.0; m_eff_mid = MID_FLOOR; m_eff_steep = STEEP_FLOOR;
+            m_conf = 0.0; m_shape_w = 0.0;
             for (int b = 0; b < NBINS; b++) {
                 hist_amp[b] = 0.0; hist_temporal[b] = 0.0; hist_spatial[b] = 0.0;
                 hist_held[b] = 0.0;
@@ -1134,11 +1146,36 @@ void hook() {
         imageStore(out_image, ivec2(0), vec4(0.0));
 }
 
-//!HOOK OUTPUT
+//!HOOK LUMA
 //!BIND HOOKED
 //!BIND GRAIN_STATE
+//!BIND GRAIN_FIELD
+//!SAVE GRAIN_GEN_TRIGGER
+//!WIDTH 3840
+//!HEIGHT 2160
 //!COMPUTE 32 32
-//!DESC Film Grain Match: OUTPUT render + debug
+//!DESC Film Grain Match: GRAIN gen (fixed 4K, source-locked)
+
+// LUMA hook = mpv's FRESH group: runs once per SOURCE frame regardless of
+// video-sync / display refresh (measured 24.x/s under both display-resample
+// @120Hz and audio sync, 2026-07-06). The OUTPUT composite (redraw group,
+// per-present) just fetches GRAIN_FIELD, so re-presents cost ~nothing and
+// grain cadence can't ride the display refresh. The 3840x2160 grid is the
+// grain's own resolution ("a fixed 4K scan"): generation cost is constant,
+// and GRAIN_RES_REF scaling below collapses to 1 (the grid IS the 4K ref).
+//
+// STORAGE-TEXTURE RECOVERY (2026-07-06): the earlier split SAVE'd GRAIN_FIELD
+// from this fresh pass and BIND'd it in the OUTPUT redraw pass — but a SAVE'd
+// texture is a per-frame transient and did NOT survive the fresh->redraw group
+// gap, so grain generated but never reached the presented frame. Fix: GRAIN_FIELD
+// is now a persistent, shader-owned TEXTURE+STORAGE image (declared
+// top-of-file, like the GRAIN_STATE SSBO) that we imageStore into here and
+// imageLoad from in the composite. Persistent storage retains its contents across
+// presents, so a redraw (no fresh dispatch) reads the last-written field. This
+// fresh pass still needs a dispatch grid, so it SAVEs a throwaway 4K trigger
+// texture (GRAIN_GEN_TRIGGER, never bound) purely to size the 3840x2160 dispatch.
+// GRAIN_FIELD is rgba16f: rgb = final signed grain (bandpass + warp + chroma),
+// a = the pre-warp LOWPASS grain's luma (debug A/B strips).
 
 // 9-tap support (was 7): the blue channel's base sigma (1.20) reaches ~1.15 even at
 // the crisp neutral and higher when coarse, where 7 taps (clean only to sigma ~1.0)
@@ -1161,6 +1198,18 @@ void hook() {
 // Output res the crisp default is calibrated for (grain sigma scales by
 // OUTPUT_height/REF so it reads as a 4K scan at constant visual angle on any display).
 #define GRAIN_RES_REF 2160.0
+// Fixed grain-grid dims. The noise seed wraps on these so the field is TOROIDAL:
+// the composite fetches gid % grid, and a display taller/wider than the grid
+// (e.g. the 3456x2234 XDR wraps vertically at 2160) must not show a seam. Wrapping
+// the seed coordinate makes noise(grid)==noise(0); the separable DoG halo then
+// wraps too (each workgroup regenerates its halo from global coords), so the seam
+// is continuous. In-range coords (the whole grid interior) are unchanged.
+// MUST equal this pass's WIDTH/HEIGHT directives above (3840 x 2160) — same
+// translation unit, no compile guard. The composite derives its dims from
+// imageSize(GRAIN_FIELD) so it can't desync; only these two same-file sites are
+// hand-kept in lockstep. (Directive prefix omitted here on purpose: the parser
+// splits sections on that marker even inside a comment.)
+#define GEN_GRID ivec2(3840, 2160)
 // Per-channel render-sigma cap. The 9-tap support holds a Gaussian cleanly to ~1.5;
 // beyond that it would truncate. The coarse extreme (low-fineR firing) and >4K
 // res-scaling can push a channel past it, so cap GRACEFULLY (slightly finer than
@@ -1187,7 +1236,6 @@ void hook() {
 
 #define CONF_LOW     0.10
 #define CONF_HIGH    0.35
-#define DENSITY_GAIN 1.0
 
 
 #define RED_VARIANCE_SCALE 1.0
@@ -1197,9 +1245,6 @@ void hook() {
 #define RED_SATURATION 0.6
 #define GREEN_SATURATION 0.5
 #define BLUE_SATURATION 0.4
-
-#define TUKEY_SCALE 0.459
-
 
 #define GRAIN_LO_BIN  2
 #define GRAIN_HI_BIN  14
@@ -1302,34 +1347,6 @@ float rand_triangular(inout uint state, float variance_scale) {
     float u = float(a) * (1.0 / 4294967296.0);
     float v = float(b) * (1.0 / 4294967296.0);
     return (u + v - 1.0) * 0.612 * variance_scale;
-}
-
-// --- HDR (PQ BT.2020 output) domain bridge, grain_hdr=1 — for the CelFlare
-// chain. The grain model is measured on gamma-encoded SDR source codes, but
-// under the sdr-to-hdr retag the OUTPUT pixels are true PQ (CelFlare decodes,
-// expands, PQ-encodes). Bridge per pixel: PQ code -> nits -> SDR-equivalent
-// 2.4-gamma code vs grain_ref_white; key + apply the model there; re-encode.
-// Grain lands exactly as the SDR path wherever the image sits at SDR levels
-// (CelFlare holds midtones) and fades to zero shortly above reference white
-// (the measured bell extrapolates; grain does not persist into expanded
-// highlight cores). ST 2084
-// constants match CelFlare's own encode so the round-trip shares a transfer.
-float pq_eotf_nits(float e) {
-    float p = pow(e, 1.0 / 78.84375);
-    return 10000.0 * pow(max(p - 0.8359375, 0.0)
-                         / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125);
-}
-float pq_oetf_code(float nits) {
-    float y = pow(clamp(nits / 10000.0, 0.0, 1.0), 0.1593017578125);
-    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
-}
-
-float grain_scale(float lum, float mid, float steepness) {
-    float d2 = steepness * (lum - mid) * (lum - mid);
-    float t = 1.0 - d2 * TUKEY_SCALE;
-    float curve = t > 0.0 ? t * t : 0.0;
-    float protection = smoothstep(0.0, 0.12, lum);
-    return curve * protection;
 }
 
 float gaussian_weight(float dx, float sigma) {
@@ -1444,18 +1461,18 @@ void hook() {
     float temporal_tone = softness_temporal * softness_conf;
     eff_steep = min(STEEP_MAX, eff_steep * mix(1.0, TEMPORAL_TONE_STEEPEN, temporal_tone));
 
-    // Seed from m_gen_frame (the measure pass's SOURCE-frame counter), NOT the
-    // `frame` builtin — `frame` ticks per PRESENT, so under display-resample the
-    // grain re-seeded at the DISPLAY rate (grain_rate 0.5 -> ~60 Hz on 120 Hz),
-    // which desynced from the source and, more importantly, made grain_rate mean
-    // different things on different displays. m_gen_frame advances once per source
-    // frame, so this OUTPUT pass (which runs per present) produces the SAME grain
-    // across all presents of one source frame -> grain is source-locked on any
-    // display. grain_rate is the cadence dial in SOURCE frames: default 1.0 = a
-    // fresh field every source frame ("on ones", the author's tuned look); 0.5 =
-    // on twos. (The content-cadence seed is avoided: it froze grain on held cels
-    // of clean sources -> a static "dirt" look. The measured distinct counter is
-    // retained for held-grain-cadence detection, deferred.)
+    // Seed from m_gen_frame (the measure pass's SOURCE-frame counter), not
+    // content cadence — a content-cadence seed froze grain on held cels of
+    // clean sources (no grain + identical cel -> counter stalls -> static
+    // "dirt" look) — and NOT the `frame` builtin: `frame` ticks per PRESENT
+    // (proven 2026-07-06 with a paused-frame parity probe), so under
+    // display-resample it made grain_rate display-refresh-dependent — the
+    // "0.5 = half rate" tuning was really "one reseed per source frame" on a
+    // 47.952 Hz (2x 23.976) display and an over-fast ~60 Hz crawl at 120 Hz.
+    // With the source-locked counter, grain_rate 1.0 = every source frame
+    // ("on ones", the tuned look); 0.5 = on twos. The measured distinct
+    // counter is retained for held-grain-cadence detection (twos/threes),
+    // deferred until source-grain cadence is measured directly.
     uint frame_seed = uint(max(0.0, floor(m_gen_frame * grain_rate)));
 
     // GRAIN SIZE/SHARPNESS + OPERATING POINT (re-anchored 2026-06-03, grain-stock
@@ -1492,18 +1509,21 @@ void hook() {
     float gs_k_tgt = clamp(pow(law_R0 / gs_fineR, law_EXP), law_KLO, law_KHI);
     float gs_fire = smoothstep(0.12, 0.30, w);
     float gs = grain_sharpness * match_grain;
-    // RESOLUTION NORMALIZATION (two different scalings, folded into the k mix):
+    // RESOLUTION NORMALIZATION (two different scalings, folded into the k mix).
+    // Grain is generated at the FIXED 3840x2160 grid = GRAIN_RES_REF (the "4K
+    // scan"), then the composite SAMPLES it scaled by grid_h/output_h -> so the
+    // sigmas here are all in 4K-REFERENCE texels, and the composite converts to
+    // display size (constant visual angle):
     //  - NEUTRAL (the clean-content 4K-film-scan default) is a fixed 4K-reference
-    //    sigma -> scale by OUTPUT/GRAIN_RES_REF for constant visual angle on any display.
+    //    sigma -> vis_scale is identically 1 (the grid IS the 4K ref); the
+    //    composite scale then makes it constant visual angle on any display, so
+    //    on a 2160-tall display it matches the old OUTPUT-res generation exactly.
     //  - PER-SOURCE (gs_k_tgt) is measured in SOURCE-LUMA pixels -> scale by
-    //    OUTPUT/SOURCE so the rendered grain matches the on-screen (libplacebo-scaled)
-    //    image grain (a linear geometric stretch). NOT a "native 4K gauge" remap:
-    //    we match what's actually on screen, which IS just the scaled source.
-    // In the AnimeJaNai pipeline LUMA(post-upscale)=OUTPUT so both ratios are 1.0
-    // (no-op); they only diverge when libplacebo scales the source to the display.
+    //    GRID/SOURCE so the grain (at the 4K grid) matches the source's grain
+    //    stretched to 4K; the composite scale then carries it to the display.
     float src_h = (m_source_height > 1.0) ? m_source_height : HOOKED_size.y;
-    float vis_scale = HOOKED_size.y * (1.0 / GRAIN_RES_REF);      // OUTPUT / 4K-ref
-    float src_scale = HOOKED_size.y / src_h;                      // OUTPUT / SOURCE
+    float vis_scale = 1.0;                                        // grid IS the 4K ref
+    float src_scale = 2160.0 / src_h;                             // GRID / SOURCE (2160 MUST equal GEN_GRID.y / //HEIGHT / //SIZE)
     float k_neutral = mix(1.0, K_NEUTRAL * vis_scale, gs);
     float k_size = mix(k_neutral, gs_k_tgt * src_scale, gs * gs_fire);
     // grain_size: live size multiplier (1.0 = calibrated). <1 finer, >1 coarser. Lets
@@ -1603,7 +1623,7 @@ void hook() {
         uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
         ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy)
                              + ivec2(local_pos) - ivec2(MAX_TAPS);
-        uvec2 global_pos = uvec2(global_coord_i);
+        uvec2 global_pos = uvec2((global_coord_i % GEN_GRID + GEN_GRID) % GEN_GRID);
         uint seed_init = (global_pos.x * 1664525u) + (global_pos.y * 22695477u)
                        + (frame_seed * 314159265u);
         float g_r = rand_triangular(seed_init, RED_VARIANCE_SCALE);
@@ -1645,7 +1665,7 @@ void hook() {
             uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
             ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy)
                                  + ivec2(local_pos) - ivec2(MAX_TAPS);
-            uvec2 global_pos = uvec2(global_coord_i);
+            uvec2 global_pos = uvec2((global_coord_i % GEN_GRID + GEN_GRID) % GEN_GRID);
             uint seed_init = (global_pos.x * 1664525u) + (global_pos.y * 22695477u)
                            + (frame_seed * 314159265u);
             float g_r = rand_triangular(seed_init, RED_VARIANCE_SCALE);
@@ -1690,7 +1710,7 @@ void hook() {
             uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
             ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy)
                                  + ivec2(local_pos) - ivec2(MAX_TAPS);
-            uvec2 global_pos = uvec2(global_coord_i);
+            uvec2 global_pos = uvec2((global_coord_i % GEN_GRID + GEN_GRID) % GEN_GRID);
             uint cbase = (global_pos.x * 1664525u) + (global_pos.y * 22695477u)
                        + (frame_seed * 314159265u);
             uint cr_s = cbase + 0x68bc21ebu;     // 3 INDEPENDENT per-channel streams (distinct
@@ -1759,7 +1779,114 @@ void hook() {
         vsum_b += cs_b - cl;
     }
 
+    // Final field store. rgb = the finished signed grain (bandpass + warp +
+    // chroma); a = the pre-warp LOWPASS grain's luma so the debug A/B strips
+    // can still show lowpass-vs-bandpass without a second saved texture.
+    if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u) {
+        // Composite-side scalars, computed ONCE here (uniform math over
+        // GRAIN_STATE + params) and passed through the state buffer so the
+        // two translation units can't drift on duplicated defines. Written
+        // by a single thread; the composite dispatch reads them after this
+        // pass completes.
+        m_eff_render = eff_render;
+        m_eff_mid    = eff_mid;
+        m_eff_steep  = eff_steep;
+        m_conf       = conf;
+        m_shape_w    = shape_w;
+    }
+    float lowpass_luma = dot(vec3(vsum1_r, vsum1_g, vsum1_b), luma_coeff);
+    // Write the finished field into the PERSISTENT storage texture (survives across
+    // presents). The 4K trigger dispatch rounds 2160 up to 2176 rows (COMPUTE 32),
+    // so guard against the 16 out-of-range rows: an OOB imageStore is a spec-legal
+    // silent no-op on both Vulkan and D3D11, but gate it explicitly rather than lean
+    // on backend drop behavior (no barrier follows, so the divergent branch is safe).
+    ivec2 gpos = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(gpos, imageSize(GRAIN_FIELD))))
+        imageStore(GRAIN_FIELD, gpos, vec4(vsum_r, vsum_g, vsum_b, lowpass_luma));
+    // The SAVE'd trigger target only exists to size the dispatch and is never bound;
+    // write it from ONE invocation so we don't pay a second full-4K store.
+    if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u)
+        imageStore(out_image, ivec2(0), vec4(0.0));
+}
+
+//!HOOK OUTPUT
+//!BIND HOOKED
+//!BIND GRAIN_STATE
+//!BIND GRAIN_FIELD
+//!COMPUTE 32 32
+//!DESC Film Grain Match: OUTPUT composite + debug
+
+// The per-present half: this is the shader's only pass in mpv's REDRAW group
+// (re-runs per present -- up to display Hz under display-resample), so it
+// stays fetch + key + apply. All grain generation and every scalar that used
+// to be derived here (eff_render/mid/steep, conf, shape_w) now come from the
+// source-locked gen pass via GRAIN_STATE / GRAIN_FIELD.
+#define DENSITY_GAIN 1.0
+#define TUKEY_SCALE  0.459
+
+const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
+
+// --- HDR (PQ BT.2020 output) domain bridge, grain_hdr=1 — for the CelFlare
+// chain. The grain model is measured on gamma-encoded SDR source codes, but
+// under the sdr-to-hdr retag the OUTPUT pixels are true PQ (CelFlare decodes,
+// expands, PQ-encodes). Bridge per pixel: PQ code -> nits -> SDR-equivalent
+// 2.4-gamma code vs grain_ref_white; key + apply the model there; re-encode.
+// Grain lands exactly as the SDR path wherever the image sits at SDR levels
+// (CelFlare holds midtones) and fades to zero shortly above reference white
+// (the measured bell extrapolates; grain does not persist into expanded
+// highlight cores). ST 2084
+// constants match CelFlare's own encode so the round-trip shares a transfer.
+float pq_eotf_nits(float e) {
+    float p = pow(e, 1.0 / 78.84375);
+    return 10000.0 * pow(max(p - 0.8359375, 0.0)
+                         / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125);
+}
+float pq_oetf_code(float nits) {
+    float y = pow(clamp(nits / 10000.0, 0.0, 1.0), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+}
+
+float grain_scale(float lum, float mid, float steepness) {
+    float d2 = steepness * (lum - mid) * (lum - mid);
+    float t = 1.0 - d2 * TUKEY_SCALE;
+    float curve = t > 0.0 ? t * t : 0.0;
+    float protection = smoothstep(0.0, 0.12, lum);
+    return curve * protection;
+}
+
+// Wrapped POINT fetch of the toroidal grain field. GRAIN_FIELD is a persistent
+// storage image, so it is read via imageLoad (point-only — imageLoad has no
+// bilinear path). At integer fpos (any 2160-tall display -> gscale 1.0) this is
+// the exact texel, bit-identical to the old fetch. Sub/over-4K displays (gscale
+// != 1.0) get a point-sampled (nearest) scale instead of the split's bilinear —
+// slightly aliased grain scaling on non-2160 displays only; the author's targets
+// are 2160-tall so the on-screen result is unchanged. The wrap (%) tiles the
+// toroidal field when the scaled extent exceeds the grid (ultrawide / >4K width).
+vec4 grain_point(vec2 fpos, ivec2 g) {
+    ivec2 i = ivec2(floor(fpos - 0.5));
+    ivec2 a = (i % g + g) % g;                  // component-wise wrap
+    return imageLoad(GRAIN_FIELD, a);
+}
+
+void hook() {
     vec4 color = HOOKED_tex(HOOKED_pos);
+
+    // Source-locked grain, SCALED to the display so it tracks image scale like
+    // a real 4K source (constant visual angle), not a fixed display-pixel size.
+    // gscale = grid_height / output_height, applied UNIFORMLY to both axes so
+    // grain stays square; horizontal over-extent tiles via the wrap. On any
+    // 2160-tall display (both the author's) gscale == 1.0 -> integer fpos ->
+    // exact texel, crisp, bit-identical to the old 1:1 fetch. Sub-4K (gscale>1)
+    // point-downsamples -> finer grain that shrinks with the display; >4K
+    // (gscale<1) point-upsamples. Grid dims come from imageSize(GRAIN_FIELD) (not
+    // a literal) so the composite can't desync from the gen pass's WIDTH/HEIGHT
+    // directives (the cross-TU "constant sync" footgun; audit 2026-07-06).
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 gsize = imageSize(GRAIN_FIELD);
+    float gscale = float(gsize.y) / max(HOOKED_size.y, 1.0);
+    vec2 fpos = (vec2(gid) + 0.5) * gscale;
+    vec4 gfield4 = grain_point(fpos, gsize);
+    vec3 vsum = gfield4.rgb;
 
     // grain_hdr bridge: work in the measured SDR domain (see helpers above).
     // Clamp the PQ input codes — YUV->RGB overshoot above 1.0 explodes the
@@ -1775,14 +1902,13 @@ void hook() {
     }
 
     float color_luma = dot(work_rgb, luma_coeff);
-    float tone_scale = grain_scale(color_luma, eff_mid, eff_steep);
-    vec3 vsum = vec3(vsum_r, vsum_g, vsum_b);
+    float tone_scale = grain_scale(color_luma, m_eff_mid, m_eff_steep);
     vec3 scale_vec = vec3(tone_scale);
     vec3 pre_grain = work_rgb;
     if (density_combine > 0.5)
-        work_rgb *= exp(eff_render * DENSITY_GAIN * vsum * scale_vec);
+        work_rgb *= exp(m_eff_render * DENSITY_GAIN * vsum * scale_vec);
     else
-        work_rgb += eff_render * vsum * scale_vec;
+        work_rgb += m_eff_render * vsum * scale_vec;
 
     if (hdr_bridge) {
         // Grain is texture, not signal: it may never push a pixel above
@@ -1810,12 +1936,12 @@ void hook() {
             if      (row == 0) v = m_intensity_raw * 30000.0;
             else if (row == 1) v = m_mid * 65000.0;
             else if (row == 2) v = m_steepness * 7000.0;
-            else if (row == 3) v = 0.0;   // retired (m_sat) — row layout kept stable
+            else if (row == 3) v = m_gen_frame;  // was retired m_sat; row layout stable
             else if (row == 4) v = m_log_avg * 1000000.0;
             else if (row == 5) v = m_measured;
             else if (row == 6) v = m_debug_tick;
-            else if (row == 7) v = eff_render * 90000.0;
-            else if (row == 8) v = conf * 65000.0;
+            else if (row == 7) v = m_eff_render * 90000.0;
+            else if (row == 8) v = m_conf * 65000.0;
             else if (row == 9) v = m_prev_ready * 60000.0;
             else if (row < 26) v = hist_amp[row - 10] * 2000000.0;
             else if (row == 40) v = hist_spatial[14];
@@ -1838,9 +1964,9 @@ void hook() {
             else if (row == 72) v = m_measure_swatch_g * 65000.0;
             else if (row == 73) v = m_measure_swatch_b * 65000.0;
             else if (row == 74) v = m_measure_stage * 65000.0;
-            else if (row == 75) v = eff_mid * 65000.0;
-            else if (row == 76) v = eff_steep * 7000.0;
-            else if (row == 77) v = shape_w * 65000.0;
+            else if (row == 75) v = m_eff_mid * 65000.0;
+            else if (row == 76) v = m_eff_steep * 7000.0;
+            else if (row == 77) v = m_shape_w * 65000.0;
             else if (row < 92)  v = hist_held[row - 78] * 2000000.0;
             else if (row == 92) v = m_held_count;
             else if (row == 93) v = m_film_level * 2000000.0;
@@ -1875,18 +2001,20 @@ void hook() {
                           : (slot == 1) ? vec3(0.20)
                           : (slot == 2) ? vec3(0.45)
                           :               vec3(0.70);
-                float ts = grain_scale(dot(base, luma_coeff), eff_mid, eff_steep);
+                float ts = grain_scale(dot(base, luma_coeff), m_eff_mid, m_eff_steep);
                 // thirds: CLEAN | LOWPASS (blur s1) | BANDPASS (current grain_contrast),
                 // so the bandpass character shows directly vs clean AND vs the old lowpass
                 // without toggling. Crank Ctrl+Shift+F3 (gain) to make it clearly visible.
+                // Lowpass strip is MONO since the split (GRAIN_FIELD.a carries only the
+                // lowpass LUMA); the bandpass strip stays full per-channel.
                 vec3 gfield = (pp.x < 40) ? vec3(0.0)
-                            : (pp.x < 80) ? vec3(vsum1_r, vsum1_g, vsum1_b)
+                            : (pp.x < 80) ? vec3(gfield4.a)
                             :               vsum;
                 vec3 outc = base;
                 if (density_combine > 0.5)
-                    outc *= exp(eff_render * DENSITY_GAIN * gfield * ts);
+                    outc *= exp(m_eff_render * DENSITY_GAIN * gfield * ts);
                 else
-                    outc += eff_render * gfield * ts;
+                    outc += m_eff_render * gfield * ts;
                 color.rgb = outc;
             }
         }

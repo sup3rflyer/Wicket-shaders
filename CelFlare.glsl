@@ -156,6 +156,7 @@
 //!VAR float pump_slow_cell[144]
 //!VAR float pump_env_cell[144]
 //!VAR float pump_mask_cell[144]
+//!VAR float pump_seed_cell[144]
 //!VAR float bar_run[8]
 //!STORAGE
 
@@ -853,6 +854,68 @@ vec4 hook() {
 // safety, not an A/B lever — an ungated additive mask is exactly the pre-v5.2
 // artifact machine. Keep it 1 while the additive experiment is on.
 #define PUMP_MASK_ESTABLISH 1
+// OFF-SCREEN / EDGE ESTABLISHMENT (2026-07-07) — the reveal-safety analog for
+// content ENTERING through the frame border. The established-level gate above
+// only knows ON-SCREEN history: a steady-bright object sliding in from off
+// frame has none, and it outruns the 25-frame slow lane, so every cell it
+// crosses reads FRESH and — under the ADDITIVE mask, whose only reveal-safety
+// IS this gate (the signed-cancellation safety lives in the scalar pump_env,
+// which additive does not consume for amplitude) — pumps a glow that tracks the
+// object. This is the documented residual of the signed-cancellation approach
+// (see the PUMP_DRIVE_P "TRADE" note: an object ENTERING has its matching fall
+// off-screen, so the on-screen onset looks unmatched). Three parts, all in
+// PASS 5:
+//  (1) FAST-ESTABLISH — a rising NON-fresh cell settles its slow lane to its
+//      fast lane THIS frame instead of over ~25, so the "established" verdict
+//      propagates inward with the moving front at up to ring-2/frame and keeps
+//      pace with the object (≈240 px/frame at 1080p). CRUCIALLY it fires only
+//      when the rise is gated by an INFLUX ANCHOR — a per-cell seed-origin
+//      marker (pump_seed_cell) that traces back to a border seed AND sits a
+//      STEP above this cell's fast (PUMP_EDGE_STEP_MARGIN). Two guards:
+//        - marker 0 (a genuine established sky/lamp/standing fire) never
+//          propagates -> a cell gated by it keeps the slow EMA + the pre-
+//          existing bounded-rim gate. Without this the chain runs through ANY
+//          connected region within PUMP_ESTABLISH_MARGIN and gates a fire under
+//          a brighter sky / a dim co-fire to ~0 (audit finding: "an event is
+//          fresh so it can't self-gate" is FALSE — an event dimmer than an
+//          adjacent established region is non-fresh at its boundary).
+//        - the STEP requirement means the anchor is genuinely HIGHER (this cell
+//          is catching up to a front / reveal). A uniform fade has every
+//          neighbour's slow lane BELOW this cell's fast, so no step is met and
+//          the marker cannot chain through a smooth full-frame rise — the
+//          self-latching gate (settle pins di -> stays non-fresh -> sustains
+//          the chain) the second audit pass found is structurally impossible.
+//  (2) BORDER SEED — the outer ring has no more-outward on-screen neighbour to
+//      be non-fresh against, so a rising outer-ring cell is presumed influx
+//      (off-frame continuity): it holds its mask shut, marks itself (marker =
+//      edge_seed), and fast-establishes. This is the ORIGIN that (1) propagates.
+//  (3) GLOBAL GATE — (2) must NOT fire on a frame-wide rise (tunnel exit,
+//      fade-to-white) or the whole frame would gate inward from every edge (and
+//      seed a frame-filling influx chain). The seed scales by 1 - smoothstep of
+//      the FRACTION of the deep interior that is rising: a global rise lights
+//      most of it (seed off), a localized central event lights only a handful
+//      (seed stays armed — fraction, not mean magnitude, so a few hot central
+//      cells can't trip it).
+// Vignette safety is the BORDER MIRROR in the publish loop: an outer cell
+// max-inherits its inward neighbour's amplitude at full rate, so a genuine
+// event reaching the edge pumps clean to the edge while a pure influx — whose
+// inward neighbour is itself gated — inherits nothing. Accepted residuals
+// (both DOCUMENTED, not bugs — offline audit 2026-07-07): (a) a sustained event
+// that originates PURELY at the extreme edge with no interior support reads as
+// influx and under-pumps (the source is already bright; spec + expansion still
+// carry it); (b) the STEP_MARGIN test speed-limits influx protection to
+// ~1.3 cells/frame (≈155 px/frame @1080p) — a FASTER uniform pan-reveal glows
+// as it did before this feature (a pre-existing residual of the signed-
+// cancellation approach, NOT new: the fix is <= pre-fix pump at every speed, so
+// it adds no over-pump). To reclaim the fast-pan ceiling later, make the step
+// test velocity-aware (relax it in proportion to the border cell's own di) —
+// enhancement, not a ship gate. 0 = pre-fix (feature off) behavior.
+#define PUMP_EDGE_ESTABLISH        1
+#define PUMP_EDGE_ESTABLISH_ALPHA  1.0    // 1 = settle slow->fast in one frame (max propagation reach); lower = gentler
+#define PUMP_EDGE_STEP_MARGIN      0.03   // influx marker propagates only across a step this big (neighbour established above this cell's fast) — rejects uniform co-rise (anti-latch)
+#define PUMP_EDGE_GLOBAL_EPS       0.02   // per-cell rise above which a deep-interior cell counts as "rising"
+#define PUMP_EDGE_GLOBAL_FRAC_LO   0.40   // fraction of the deep interior rising below this: localized -> seed armed
+#define PUMP_EDGE_GLOBAL_FRAC_HI   0.75   // above this: frame-global rise -> border seed fully disengaged
 // Mask softening (v5.6 hardening, field report: cels read diamond-shaped and
 // a large event's BOUNDARY cells — whose cell-mean drive dilutes below
 // CELL_DRIVE_LOW — never open, leaving hard mosaic edges mid-event). The
@@ -948,6 +1011,14 @@ shared float s_illum_v[144];        // max(R,G,B) of the illum field — V-aware
 // cell's PRE-update state while the fused loop updates them in place.
 shared float s_pump_snap_f[144];
 shared float s_pump_snap_s[144];
+#if PUMP_EDGE_ESTABLISH
+// Per-cell INFLUX-ORIGIN marker snapshot: 1 = this cell's establishment
+// traces back to a border seed (content entering off-frame), 0 = it is a
+// genuine interior established region (sky, lamp, standing fire). Only a
+// marked anchor may propagate the fast-establish gate inward — the decoupling
+// that stops the gate from chain-eating a fire under a brighter sky.
+shared float s_pump_snap_seed[144];
+#endif
 #endif
 
 void hook() {
@@ -1279,6 +1350,9 @@ void hook() {
                 pump_slow_cell[i] = v;
                 pump_env_cell[i]  = 0.0;
                 pump_mask_cell[i] = 0.0;
+                #if PUMP_EDGE_ESTABLISH
+                pump_seed_cell[i] = 0.0;
+                #endif
             }
             #endif
             pump_fast = pnorm_illum_v;
@@ -1330,11 +1404,17 @@ void hook() {
             // balanced crossings cancel here, dying fires go net-negative.
             float loc_sum = 0.0, loc_on_sum = 0.0;
             float fall_w = 0.0, fall_ratio = 0.0;
+            #if PUMP_EDGE_ESTABLISH
+            float edge_interior_n = 0.0;   // count of deep-interior cells that are RISING
+            #endif
             for (uint i = 0u; i < 144u; i++) {
                 float cf = pump_fast_cell[i];
                 float cs = pump_slow_cell[i];
                 s_pump_snap_f[i] = cf;
                 s_pump_snap_s[i] = cs;
+                #if PUMP_EDGE_ESTABLISH
+                s_pump_snap_seed[i] = pump_seed_cell[i];   // prev-frame influx-origin marker
+                #endif
                 float di = cf - cs;
                 float m  = max(abs(di) - PUMP_CELL_DEADZONE, 0.0);
                 float w  = pow(m, PUMP_DRIVE_P);
@@ -1345,7 +1425,29 @@ void hook() {
                     fall_w     += w;
                     fall_ratio += w * (cf / cs);
                 }
+                #if PUMP_EDGE_ESTABLISH
+                // Border-seed global gate: the FRACTION of the deep interior
+                // (cols 3-12 x rows 2-6, 50 cells clear of the outer ring AND the
+                // letterbox candidate lines 0,1,7,8 / 0,1,14,15) that is rising.
+                // A frame-global brightening lights most of them; a LOCALIZED
+                // central event (a fire, an explosion) lights only a handful, so
+                // fraction — not mean magnitude — keeps the seed armed through
+                // localized events while still disengaging on a true global rise
+                // (the mean-magnitude form let a few hot central cells trip it).
+                {
+                    int gy = int(i) / 16, gx = int(i) % 16;
+                    if (gx >= 3 && gx <= 12 && gy >= 2 && gy <= 6 && di > PUMP_EDGE_GLOBAL_EPS)
+                        edge_interior_n += 1.0;
+                }
+                #endif
             }
+            #if PUMP_EDGE_ESTABLISH
+            // >LO fraction rising: broad enough to be coherent; >HI: clearly
+            // frame-global -> seed fully disengaged so borders pump like
+            // everything else.
+            float global_gate = smoothstep(PUMP_EDGE_GLOBAL_FRAC_LO, PUMP_EDGE_GLOBAL_FRAC_HI,
+                                           edge_interior_n * (1.0 / 50.0));
+            #endif
             // Loop 2: established-level gate → gated ONSET aggregate, then the
             // cell EMA update + mask env. A rise is FRESH only if the cell's
             // pre-update fast exceeds every ring-2 neighbour's pre-update slow
@@ -1361,6 +1463,24 @@ void hook() {
                 float w  = pow(m, PUMP_DRIVE_P);
                 bool fresh = false;
                 float fresh_ease = 0.0;
+                int cy = int(i) / 16, cx = int(i) % 16;
+                #if PUMP_EDGE_ESTABLISH
+                // Border seed (off-screen establishment): a rising outer-ring
+                // cell has no more-outward on-screen neighbour to be non-fresh
+                // against, so it is presumed influx — brightness continuing in
+                // from off frame — except during a frame-global rise, where
+                // global_gate disengages it. edge_seed in [0,1] debits the onset
+                // and holds the mask shut below, and seeds the fast-establish so
+                // the verdict propagates inward with the entering front.
+                bool edge_cell = (cx == 0 || cx == 15 || cy == 0 || cy == 8);
+                float edge_seed = (edge_cell && di > 0.0) ? (1.0 - global_gate) : 0.0;
+                // Max influx-origin marker among the ring-2 neighbours that
+                // actually gate this cell (their established level reaches it) —
+                // set in the di>0 scan below. This is what scopes the
+                // fast-establish to influx: a genuine (unmarked) sky/fire anchor
+                // gives nb_seed 0, so the gate never chains through it.
+                float nb_seed = 0.0;
+                #endif
                 if (di > 0.0) {
                     // ANCHORED establishment window (frame-edge rule, the
                     // additive-door prerequisite): the 5×5 ring-2 window is
@@ -1384,18 +1504,44 @@ void hook() {
                     //    sky never localizes (kills the multi-fire target).
                     //    Ring stays 2; the ≥5-cell-tall occluder wake this
                     //    leaves open is the documented additive residual.
-                    // cy/cx (not iy/ix): the lane-ID names are taken by the
-                    // outer uint pair — audit-flagged shadow, renamed.
-                    int cy = int(i) / 16, cx = int(i) % 16;
+                    // cy/cx hoisted to the loop top (shared with the border
+                    // seed + fast-establish); the ring-2 window is unchanged.
                     int ny0 = clamp(cy - 2, 0, 4);
                     int nx0 = clamp(cx - 2, 0, 11);
                     float nb_est = 0.0;
                     for (int ny = ny0; ny < ny0 + 5; ny++)
                         for (int nx = nx0; nx < nx0 + 5; nx++)
-                            if (ny != cy || nx != cx)
-                                nb_est = max(nb_est, s_pump_snap_s[ny * 16 + nx]);
+                            if (ny != cy || nx != cx) {
+                                float snb = s_pump_snap_s[ny * 16 + nx];
+                                nb_est = max(nb_est, snb);
+                                #if PUMP_EDGE_ESTABLISH
+                                // Carry the max INFLUX marker among neighbours
+                                // established a STEP above this cell's fast
+                                // (snb >= cf + STEP_MARGIN). Two guards in one:
+                                //  - marker 0 (genuine sky/fire) never propagates
+                                //    -> the fire-under-sky decoupling;
+                                //  - the STEP requirement means the neighbour is a
+                                //    genuinely-higher established anchor this cell
+                                //    is CATCHING UP to (an influx front / reveal),
+                                //    NOT a co-rising equal neighbour. On a uniform
+                                //    fade every neighbour's slow lane sits BELOW
+                                //    this cell's fast (snb = cf - di < cf), so the
+                                //    step is never met -> the marker cannot chain
+                                //    through a smooth full-frame rise (the
+                                //    self-latching gate the design audit found).
+                                if (snb >= cf + PUMP_EDGE_STEP_MARGIN)
+                                    nb_seed = max(nb_seed, s_pump_snap_seed[ny * 16 + nx]);
+                                #endif
+                            }
                     fresh = cf - PUMP_ESTABLISH_MARGIN > nb_est;
+                    #if PUMP_EDGE_ESTABLISH
+                    // Influx-seeded edge cells contribute a debited onset so an
+                    // object entering off-frame cannot fire the global scalar
+                    // either (its off-screen fall is invisible to loc_on_sum).
+                    if (fresh) loc_on_sum += w * (1.0 - edge_seed);
+                    #else
                     if (fresh) loc_on_sum += w;
+                    #endif
                     // Mask half consumes an EASED freshness: the band starts
                     // AT the margin, so everything the boolean suppresses
                     // stays exactly 0 (a reveal that noise-overshoots its
@@ -1412,6 +1558,27 @@ void hook() {
                 float v = s_illum_v[i];
                 float f = mix(cf, v, PUMP_ALPHA_FAST);
                 float s = mix(cs, v, PUMP_ALPHA_SLOW);
+                #if PUMP_EDGE_ESTABLISH
+                // Fast-establish, SCOPED TO INFLUX (2026-07-07 rework, after the
+                // design audit): a rising cell settles its slow lane to its fast
+                // lane THIS frame — instead of over ~25 — ONLY when its rise is
+                // gated by an influx anchor (edge_seed for a border cell, else
+                // nb_seed inherited from a seed-marked neighbour). That makes the
+                // established verdict ride inward with an entering front at up to
+                // ring-2/frame WITHOUT chaining through a genuine established
+                // region: a non-fresh cell gated by an unmarked sky/fire keeps
+                // the slow EMA (nb_seed 0 -> settle 0), so a fire under a brighter
+                // sky / a dim co-fire keeps the pre-fix bounded-rim behaviour
+                // instead of being chain-gated to zero. `settle` doubles as this
+                // cell's new influx marker: it is nonzero only for influx risers,
+                // so a fresh event (settle 0) and a fall (di<0) both clear it.
+                // Blended (not branched) to avoid a threshold pop. Writes only
+                // the SSBO slow lane, NOT the frozen snapshot, so the wave stays
+                // symmetric (ring-2/frame) and scan-order-independent.
+                float settle = max((di > 0.0 && !fresh) ? nb_seed : 0.0, edge_seed);
+                s = mix(s, mix(cs, f, PUMP_EDGE_ESTABLISH_ALPHA), settle);
+                pump_seed_cell[i] = settle;
+                #endif
                 pump_fast_cell[i] = f;
                 pump_slow_cell[i] = s;
                 float d = f - s;
@@ -1425,6 +1592,13 @@ void hook() {
                 // (see fresh_ease above). An already-open cell max-holds and
                 // releases exactly as before — closing is never gated.
                 a *= fresh_ease;
+                #endif
+                #if PUMP_EDGE_ESTABLISH
+                // Edge cells open only on a coherent (global) rise; a pure
+                // influx (edge_seed->1, so 1-edge_seed->0) is held shut. A
+                // genuine event that reaches the edge is restored at full rate
+                // by the border mirror in the publish loop.
+                a *= (1.0 - edge_seed);
                 #endif
                 // Velocity-matched release: the negative half of the band-pass
                 // is the region's own fall, so the mask eases out in lockstep
@@ -1457,6 +1631,29 @@ void hook() {
                 pump_mask_cell[i] = max(s_pump_snap_f[i], b * (1.0 / 16.0));
                 #else
                 pump_mask_cell[i] = s_pump_snap_f[i];
+                #endif
+                #if PUMP_EDGE_ESTABLISH
+                // Border mirror (vignette safety): an outer-ring cell inherits
+                // its inward neighbour's amplitude at FULL rate (max, not the
+                // ~1/4 soften skirt). A genuine event reaching the frame edge
+                // pumps clean to the edge; a pure influx — whose inward
+                // neighbour is itself gated — inherits 0, so no glow. Reads the
+                // post-update env stashed in s_pump_snap_f by loop 2.
+                int mcy = int(i) / 16, mcx = int(i) % 16;
+                float mir = 0.0;
+                if (mcx == 0)  mir = max(mir, s_pump_snap_f[mcy * 16 + 1]);
+                if (mcx == 15) mir = max(mir, s_pump_snap_f[mcy * 16 + 14]);
+                if (mcy == 0)  mir = max(mir, s_pump_snap_f[16 + mcx]);
+                if (mcy == 8)  mir = max(mir, s_pump_snap_f[7 * 16 + mcx]);
+                // Corner cells: both orthogonal inward neighbours are THEMSELVES
+                // edge cells (gated by the same global_gate), so also reach the
+                // inward DIAGONAL — the nearest genuinely-interior cell — or a
+                // real corner event leaves a 1-cell notch at the very corner.
+                int dcy = (mcy == 0) ? 1 : (mcy == 8) ? 7 : mcy;
+                int dcx = (mcx == 0) ? 1 : (mcx == 15) ? 14 : mcx;
+                if ((mcy == 0 || mcy == 8) && (mcx == 0 || mcx == 15))
+                    mir = max(mir, s_pump_snap_f[dcy * 16 + dcx]);
+                pump_mask_cell[i] = max(pump_mask_cell[i], mir);
                 #endif
             }
             // ONSET takes the gated aggregate; the release path below keeps

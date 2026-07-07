@@ -128,9 +128,37 @@ Technical approach:
 - Separable multi-tap Gaussian convolution for grain size control (per-channel tap counts create natural chromatic grain structure)
 - Luminance-adaptive scaling via Tukey window (grain concentrated in midtones, finite support)
 
-#### SDR Variants
+#### Single file — `filmgrain-smooth.glsl`
 
-For standard dynamic range content. Hooks at `OUTPUT` stage to always present the grain at native resolution.
+The whole SDR/HDR × light/medium/heavy matrix is also available as **one shader** with the variant selected at runtime — the mpv counterpart of the ReShade port below. Pick a look with `grain_preset` (light/medium/heavy), or set it to `custom` and dial the individual knobs; size, cadence, and the HDR toggle stay live in every preset.
+
+Grain is generated once per **source frame** on a fixed 3840×2160 grid and composited display-scaled every present. So its cadence is locked to the content (not the display refresh) and its size holds a constant visual angle on any panel — and on a high-refresh display it costs far less than regenerating grain every present.
+
+Runtime controls (live via `glsl-shader-opts`, no recompile):
+
+| Param | Effect |
+|-------|--------|
+| `grain_preset` | Baked look: `0` = custom, `1` = light, `2` = medium, `3` = heavy. A preset drives intensity, saturation, tone, and per-channel chroma balance — the custom-only knobs below are ignored while it's active. |
+| `grain_intensity` | Grain amplitude (custom only; light ≈ 0.05, medium ≈ 0.12, heavy ≈ 0.20). |
+| `grain_saturation` | Per-channel grain chroma (custom only; 0 = monochrome, 1 = full color). |
+| `grain_size` | Cell size at a 4K reference (constant visual angle). 1 = calibrated, >1 coarser, <1 finer. Live in every preset. |
+| `grain_mid` | Tone where grain peaks (custom only; 0 = shadows, 0.5 = midtones, 1 = highlights). |
+| `grain_steepness` | Tone-bell tightness (custom only) — higher confines grain to the midtones and keeps highlights cleaner. |
+| `grain_rate` | Reseed cadence in *source* frames (1 = every frame, 0.5 = on twos). Display-refresh independent. Live. |
+| `grain_hdr` | `1` = PQ BT.2020 output chain (e.g. after CelFlare): grain is keyed and applied in the SDR domain via a per-pixel PQ bridge, fading out above reference white. `0` = plain SDR. Live. |
+| `grain_ref_white` | SDR reference white in nits for the HDR bridge — match `hdr-reference-white` (and CelFlare's `cf_ref_white`). |
+
+```ini
+# mpv.conf
+glsl-shaders-append=~~/shaders/filmgrain-smooth.glsl
+glsl-shader-opts=grain_preset=2          # medium; or grain_preset=0 to use the custom knobs
+```
+
+#### Fixed-file variants
+
+The same six looks are also shipped as individual fixed shaders — no parameters, just append one.
+
+**SDR** — for standard dynamic range content. Hooks at `OUTPUT` stage to always present the grain at native resolution.
 
 | Variant | Intensity | Character |
 |---------|-----------|-----------|
@@ -138,9 +166,7 @@ For standard dynamic range content. Hooks at `OUTPUT` stage to always present th
 | **SDR Medium** | 0.12 | Noticeable film-like grain. Made to match grainy footage. |
 | **SDR Heavy** | 0.20 | Strong, visible grain. Emulates high-ISO film stock. |
 
-#### HDR Variants
-
-For HDR content or use after SDR-to-HDR expansion. Include a soft-toe black level protection that keeps pure blacks grain-free, and steep Gaussian falloff that keeps highlights crystal clear. Grain is concentrated in the midtones (peak at ~22% luminance).
+**HDR** — for HDR content or use after SDR-to-HDR expansion. Include a soft-toe black level protection that keeps pure blacks grain-free, and steep Gaussian falloff that keeps highlights crystal clear. Grain is concentrated in the midtones (peak at ~22% luminance).
 
 | Variant | Intensity | Character |
 |---------|-----------|-----------|
@@ -219,6 +245,42 @@ Use it *instead of* a fixed Film Grain tier (above), not on top of one.
 
 ---
 
+### NitMeter
+
+**HDR peak-nit analysis overlay** — a measurement/tuning companion for CelFlare (and native HDR content), not an image effect. Decodes the PQ frame and reports absolute-nit statistics as an on-screen panel, with an optional full-frame false-color heatmap.
+
+Per-pixel light level is computed as pixel CLL — `PQ-EOTF(max(R,G,B)) × 10000` — the same convention as MaxCLL/MaxFALL in HDR10 metadata. The panel shows:
+
+| Row | Meaning |
+|-----|---------|
+| **P** | Frame peak CLL (strict max pixel). On web re-encodes this is often codec ringing rather than content. |
+| **9** | 99.99th-percentile CLL — the practical content peak, immune to lone spike pixels. `P` ≫ `9` means the "peak" is encode noise. |
+| **H** | Hold of the `9` row: latches its recent high, then decays — a spike-free recent content peak. |
+| **A** | FALL — frame-average CLL (same averaging as MaxFALL). |
+| **C** | Session MaxCLL — running max frame peak since toggle-on. |
+| **F** | Session MaxFALL — running max FALL since toggle-on. |
+
+A log2 histogram (1 → 10000 nits, ticks at 100/203/1000/4000) shows the screen-area CLL distribution, and a small indicator on the `P` row goes green → yellow → red as the content peak approaches and exceeds `nitmeter_target` (your display ceiling).
+
+Runtime controls (live via `glsl-shader-opts`):
+
+| Param | Effect |
+|-------|--------|
+| `nitmeter_mode` | `1` = panel only, `2` = false-color heatmap + panel, `3` = heatmap encoded as gamma-2.2 SDR for screenshots. (Recompiles.) |
+| `nitmeter_target` | Display peak in nits for the `P`-row ceiling indicator — match your `target-peak`. Live, no recompile. |
+
+**Requirements / order:** mpv with `vo=gpu-next`. The frame at `MAIN` must already be **PQ-encoded**, so load NitMeter **after CelFlare** (which emits PQ in-shader), or on native PQ HDR content (HDR10/HDR10+/DV) without it. HLG is not supported, and on plain SDR content the numbers are meaningless — a built-in guard blanks the panel when it detects SDR input.
+
+```ini
+# mpv.conf — append after CelFlare, or on native PQ HDR
+glsl-shaders-append=~~/shaders/NitMeter.glsl
+glsl-shader-opts=nitmeter_mode=2,nitmeter_target=1000
+```
+
+Most convenient driven from a small Lua script that cycles panel → heatmap → off on one key (appending/unloading the shader and setting `nitmeter_mode`).
+
+---
+
 ## Installation
 
 ### mpv
@@ -243,7 +305,7 @@ glsl-shaders-append=~~/shaders/CelFlare.glsl
 glsl-shaders-append=~~/shaders/filmgrain-smooth-HDR-light.glsl
 ```
 
-TextureClarity runs on LUMA before expansion. CelFlare hooks at MAIN (multi-pass: blur → stats → expand). Film grain hooks at OUTPUT (final stage).
+TextureClarity runs on LUMA before expansion. CelFlare hooks at MAIN (multi-pass: blur → stats → expand). Film grain hooks at OUTPUT (final stage). If you use NitMeter, append it after CelFlare so it reads the PQ frame.
 
 ## License
 

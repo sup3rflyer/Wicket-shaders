@@ -27,6 +27,8 @@
 // texture is what locks the grain cadence to the source, not the display.
 
 //@shampv toggle grain_hdr
+//@shampv choice grain_preset custom light medium heavy
+//@shampv active-if grain_preset 0 grain_intensity grain_saturation grain_mid grain_steepness
 
 //!PARAM grain_preset
 //!DESC Baked look: 0 = custom (use the grain_* knobs below), 1 = light, 2 = medium, 3 = heavy. A preset (>0) drives intensity, saturation, mid, steepness and the per-channel chroma balance, so those knobs are ignored while it is active; grain_size, grain_rate, grain_hdr and grain_ref_white stay independent.

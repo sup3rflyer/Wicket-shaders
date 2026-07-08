@@ -1,4 +1,4 @@
-// CelFlare v5.12 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.13 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Design goal: emulate a professional HDR grade of the source — midtones hold
@@ -723,7 +723,7 @@ vec4 hook() {
 // stays under the onset.
 // PUMP_ALPHA_FAST is the primary flash-vs-sustained dial: LOWER = more flash
 // rejection but slower response to genuine attacks.
-#define PUMP_ALPHA_FAST     0.12   // fast lane (~8 frame time constant). Sets ATTACK speed — lower = gentler ramp
+#define PUMP_ALPHA_FAST     0.18   // fast lane (~5 frame time constant). Sets ATTACK speed — lower = gentler ramp. Tuned 0.12→0.18 2026-07 (onset knee; lands the pump ~4fr earlier, amplitude-neutral; validated day/night/laser/fire)
 #define PUMP_ALPHA_SLOW     0.04   // slow baseline lane (~25 frame time constant)
 #define PUMP_DRIVE_LOW      0.03   // band-pass onset — below this, no pump
 #define PUMP_DRIVE_HIGH     0.20   // band-pass saturation — full pump needs a steep rise (reserves full for violent events)

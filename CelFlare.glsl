@@ -70,7 +70,7 @@
 1.0
 
 //!PARAM cf_shoulder
-//!DESC Highlight shoulder — softens how hard expansion arrives at the brightest pixels. 0 = shipped look (steepest near-clip differentiation); 1 = expansion reaches its peak with no extra steepening. Raise it for sources whose highlights are already harsh or clipped hard.
+//!DESC Highlight shoulder — softens how hard expansion arrives at the brightest pixels. 0 = steepest near-clip differentiation; 1 = expansion reaches its peak with no extra steepening. Default 0.4. Raise it for sources whose highlights are already harsh or clipped hard.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
@@ -1915,7 +1915,7 @@ void hook() {
 // EXAGGERATED defaults for first validation — the gain ceil dominates so the
 // effect is unmissable. Drop PUMP_STRENGTH to ~0.3-0.6 for the subtle target.
 #define ENABLE_LIGHT_PUMP   cf_light_pump   // top-of-file toggle
-#define PUMP_STRENGTH       0.5      // gain per unit pump_env at full pixel weight. At = CEIL the response is
+#define PUMP_STRENGTH       0.6      // gain per unit pump_env at full pixel weight. At = CEIL the response is
                                    // PROPORTIONAL (peak reserved for full-detection events, not roof-pinned);
                                    // > CEIL slams moderate events to the roof (aggressive); subtle ≈ 0.4
 #define PUMP_Y_LOW          0.35   // per-pixel weight onset — low/broad so the whole bright region lifts (not a pinpoint)

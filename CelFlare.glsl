@@ -1,4 +1,4 @@
-// CelFlare v5.13 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.15 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Design goal: emulate a professional HDR grade of the source — midtones hold
@@ -70,18 +70,18 @@
 1.0
 
 //!PARAM cf_shoulder
-//!DESC Highlight shoulder — softens how hard expansion arrives at the brightest pixels. 0 = steepest near-clip differentiation; 1 = expansion reaches its peak with no extra steepening. Default 0.4. Raise it for sources whose highlights are already harsh or clipped hard.
+//!DESC Highlight shoulder — softens how hard expansion arrives at the brightest pixels. 0 = steepest near-clip differentiation; 1 = expansion reaches its peak with no extra steepening. Default 0.7 — smooths high-APL sources without visibly darkening anything (validated on high-key anime); drop toward 0.4 for maximum near-clip differentiation.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
-0.4
+0.7
 
 //!PARAM cf_spec
-//!DESC Specular pop — extra punch on glints, light sources, and clipped highlights. 1 = shipped tune, 0 = off.
+//!DESC Specular pop — extra punch on glints, light sources, and clipped highlights. Default 0.6 = the shipped tune (scales the internal spec peaks), 0 = off.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
-0.5
+0.6
 
 //!PARAM cf_pump
 //!DESC Light pump — a temporary surge on sudden sustained brightening (explosions, tunnel exits, spells). 1 = shipped tune, 0 = off.
@@ -640,9 +640,15 @@ vec4 hook() {
 // shirts/walls at Y=1.0, snow vistas — bs_frac ≥ ~0.20). The earlier wide
 // window (0.50–0.85) treated cel-art whites as legitimate specular bodies
 // and lifted them ~20–40 nits via SPEC_PEAK_BRIGHT, which read as "too hot"
-// on anime even though the spatial curve alone was on target.
-#define BRIGHT_SPEC_FRAC_MAX  0.15  // Recovery starts fading at 15% of cells > 0.97
-#define BRIGHT_SPEC_FRAC_CEIL 0.40  // Recovery fully off at 40% of cells > 0.97
+// on anime even though the spatial curve alone was on target. Tightened
+// again in v5.15 (0.15/0.40 → 0.10/0.28) for the same class one notch
+// further out: sun-facing shots (sun disc + halo + glare on water/faces,
+// bs_frac ~0.12-0.30) kept a broad recovery lift that flattened their
+// remaining depth. Sparse glints (bs_frac ≤ ~0.08) are unaffected and get
+// the v5.15 cf_spec 0.5→0.6 strength raise instead — fewer pixels qualify,
+// the ones that do pop slightly more.
+#define BRIGHT_SPEC_FRAC_MAX  0.10  // Recovery starts fading at 10% of cells > 0.97
+#define BRIGHT_SPEC_FRAC_CEIL 0.28  // Recovery fully off at 28% of cells > 0.97
 // Recovery counts NEAR-WHITE cells only. Every case in the recovery's spec
 // (chrome, sun glints, headlights) is near-neutral by nature. With
 // ENABLE_SATURATED_SPEC the counters run on V = max(R,G,B), so without a

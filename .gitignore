@@ -19,10 +19,11 @@ __pycache__/
 .DS_Store
 **/.DS_Store
 
-# Dev docs — local to this working copy, NEVER published (see CLAUDE.md §policy).
-# CHANGELOG has internal audit/tuning notes; publish a cleaned version deliberately
-# if ever wanted — don't let it leak here by default.
+# Dev docs / agent instructions — local to this working copy, NEVER published
+# (see CLAUDE.md §policy). CHANGELOG has internal audit/tuning notes; publish a
+# cleaned version deliberately if ever wanted — don't let it leak here by default.
 CLAUDE.md
+AGENTS.md
 HANDOFF.md
 CHANGELOG.md
 SPATIAL-PUMP-JOURNEY.md

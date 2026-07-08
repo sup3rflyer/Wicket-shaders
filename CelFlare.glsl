@@ -1194,9 +1194,21 @@ void hook() {
         // avg_illum/contrast, which growth-mode and APL still consume on the
         // luma axis.
         float pnorm_illum_v = pow(illum_v_psum / N_SAMPLES, 1.0 / PUMP_DRIVE_P);
-        float contrast_v    = (illum_v_min > 0.001)
-            ? log2(illum_v_max / illum_v_min)
-            : 0.0;
+        // Cover-gate contrast, low-tail anchored (min). The old `illum_v_min > 0.001
+        // ? log2(max/min) : 0.0` was wrong-signed: one near-black cell forced the
+        // ratio to 0.0, muting the pump on every localized bright event that sits on
+        // a darker surround — an explosion in a lit scene, a spell on a night sky —
+        // AND every ordinary shadowed shot. Floor the denominator instead of dropping
+        // to 0, keeping the min's sensitivity to a hot region against ANY darker
+        // surround (this is what pumps a real fire-in-a-scene, which a mean anchor
+        // muted because the fire's area + scene mid-tones lift the mean above the
+        // gate). Numerator floored too (log2(0) is UB; pump_cover_gate is persistent
+        // SSBO state — a stray NaN would smear across frames). TRADE (accepted): a
+        // structured fade-to-white with a persistent dark region also opens cover
+        // here — a mild, multiplicative fade pump. The clean fade/event separator is
+        // TEMPORAL (is the dark anchor RISING = fade, or STABLE = event), not spatial;
+        // this gate leans on the drive band-pass as the first line of defense.
+        float contrast_v    = max(0.0, log2(max(illum_v_max, 1e-6) / max(illum_v_min, 0.001)));
 
         // Log-average: perceptual brightness key from source pixels
         float log_avg = (valid_luma > 4u)

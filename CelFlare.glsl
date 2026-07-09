@@ -1,4 +1,4 @@
-// CelFlare v5.15 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.16 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Design goal: emulate a professional HDR grade of the source — midtones hold
@@ -147,6 +147,7 @@
 //!VAR float smoothed_growth_mode
 //!VAR float scene_cut_lockout
 //!VAR float smoothed_spec_natural
+//!VAR float smoothed_top_frac
 //!VAR float pump_fast
 //!VAR float pump_slow
 //!VAR float pump_env
@@ -600,6 +601,17 @@ vec4 hook() {
 // Specular detection (source brightness tiers, no illum field)
 #define HIGHLIGHT_THRESH    0.75    // Source highlight tier
 #define SPECULAR_THRESH     0.92    // Source specular tier
+// Top-band tier for the shaped-not-dampened reshape (PASS 6). The reshape's
+// analytic payoff zone starts at the body/top crossover Y~0.82: a bright-key
+// scene whose content tops out BELOW that (golden-hour faces at Y~0.75-0.8)
+// would pay the body-hold with zero separation payoff. This tier measures
+// top-band PRESENCE — deliberately between HIGHLIGHT (0.75, fires on the
+// no-payoff class itself) and SPECULAR (0.92, misses soft near-clip skies) —
+// so the reshape can key on "does this frame actually have a top band"
+// rather than scene mean. Raw fraction, NO shutoff/tier gating on purpose:
+// unlike the spec-bonus signals, broad near-white fields are exactly where
+// the reshape should stay OPEN (that is the flat-bright-anime target class).
+#define TOP_BAND_THRESH     0.85
 // SOFT tier membership (v5.6 hardening). The tier counters rest on 144
 // SINGLE-TEXEL samples; with hard compares a pan/tilt over textured content
 // (sparkle clusters, glinting water) slides samples across the thresholds and
@@ -1089,6 +1101,7 @@ void hook() {
         float high_sum          = 0.0;
         uint  change_count      = 0u;
         float bright_spec_sum   = 0.0;
+        float top_sum           = 0.0;
         float illum_min         = 1.0;
         float illum_max         = 0.0;
         float illum_v_psum      = 0.0;
@@ -1174,6 +1187,8 @@ void hook() {
                                  ? smoothstep(BRIGHT_SPEC_THRESH - TIER_SOFT_HALFBAND,
                                               BRIGHT_SPEC_THRESH + TIER_SOFT_HALFBAND, ii)
                                  : 0.0;
+            top_sum           += smoothstep(TOP_BAND_THRESH - TIER_SOFT_HALFBAND,
+                                            TOP_BAND_THRESH + TIER_SOFT_HALFBAND, ii);
         }
 
         const float N_SAMPLES = 144.0;
@@ -1184,6 +1199,7 @@ void hook() {
         float n_eff       = N_SAMPLES - float(n_bar);
         float avg_illum   = illum_sum / N_SAMPLES;
         float bright_frac = bright_sum / n_eff;
+        float top_frac    = top_sum / n_eff;
 
         // Contrast: dynamic range from illumination field (stable, noise-free).
         // max/min >= 1 by construction: both are running extrema of one sample set.
@@ -1733,6 +1749,7 @@ void hook() {
             smoothed_bright_frac  = 0.0;
             smoothed_spec_signal  = 0.0;
             smoothed_spec_natural = 0.0;
+            smoothed_top_frac     = 0.0;
             smoothed_contrast     = contrast;
             smoothed_log_avg      = log_avg;
             scene_cut_lockout     = 0.0;
@@ -1752,6 +1769,7 @@ void hook() {
             // mix(TEMPORAL_ALPHA_SLOW, base_alpha, smoothed_growth_mode).
             float alpha_spec = (scene_cut_lockout > 0.0) ? alpha : TEMPORAL_ALPHA_SLOW;
             smoothed_bright_frac  = mix(smoothed_bright_frac, bright_frac, alpha);
+            smoothed_top_frac     = mix(smoothed_top_frac, top_frac, alpha);
             smoothed_spec_signal  = mix(smoothed_spec_signal, spec_raw, alpha_spec);
             smoothed_spec_natural = mix(smoothed_spec_natural, spec_raw_natural, alpha);
             smoothed_contrast     = mix(smoothed_contrast, contrast, alpha);
@@ -1823,6 +1841,49 @@ void hook() {
 #define PEAK_DARK       2.7     // Expansion peak for dark regions (~313 nits pre-APL)
 #define GAMMA_BRIGHT    2.1     // Gentler ramp through 0.85–0.95 — peak preserved at Y=1.0
 #define GAMMA_DARK      2.3     // Matching gradualness in dark scenes
+// Bright-scene SHAPE control ("bright where it matters", author 2026-07-09):
+// bright anime under the amplitude-dampened curve still ran the whole scene
+// body 30-50% over SDR — sustained high APL that tires the eyes shot after
+// shot. HDR is not about being bright; it is about being bright where it
+// matters. Three pieces, all riding the illum-weighted cool_w (see
+// COOL_ILLUM_LO/HI — bright FIELDS cool, faces/warm objects at mid illum
+// keep the ship curve; dark and mid-key scenes at apl_t <= 0.5 are
+// bit-identical to ship):
+//  - SHAPE COOLING (this define): steepen the ramp gamma — the field's
+//    body pulls back toward the SDR grade (expansion >= 1 always, so
+//    "cooled" means closer to SDR, never below).
+//  - FIELD LEVEL (APL_BRIGHT_COOL, STEP 4): amplitude pulldown so broad
+//    near-white fields settle at ~170-185 nits — the calm level the
+//    speculars and the light pump read against.
+//  - TOP-BAND SPEND (APL_BRIGHT_RELAX, STEP 4, default 0): optional
+//    amplitude return gated on top-band presence (relax_w = cool_w x the
+//    smoothed_top_frac gate below). With the field pulled down, separation
+//    comes from the sunken field against the held top — contrast, not
+//    more light.
+#define GAMMA_APL_BOOST 1.8     // local_gamma multiplier at cool_w=1
+// Top-band presence gate for the RELAX only. The analytic body/top crossover
+// sits at Y~0.82: HIGHLIGHT_THRESH 0.75 fires on golden-hour faces (the
+// class that should stay cooled), SPECULAR 0.92 misses soft near-clip skies,
+// so PASS 5 counts a dedicated tier at 0.85 (smoothed_top_frac). LO..HI in
+// 16x9-cell picture fraction: ~3 cells opens, ~11 cells (8%) fully open.
+#define TOP_FRAC_LO     0.02
+#define TOP_FRAC_HI     0.08
+// Illumination-field weight on the cooling: cool the FIELDS, not the faces.
+// The scene-key cooling alone manufactures a lightness-ratio percept on
+// mid-luminance warm content — shaded skin's own level drops while its
+// surround gains, and orange at lowered relative luminance reads BROWN
+// (Bezold-Brucke and simultaneous-contrast territory; the expansion itself
+// is chromaticity-preserving, so this is purely a luminance-relationship
+// effect and only the curve can own it). The APL fatigue the cooling
+// targets lives in broad bright fields (sky, sea glare, white walls) —
+// high Y_illum; the psychovisual victims (faces, warm objects) sit at mid
+// Y_illum. Weighting the WHOLE reshape pair by the sigma-80 field keeps
+// mid-luminance regions on the exact ship curve (their SDR-grade
+// impression anchored) while the fields still cool and separate. Same
+// spatial-modulation channel the curve already uses: smooth field, both
+// endpoint curves monotone, so the per-pixel mix stays contour-free.
+#define COOL_ILLUM_LO   0.55    // Y_illum below: reshape fully off (ship curve)
+#define COOL_ILLUM_HI   0.80    // Y_illum above: full cooling + top spend
 
 // Saturated-brightness credit on the base ramp. BT.709 luma under-credits
 // the brightness of saturated R/B-dominant colors (G carries 0.7152 of the
@@ -1881,6 +1942,26 @@ void hook() {
 #define APL_KEY_BRIGHT      0.30    // Above this: bright scene multiplier
 #define APL_BOOST_DARK      1.25    // Neutral for dark scenes (gamma_dark suppresses midtones)
 #define APL_DAMPEN_BRIGHT   0.65    // Bright-scene reduction — full white ≈ 206 nits at REFERENCE_WHITE=116 (Y_illum≈0.7, bf=1)
+// Bright-field level ("150-180 nits is fine for bright scenes", author
+// 2026-07-09): on top of the GAMMA_APL_BOOST shape cooling, bright FIELDS
+// get an amplitude pull on the illum-weighted cool_w so broad near-white
+// areas settle at ~170-185 nits instead of ship's ~200+ — the calm level
+// the speculars (cf_spec, unchanged) and the light pump read AGAINST.
+// Effective bright-field endpoint 0.65 - 0.20 = 0.45. Rides cool_w — NOT a
+// raw APL_DAMPEN_BRIGHT retune, which would leak ~-10% into mid-key scenes
+// through the linear apl_t mix (measured, round one of this design) — and
+// cool_w carries the Y_illum weight, so faces/warm objects at mid illum
+// keep ship amplitude (the brown-skin guard applies to this pulldown too).
+#define APL_BRIGHT_COOL     0.20    // apl_factor pulldown at cool_w=1
+// Top-band spend: optional amplitude RETURN on relax_w (cooling weight x
+// top-band presence gate) for bright scenes with a real top band. Default 0
+// under the 150-180 field target: separation comes from the sunken field
+// against the held top — contrast, not more light — and sparse speculars
+// ride above via the spec path. Raise (e.g. 0.05-0.10) to let top-banded
+// bright scenes carry a slightly hotter field than topless ones. At 0.20
+// it fully cancels APL_BRIGHT_COOL where the gate opens (measured +2.4%
+// FALL over ship on blazing-beach content — the fatigue goal inverted).
+#define APL_BRIGHT_RELAX    0.0     // apl_factor addback at relax_w=1
 // Mid-scene notch: parabolic dampener peaking at apl_t=0.5 (smoothed_log_avg
 // ≈ 0.16 — normally-lit interiors, mid-key cinematic). Prevents pale skin /
 // fabric / hair from looking "illuminated" in those scenes by trimming a few
@@ -2595,12 +2676,45 @@ vec4 hook() {
     float peak_atten_eff = PEAK_ATTEN;
     #endif
     local_peak *= (1.0 - peak_atten_eff * bf);  // scene-level dampening on top
+    // Scene APL axis (0 = dark key, 1 = bright key) — hoisted above the curve
+    // (was declared at STEP 4) so the shape can read it: shared by the gamma
+    // boost here, the APL modulation at STEP 4, and the specular-bonus params.
+    // ONE axis BY DESIGN (merged 2026-07-02, see STEP 4). bright_w is the
+    // shaped-not-dampened weight: OFF through mid-key, phasing in only for
+    // genuinely bright scene keys (both smoothsteps of the temporally
+    // smoothed log_avg, so shape transitions inherit the EMA's smoothness).
+    float apl_t = smoothstep(APL_KEY_DARK, APL_KEY_BRIGHT, smoothed_log_avg);
+    // cool_w — bright-key scenes cool toward the SDR grade, weighted by the
+    // illumination field so the cooling lands on broad bright FIELDS while
+    // mid-luminance regions (faces, warm objects) keep the ship curve — see
+    // COOL_ILLUM_LO/HI for the psychovisual rationale. relax_w — amplitude
+    // returns only where a top band exists to spend it on. relax_w derives
+    // from the weighted cool_w ON PURPOSE: the pair must move as a unit
+    // per-pixel (relax without the gamma boost is a bare +31% amplitude
+    // lift — exactly the uniform-lift class the design audit rejected).
+    float cool_w  = smoothstep(0.5, 1.0, apl_t)
+                  * smoothstep(COOL_ILLUM_LO, COOL_ILLUM_HI, Y_illum);
+    float relax_w = cool_w * smoothstep(TOP_FRAC_LO, TOP_FRAC_HI, smoothed_top_frac);
+    // Growth-mode bypass on the SHAPE, mirroring the amplitude bypass at
+    // STEP 4: an expanding bright event should restore the full pre-reshape
+    // curve (bloom through the midtones), not just its amplitude — without
+    // this the steepened gamma would keep holding the event's mid-rim down
+    // at full growth_mode (audit-caught half-bypass).
+    #if ENABLE_GROWTH_BYPASS
+    float bw_gamma = cool_w * (1.0 - GROWTH_APL_BYPASS * smoothed_growth_mode);
+    #else
+    float bw_gamma = cool_w;
+    #endif
     // cf_curve (top-of-file knob) scales the exponent: <1 broadens the ramp
     // (gentle lift deeper into the highlights), >1 concentrates it against
     // Y=1 (harsher pop). Peak is invariant (t=1 → pow=1 for any gamma). The
     // max(1.0) floor preserves the monotonically-increasing-derivative
     // invariant the curve comment above relies on — never let gamma < 1.
-    float local_gamma = max(1.0, mix(GAMMA_DARK, GAMMA_BRIGHT, spatial_t) * cf_curve);
+    // GAMMA_APL_BOOST steepens the exponent in bright scenes (shaped-not-
+    // dampened, see the define block): multiplicative on the same exponent,
+    // so the >= 1 floor and the monotone-derivative proof carry over.
+    float local_gamma = max(1.0, mix(GAMMA_DARK, GAMMA_BRIGHT, spatial_t) * cf_curve
+                                 * mix(1.0, GAMMA_APL_BOOST, bw_gamma));
 
     // Per-pixel expansion curve: linear ramp from KNEE, shaped by pow(gamma).
     // Ramp input = stabilized luma, plus the bounded saturated-brightness
@@ -2660,11 +2774,10 @@ vec4 hook() {
     // STEP 4: APL MODULATION (brightness-driven scaling)
     // -------------------------------------------------------------------------
     // Dark scenes get more headroom, bright scenes get dampened.
-    // Scene APL axis (0 = dark key, 1 = bright key) — shared by the APL
-    // modulation below AND the specular-bonus params. ONE axis BY DESIGN
+    // apl_t (the shared scene APL axis) is declared above STEP 2 — the
+    // shaped-not-dampened gamma boost reads it first. ONE axis BY DESIGN
     // (merged 2026-07-02): the former SPEC_APL_LOW/HIGH knob pair was
     // numerically identical to APL_KEY_DARK/BRIGHT and never diverged.
-    float apl_t = smoothstep(APL_KEY_DARK, APL_KEY_BRIGHT, smoothed_log_avg);
     #if ENABLE_APL_MOD
     {
         float apl_factor = mix(APL_BOOST_DARK, APL_DAMPEN_BRIGHT, apl_t);
@@ -2674,6 +2787,17 @@ vec4 hook() {
         // in a mid-key scene can still drive apl_factor back to 1.0.
         float mid_notch = MID_APL_DAMPEN * apl_t * (1.0 - apl_t) * 4.0;
         apl_factor *= 1.0 - mid_notch;
+        // Bright-field pulldown + optional top-band return (see the
+        // APL_BRIGHT_COOL / APL_BRIGHT_RELAX block): the pulldown rides the
+        // illum-weighted cool_w (bright FIELDS settle at ~170-185 nits;
+        // faces at mid illum keep ship amplitude), the relax rides relax_w
+        // (top-banded scenes may carry a hotter field, default off). Both
+        // are post-notch ADDs — notch, pulldown and relax are independent
+        // terms, order-correct for any notch value in the transition band.
+        // Placed before the growth bypass: the mix toward 1.0 overrides
+        // both during an event (no stacking), matching the shape-side
+        // bw_gamma bypass.
+        apl_factor += APL_BRIGHT_RELAX * relax_w - APL_BRIGHT_COOL * cool_w;
         // Growth-mode bypass: pull apl_factor back toward 1.0 (no APL
         // adjustment) during an expanding-object event. The bypass is
         // symmetric across DARK/BRIGHT — in dark scenes APL_BOOST=1.25

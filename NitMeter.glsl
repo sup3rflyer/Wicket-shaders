@@ -1,4 +1,4 @@
-// NitMeter v1.5 — HDR peak-nit analysis overlay for mpv (gpu-next)
+// NitMeter v1.6 — HDR peak-nit analysis overlay for mpv (gpu-next)
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Companion dev tool for CelFlare: decodes the PQ frame and displays
@@ -26,13 +26,25 @@
 //     C (orange) — session MaxCLL: running max frame peak since toggle-on
 //     F (green)  — session MaxFALL: running max FALL since toggle-on
 //   Values under 100 nits gain a tenths digit (e.g. 94.3). The small square
-//   on the P row is the display-ceiling indicator vs nitmeter_target:
-//   green < 95% of target, yellow approaching, red = content peak exceeds
-//   the display (mpv/display will compress or clip).
-//   Histogram — screen-area distribution of 16x16-block mean CLL on a
-//   log2 axis from 1 to 10000 nits. Grey ticks at 100 / 203 / 1000 / 4000
-//   nits; bright line = current frame peak. Bars take the heatmap ramp hue
-//   of their bin (grey below 100).
+//   on the P row is the display-ceiling indicator vs nitmeter_target,
+//   driven by the 9 row (CONTENT peak — a strict-max driver went red on
+//   lone encode-ringing spikes no display visibly clips): green < 95% of
+//   target, yellow approaching, red = content exceeds the display
+//   (mpv/display will compress or clip). Strict-max-only exceedance shows
+//   in the P digits / P-9 gap / dim histogram tick, not in the square.
+//   Histogram — screen-area distribution of per-pixel CLL on a log2 axis
+//   from 1 to 10000 nits, rebinned from the same 256-bin pixel histogram
+//   that feeds the 9 row (until v1.5 the bars were 16x16-block MEANS,
+//   which diluted small speculars into mid bins — the tail is the point).
+//   Grey ticks at 100 / 203 / 1000 / 4000 nits; bright line = current
+//   frame 9 (content peak), thin dim line = strict-max P. Bars take the
+//   heatmap ramp hue of their bin (grey below 100).
+//   nitmeter_graph=1 appends a time-series strip under the histogram:
+//   the last 120 rendered frames (~5 s @24p) of P (white) / 9 (grey) /
+//   A (cyan) on the same log2 axis, newest at the right, dim line at
+//   nitmeter_target — a live scope for CelFlare's light-pump envelope
+//   (onset / hold / release). 0-samples draw as gaps: tripped frames by
+//   design, true-black frames incidentally.
 //
 // REQUIREMENTS / USAGE
 //   The frame at MAIN must already be PQ-encoded when this shader runs:
@@ -40,7 +52,7 @@
 //   content without CelFlare (HDR10/HDR10+/DV — DV is reshaped to plain PQ
 //   before MAIN). HLG is NOT supported (deliberately — PQ only). On plain
 //   SDR content the numbers are meaningless (gamma decoded as PQ); the
-//   NITMETER_SDR_GUARD tripwire below blanks the panel when it detects that.
+//   nitmeter_sdr_guard tripwire below blanks the panel when it detects that.
 //
 //   Convenient driving is a small lua script cycling panel -> heatmap ->
 //   off on one key: it appends this file to glsl-shaders and sets the
@@ -63,17 +75,31 @@
 //       screenshots/encodes to share on SDR screens. Looks dim on the live
 //       PQ-passthrough display — capture mode, not viewing mode.
 //     "Off" is not a mode: unload the shader (the script does this).
-//   nitmeter_target (float, default 1000) — display peak in nits for the
-//     P-row ceiling indicator; match your target-peak. Live uniform, no
-//     recompile: change-list glsl-shader-opts append nitmeter_target=800
-//
-// KNOBS (PASS 3, "MAIN TUNING")
-//   NITMETER_SDR_GUARD (default 1) — SDR-input tripwire. A user shader
-//     cannot query the frame's tagged transfer, so detection is heuristic,
-//     on two OR'd signals (PASS 2): (a) smoothed max 16x16-block-average
+//   nitmeter_target (DYNAMIC float, default 1000) — display peak in nits
+//     for the P-row ceiling indicator and the graph target line; match
+//     your target-peak. True live uniform (v1.6; the plain-float PARAM it
+//     replaced took the constant/rebuild path).
+//   nitmeter_corner (1) — 0 TL / 1 TR / 2 BL / 3 BR
+//   nitmeter_scale (DYNAMIC, 1.0) — panel size multiplier (1.0 = ~136 px
+//     wide at 1080p)
+//   nitmeter_graph (0) — 1 appends the P/9/A time-series strip
+//   nitmeter_heat_nits (DYNAMIC, 180) — display brightness of the heatmap
+//     bands and histogram bars (PQ mode)
+//   nitmeter_pct (DYNAMIC, 0.0001) — fraction of frame pixels allowed
+//     ABOVE the 9-row readout (0.0001 = 99.99th percentile)
+//   nitmeter_reset (DYNAMIC, 0) — session reset edge: whenever the value
+//     CHANGES, session state (C / F / H / graph ring) zeroes. Needed
+//     because the STORAGE buffer survives the cycle script's
+//     remove+re-append (field-observed: C/F persist across N-key cycles),
+//     so "resets on shader reload" was never true. The cycle script bumps
+//     this on every toggle-on; manual:
+//       change-list glsl-shader-opts append nitmeter_reset=7
+//   nitmeter_sdr_guard (1) — SDR-input tripwire. A user shader cannot
+//     query the frame's tagged transfer, so detection is heuristic, on
+//     two OR'd signals (PASS 2): (a) smoothed max 16x16-block-average
 //     above NM_SDR_SUSPECT_NITS (8000) — a solid clipped-white AREA; (b)
 //     fraction of frame pixels at the signal ceiling (code >= 0.9995,
-//     ~9990 nits) above NM_SDR_CEIL_FRAC (0.05% ~ one small line of white
+//     ~9950 nits) above NM_SDR_CEIL_FRAC (0.05% ~ one small line of white
 //     text). Clipped SDR whites decode to exactly 10000 in droves, while
 //     graded HDR essentially never reaches ceiling codes (masters cap
 //     ~1000-4000 nits, code <= ~0.92, and YUV-overshoot ringing from there
@@ -83,12 +109,10 @@
 //     panel. While tripped: readouts blank to "---", red border, and ALL
 //     temporal state is quarantined. Limitation: SDR frames with no
 //     clipped whites at all (dark scenes) are undetectable — numbers
-//     return until the next white. Disable if you ever feed legit
-//     8000+ nit material.
-//   NITMETER_CORNER — 0 TL / 1 TR (default) / 2 BL / 3 BR
-//   NITMETER_SCALE  — panel size multiplier (1.0 = ~136x207 px at 1080p)
-//   NM_PEAK_PCT_FRAC (PASS 2) — fraction of frame pixels allowed ABOVE the
-//     9-row readout (default 0.0001 = 99.99th percentile)
+//     return until the next white. Set 0 if you ever feed legit 8000+ nit
+//     material — that compiles out the PASS 2 state quarantine too, not
+//     just the panel blanking (pre-v1.6 it only disarmed the display and
+//     the quarantine kept zeroing C/F/H).
 //
 // The two measurement passes run BEFORE the overlay draw, so the panel and
 // heatmap never contaminate their own statistics.
@@ -101,11 +125,60 @@
 1
 
 //!PARAM nitmeter_target
-//!DESC display peak nits for the P-row ceiling indicator (match target-peak)
-//!TYPE float
+//!DESC display peak nits for the P-row ceiling indicator + graph target line (match target-peak)
+//!TYPE DYNAMIC float
 //!MINIMUM 100.0
 //!MAXIMUM 10000.0
 1000.0
+
+//!PARAM nitmeter_corner
+//!DESC panel corner: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 3
+1
+
+//!PARAM nitmeter_scale
+//!DESC panel size multiplier (1.0 = ~136 px wide at 1080p)
+//!TYPE DYNAMIC float
+//!MINIMUM 0.5
+//!MAXIMUM 3.0
+1.0
+
+//!PARAM nitmeter_graph
+//!DESC 1 = append the P/9/A time-series strip (last ~5 s, log2 nit axis) under the histogram
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+0
+
+//!PARAM nitmeter_heat_nits
+//!DESC display brightness (nits) of the heatmap bands and histogram bars in PQ mode
+//!TYPE DYNAMIC float
+//!MINIMUM 40.0
+//!MAXIMUM 1000.0
+180.0
+
+//!PARAM nitmeter_pct
+//!DESC 9-row percentile as the frame fraction allowed above it (0.0001 = 99.99th percentile; 0 = strict max)
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 0.01
+0.0001
+
+//!PARAM nitmeter_reset
+//!DESC session reset edge: session maxima + hold + graph ring zero whenever this value CHANGES (cycle script bumps it per toggle-on)
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 16777216.0
+0.0
+
+//!PARAM nitmeter_sdr_guard
+//!DESC SDR-input tripwire: blank the panel + quarantine state when input looks like SDR gamma misread as PQ (0 only if feeding legit 8000+ nit material)
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+1
 
 //!BUFFER NITMETER_STATE
 //!VAR float nm_peak
@@ -122,6 +195,11 @@
 //!VAR float nm_show_ctr
 //!VAR float nm_hist[24]
 //!VAR uint nm_phist[256]
+//!VAR float nm_reset_seen
+//!VAR float nm_ring_idx
+//!VAR float nm_ring_p[120]
+//!VAR float nm_ring_9[120]
+//!VAR float nm_ring_a[120]
 //!STORAGE
 
 //!HOOK MAIN
@@ -162,9 +240,12 @@ float pq_oetf_norm(float L) {   // linear (1.0 = 10000 nits) -> PQ code
 }
 
 // Per-workgroup staging for the frame-global 256-bin pixel-code histogram
-// (percentile peak, PASS 2). Each invocation reduces one 16x16 block, so a
-// workgroup covers 256 blocks; staging in shared memory keeps the SSBO
-// atomic traffic to at most 256 adds per workgroup instead of per pixel.
+// (percentile peak + drawn histogram, PASS 2). Each invocation reduces one
+// 16x16 block, so a workgroup covers 256 blocks; staging in shared memory
+// keeps the SSBO atomic traffic to at most 256 adds per workgroup instead
+// of per pixel. Shared-memory atomicAdd = InterlockedAdd on groupshared
+// via SPIRV-Cross; if a backend ever misbehaves here, fall back to
+// per-lane bins + a thread-0 serial tally like CelFlare PASS 5.
 shared uint s_ph[256];
 
 void hook() {
@@ -224,8 +305,13 @@ float pq_eotf_norm(float e) {   // PQ code -> linear, 1.0 = 10000 nits
     return pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
 }
 
-#define NM_HIST_BINS   24       // MUST match PASS 3 (hist drawing)
-#define NM_HIST_LOG_HI 13.2877  // log2(10000) — MUST match PASS 3
+// hist axis top: log2(10000 nits). Derived (constant-folded), not a magic
+// number — the PASS 3 copy is the identical expression, so the only way to
+// desync is editing the 10000.0 in one pass.
+const float NM_HIST_LOG_HI = log2(10000.0);
+
+#define NM_HIST_BINS   24       // MUST match the nm_hist[24] SSBO array + PASS 3
+#define NM_RING_LEN    120      // MUST match the nm_ring_*[120] SSBO arrays + PASS 3
 #define NM_HOLD_FRAMES 72.0     // ~3 s @24p before the hold starts decaying
 #define NM_HOLD_DECAY  0.985    // per-frame decay once expired (halves in ~1.9 s @24p)
 #define NM_SDR_SUSPECT_NITS 8000.0  // block-mean gate: solid clipped-white AREA
@@ -233,19 +319,15 @@ float pq_eotf_norm(float e) {   // PQ code -> linear, 1.0 = 10000 nits
 #define NM_SDR_ALPHA_UP     0.10    // suspicion attack (~0.3 s @24p)
 #define NM_SDR_ALPHA_DN     0.015   // suspicion release (~2 s @24p)
 #define NM_SHOW_FRAMES      12.0    // ~0.5 s @24p numeric sample-and-hold (readability)
-#define NM_PEAK_PCT_FRAC    0.0001  // 9-row: 99.99th percentile (frame fraction above)
 #define NM_PHIST_BINS       256     // pixel-code histogram bins — MUST match PASS 1 s_ph
 
 shared float s_max[144];
 shared float s_sum[144];
 shared float s_mmean[144];   // max block-MEAN — SDR-tripwire driver (a)
 shared float s_ceil[144];    // ceiling-pixel fraction sum — SDR-tripwire driver (b)
-shared uint  s_hist[NM_HIST_BINS];
 
 void hook() {
     uint lid = gl_LocalInvocationIndex;    // 0..143
-    if (lid < uint(NM_HIST_BINS)) s_hist[lid] = 0u;
-    barrier();
 
     uint W = uint(NITMETER_BLK_size.x);
     uint H = uint(NITMETER_BLK_size.y);
@@ -265,12 +347,6 @@ void hook() {
         lsum += bmean;
         lmm  = max(lmm, bmean);
         lcf  += s.b;
-        // area histogram over block means; everything <= 1 nit lands in bin 0
-        float hx = clamp(log2(max(bmean, 1.0)) / NM_HIST_LOG_HI, 0.0, 0.99999);
-        // shared-atomic histogram (InterlockedAdd on groupshared via
-        // SPIRV-Cross); if a backend ever misbehaves here, fall back to
-        // per-lane bins + a thread-0 serial tally like CelFlare PASS 5
-        atomicAdd(s_hist[uint(hx * float(NM_HIST_BINS))], 1u);
     }
     s_max[lid]   = lmax;
     s_sum[lid]   = lsum;
@@ -292,8 +368,32 @@ void hook() {
         float inv = 1.0 / max(float(total), 1.0);
         nm_peak = pk;
         nm_fall = sm * inv;
+        // explicit session reset (edge on the nitmeter_reset DYNAMIC
+        // param). Reload does NOT reset: the STORAGE buffer survives the
+        // cycle script's remove+re-append (field-observed — C/F persisted
+        // across N-key cycles), so session semantics need a real edge.
+        // Also self-heals first-load garbage if a backend ever hands us a
+        // non-zeroed buffer (reset fires because nm_reset_seen mismatches).
+        if (nitmeter_reset != nm_reset_seen) {
+            nm_reset_seen = nitmeter_reset;
+            nm_maxcll   = 0.0;
+            nm_maxfall  = 0.0;
+            nm_hold     = 0.0;
+            nm_hold_age = 0.0;
+            // expire the P/9/A sample-and-hold too, or the first frames of
+            // a new session keep showing the OLD session's held digits for
+            // up to 12 frames (audit-caught) — this forces the show
+            // snapshot to re-arm with current values further down
+            nm_show_ctr = 0.0;
+            nm_ring_idx = 0.0;
+            for (int i = 0; i < NM_RING_LEN; i++) {
+                nm_ring_p[i] = 0.0;
+                nm_ring_9[i] = 0.0;
+                nm_ring_a[i] = 0.0;
+            }
+        }
         // pixel-level percentile peak from the 256-bin code histogram:
-        // walk from the top bin until NM_PEAK_PCT_FRAC of the frame's
+        // walk from the top bin until nitmeter_pct of the frame's
         // pixels lie above, then interpolate inside the stopping bin
         // (uniform-within-bin). Immune to the lone codec-ringing spike
         // pixels that dominate a strict max on web re-encodes — the same
@@ -307,7 +407,7 @@ void hook() {
             // floor at 1 px so small frames still ignore the single hottest
             // pixel instead of degenerating into a second P row; compare in
             // uint (acc can pass 2^24 at 8K, where float comparisons drift)
-            uint target = max(uint(NM_PEAK_PCT_FRAC * float(tot)), 1u);
+            uint target = max(uint(nitmeter_pct * float(tot)), 1u);
             uint acc = 0u;
             int bi = NM_PHIST_BINS - 1;
             for (; bi >= 0; bi--) {
@@ -323,6 +423,19 @@ void hook() {
             // uniform-frame case (everything in one bin, interpolation lands
             // on the bin's upper edge) back to the exact frame value
             nm_p9999 = min(pq_eotf_norm(code) * 10000.0, pk);
+        }
+        // drawn histogram: PIXEL-level since v1.6 — rebin the 256 PQ-code
+        // bins onto the 24-bin log2-nit axis (bin center through the exact
+        // EOTF). Replaces the 16x16-block-MEAN histogram, which diluted
+        // small speculars into mid bins; the tail is the point of a nit
+        // histogram. Denominator = tot (pixel count), same [0,1]
+        // area-fraction semantics PASS 3 already draws.
+        float hinv = 1.0 / max(float(tot), 1.0);
+        for (int b = 0; b < NM_HIST_BINS; b++) nm_hist[b] = 0.0;
+        for (int b = 0; b < NM_PHIST_BINS; b++) {
+            float cn = pq_eotf_norm((float(b) + 0.5) / float(NM_PHIST_BINS)) * 10000.0;
+            float hx = clamp(log2(max(cn, 1.0)) / NM_HIST_LOG_HI, 0.0, 0.99999);
+            nm_hist[int(hx * float(NM_HIST_BINS))] += float(nm_phist[b]) * hinv;
         }
         // zero the bins for the next frame's PASS 1 accumulation
         for (int b = 0; b < NM_PHIST_BINS; b++) nm_phist[b] = 0u;
@@ -351,10 +464,19 @@ void hook() {
         float cf  = cfs * inv;   // frame fraction of ceiling pixels
         float sus = ((pkm > NM_SDR_SUSPECT_NITS) || (cf > NM_SDR_CEIL_FRAC)) ? 1.0 : 0.0;
         nm_sdr += ((sus > nm_sdr) ? NM_SDR_ALPHA_UP : NM_SDR_ALPHA_DN) * (sus - nm_sdr);
-        // session maxima (MaxCLL/MaxFALL semantics; reset per shader load,
-        // which the cycle script triggers on every toggle step). Reset while
-        // the tripwire is engaged so SDR garbage can't poison them.
-        if (nm_sdr > 0.5) {
+        // With the guard compiled out, the tripwire must be fully inert
+        // here too, not just unblanked in PASS 3 — pre-v1.6 this
+        // quarantine ran unconditionally, so guard=0 still zeroed C/F/H
+        // on legit 8000+ nit material (the documented escape hatch was
+        // broken). The suspicion EMA above stays warm either way (cheap).
+        bool tripped = false;
+#if nitmeter_sdr_guard
+        tripped = nm_sdr > 0.5;
+#endif
+        // session maxima (MaxCLL/MaxFALL semantics; reset on the
+        // nitmeter_reset edge above). Reset while the tripwire is engaged
+        // so SDR garbage can't poison them.
+        if (tripped) {
             nm_maxcll  = 0.0;
             nm_maxfall = 0.0;
             // quarantine ALL temporal readout state while tripped, not just
@@ -378,17 +500,29 @@ void hook() {
         // most when paused-and-seeking, where renders are scarce and the
         // hold used to span several seek points (field-observed). Floors
         // keep near-black scenes from churning the digits every frame.
-        bool jolt = abs(pk - nm_show_peak)      > 0.5 * max(nm_show_peak, 100.0)
-                 || abs(nm_fall - nm_show_fall) > 0.5 * max(nm_show_fall, 20.0);
-        if (nm_show_ctr <= 0.0 || jolt || nm_sdr > 0.5) {
+        // 9 gets its own jolt term: it's the row designed to move
+        // independently of P (spike-immune) and A (percentile, not mean —
+        // and undiluted by letterbox bars), so a cut can shift it hard
+        // while neither of the other two crosses its 50% threshold.
+        bool jolt = abs(pk - nm_show_peak)          > 0.5 * max(nm_show_peak, 100.0)
+                 || abs(nm_p9999 - nm_show_p9999)   > 0.5 * max(nm_show_p9999, 100.0)
+                 || abs(nm_fall - nm_show_fall)     > 0.5 * max(nm_show_fall, 20.0);
+        if (nm_show_ctr <= 0.0 || jolt || tripped) {
             nm_show_peak  = pk;
             nm_show_p9999 = nm_p9999;
             nm_show_fall  = nm_fall;
             nm_show_ctr   = NM_SHOW_FRAMES;
         }
         nm_show_ctr -= 1.0;
-        for (int b = 0; b < NM_HIST_BINS; b++)
-            nm_hist[b] = float(s_hist[b]) * inv;
+        // per-frame P/9/A ring for the time-series strip. Written even with
+        // nitmeter_graph off (3 floats/frame) so toggling it on has history;
+        // tripped frames write 0 = a gap in the traces. Index clamp guards
+        // a garbage first-load value from becoming an OOB SSBO write.
+        int ri = clamp(int(nm_ring_idx), 0, NM_RING_LEN - 1);
+        nm_ring_p[ri] = tripped ? 0.0 : pk;
+        nm_ring_9[ri] = tripped ? 0.0 : nm_p9999;
+        nm_ring_a[ri] = tripped ? 0.0 : nm_fall;
+        nm_ring_idx = float((ri + 1) % NM_RING_LEN);
         imageStore(out_image, ivec2(0), vec4(0.0));
     }
 }
@@ -397,25 +531,28 @@ void hook() {
 //!BIND HOOKED
 //!BIND NITMETER_STATE
 //!BIND NITMETER_STATS
-//!DESC NitMeter v1.5: overlay draw
+//!DESC NitMeter v1.6: overlay draw
 
 // NITMETER_STATS is bound only as the explicit data dependency on PASS 2 —
 // the stats themselves arrive through the NITMETER_STATE SSBO (same pattern
 // as CelFlare PASS 6 / CELFLARE_STATS: don't remove the bind without
 // verifying pass ordering/visibility on every backend).
 
-// panel/heatmap selection is the runtime nitmeter_mode PARAM (file header)
-// ---------------------------- MAIN TUNING ----------------------------
-#define NITMETER_SDR_GUARD   1     // blank the panel when input looks like SDR misread as PQ
-#define NITMETER_CORNER      1     // 0 TL / 1 TR / 2 BL / 3 BR
-#define NITMETER_SCALE       1.0   // panel size multiplier
-#define NM_FC_PAINT_NITS     180.0 // display brightness of heatmap bands (PQ mode)
-// ------------------------------------------------------------------
+// All tuning lives in the top-of-file PARAM block (v1.6; the old MAIN
+// TUNING defines here are gone — corner/scale/guard/paint-nits are
+// runtime params now, single-sourced across passes).
 
-#define NM_HIST_BINS   24          // MUST match PASS 2
-#define NM_HIST_LOG_HI 13.2877     // MUST match PASS 2
+// derived, identical expression in PASS 2 — see the comment there
+const float NM_HIST_LOG_HI = log2(10000.0);
+
+#define NM_HIST_BINS   24       // MUST match the nm_hist[24] SSBO array + PASS 2
+#define NM_RING_LEN    120      // MUST match the nm_ring_*[120] SSBO arrays + PASS 2
 #define NM_PANEL_W     136.0
+#if nitmeter_graph
+#define NM_PANEL_H     255.0   // + time-series strip at y [207,247)
+#else
 #define NM_PANEL_H     207.0
+#endif
 
 // PQ duplicate — keep in sync with the other passes.
 float pq_eotf_norm(float e) {   // PQ code -> linear, 1.0 = 10000 nits
@@ -471,6 +608,10 @@ float glyph_mask(int m, vec2 q) {
 // p = (leftward distance from the field's right edge, downward from row top)
 float number_mask(int v, int mind, vec2 p, float h) {
     if (p.y < 0.0 || p.y >= h || p.x < 0.0) return 0.0;
+    // negative v (only reachable from NaN/garbage SSBO state on a
+    // first load) would index NM_SEG out of bounds via GLSL's
+    // sign-following % — clamp rather than UB
+    v = max(v, 0);
     float slotw = 0.85 * h;
     int nd = (v >= 10000) ? 5 : (v >= 1000) ? 4 : (v >= 100) ? 3 : (v >= 10) ? 2 : 1;
     nd = max(nd, mind);
@@ -536,17 +677,17 @@ vec4 hook() {
         // SDR range reproduces as self-luminous grey; bands paint flat
         col = ceil_flag   ? pq_nits(vec3(400.0, 8.0, 8.0))
             : (n < 100.0) ? pq_nits(vec3(n))
-                          : pq_oetf3(heat_lin(n) * (NM_FC_PAINT_NITS / 10000.0));
+                          : pq_oetf3(heat_lin(n) * (nitmeter_heat_nits / 10000.0));
 #endif
     }
 #endif
 
-    float S = NITMETER_SCALE * HOOKED_size.y / 1080.0;
-#if NITMETER_CORNER == 0
+    float S = nitmeter_scale * HOOKED_size.y / 1080.0;
+#if nitmeter_corner == 0
     vec2 org = vec2(12.0, 12.0);
-#elif NITMETER_CORNER == 1
+#elif nitmeter_corner == 1
     vec2 org = vec2(HOOKED_size.x / S - 12.0 - NM_PANEL_W, 12.0);
-#elif NITMETER_CORNER == 2
+#elif nitmeter_corner == 2
     vec2 org = vec2(12.0, HOOKED_size.y / S - 12.0 - NM_PANEL_H);
 #else
     vec2 org = vec2(HOOKED_size.x / S - 12.0 - NM_PANEL_W,
@@ -566,7 +707,7 @@ vec4 hook() {
         }
 
         bool sdr_suspect = false;
-#if NITMETER_SDR_GUARD
+#if nitmeter_sdr_guard
         sdr_suspect = nm_sdr > 0.5;
 #endif
         if (sdr_suspect) {
@@ -592,22 +733,32 @@ vec4 hook() {
             col = mix(col, pq_nits(NM_ROW_NITS[r]), m);
         }
 
-        // display-ceiling indicator (P row): shown peak vs nitmeter_target
+        // display-ceiling indicator (P row): CONTENT peak (9 row) vs
+        // nitmeter_target — v1.5 repointed H at the percentile for spike
+        // immunity; v1.6 finishes that for the verdict square (strict-max
+        // drive went red on lone ringing spikes no display visibly clips).
+        // Deliberately BLIND to the strict max: a "spike-only" state was
+        // tried and audit-killed (P > target is the COMMON case on ringing
+        // web re-encodes, so it made green/yellow unreachable exactly
+        // there) — the P digits, the P-9 gap, and the dim histogram tick
+        // already carry the spike story.
         vec2 td = abs(lp - vec2(30.0, 18.0)) - vec2(4.0);
         float tm = step(max(td.x, td.y), 0.0);
-        vec3 tc = (nm_show_peak > nitmeter_target)        ? vec3(230.0, 15.0, 15.0)
-                : (nm_show_peak > 0.95 * nitmeter_target) ? vec3(230.0, 200.0, 20.0)
-                                                          : vec3(25.0, 210.0, 25.0);
+        vec3 tc = (nm_show_p9999 > nitmeter_target)        ? vec3(230.0, 15.0, 15.0)
+                : (nm_show_p9999 > 0.95 * nitmeter_target) ? vec3(230.0, 200.0, 20.0)
+                                                           : vec3(25.0, 210.0, 25.0);
         col = mix(col, pq_nits(tc), tm);
 
         // histogram strip: log2 axis, 1 -> 10000 nits
         if (lp.x >= 8.0 && lp.x < 128.0 && lp.y >= 159.0 && lp.y < 199.0) {
             float hx = (lp.x - 8.0) / 120.0;
-            // reference ticks at 100 / 203 / 1000 / 4000 nits
-            float tick = step(abs(hx - 0.5000), 0.004);
-            tick = max(tick, step(abs(hx - 0.5768), 0.004));
-            tick = max(tick, step(abs(hx - 0.7500), 0.004));
-            tick = max(tick, step(abs(hx - 0.9005), 0.004));
+            // reference ticks at 100 / 203 / 1000 / 4000 nits (positions
+            // derived, constant-folded — v1.5 hardcoded the four fractions,
+            // which silently depended on the axis-top constant)
+            float tick = step(abs(hx - log2(100.0)  / NM_HIST_LOG_HI), 0.004);
+            tick = max(tick, step(abs(hx - log2(203.0)  / NM_HIST_LOG_HI), 0.004));
+            tick = max(tick, step(abs(hx - log2(1000.0) / NM_HIST_LOG_HI), 0.004));
+            tick = max(tick, step(abs(hx - log2(4000.0) / NM_HIST_LOG_HI), 0.004));
             col = mix(col, pq_nits(vec3(25.0)), tick);
 
             // guard bounds already force bin < 24; clamp anyway so a future
@@ -618,12 +769,41 @@ vec4 hook() {
             if (yy < bh) {
                 float cn = exp2((float(bin) + 0.5) / float(NM_HIST_BINS) * NM_HIST_LOG_HI);
                 vec3 bc = (cn < 100.0) ? vec3(0.5) : heat_lin(cn);
-                col = mix(col, pq_oetf3(bc * (NM_FC_PAINT_NITS / 10000.0)), 0.9);
+                col = mix(col, pq_oetf3(bc * (nitmeter_heat_nits / 10000.0)), 0.9);
             }
-            // bright marker at the current frame peak (live, not held)
-            float pkx = clamp(log2(max(nm_peak, 1.0)) / NM_HIST_LOG_HI, 0.0, 1.0);
+            // markers (live, not held): thin dim = strict-max P, bright =
+            // 9 (content peak). The bright one used to be P, which floats
+            // right of every bar on ringing spikes — same repoint as the
+            // ceiling square.
+            float pmx = clamp(log2(max(nm_peak, 1.0)) / NM_HIST_LOG_HI, 0.0, 1.0);
+            col = mix(col, pq_nits(vec3(60.0)), step(abs(hx - pmx), 0.004));
+            float pkx = clamp(log2(max(nm_p9999, 1.0)) / NM_HIST_LOG_HI, 0.0, 1.0);
             col = mix(col, pq_nits(vec3(300.0)), step(abs(hx - pkx), 0.005));
         }
+
+#if nitmeter_graph
+        // time-series strip: last NM_RING_LEN rendered frames of P (white)
+        // / 9 (grey) / A (cyan) on the same log2 1..10000 axis, newest at
+        // the right — a live scope for the light-pump envelope. nm_ring_idx
+        // is the next write slot = the OLDEST sample, so column c maps to
+        // (idx + c) % len. Tripped-frame samples are 0 and draw as gaps.
+        if (lp.x >= 8.0 && lp.x < 128.0 && lp.y >= 207.0 && lp.y < 247.0) {
+            int c = int(lp.x - 8.0);
+            int ri = (clamp(int(nm_ring_idx), 0, NM_RING_LEN - 1) + c) % NM_RING_LEN;
+            float yy = (247.0 - lp.y) / 40.0;                     // 0 bottom .. 1 top
+            // dim line at the display target
+            float ty = clamp(log2(max(nitmeter_target, 1.0)) / NM_HIST_LOG_HI, 0.0, 1.0);
+            col = mix(col, pq_nits(vec3(25.0)), step(abs(yy - ty), 0.02));
+            // traces, ±1.5 px band; P drawn last so it wins overlaps. The
+            // v>0 gate makes 0-samples gaps: tripped frames by design, and
+            // true-black frames land there too (nothing to plot anyway)
+            vec3 tv = vec3(nm_ring_a[ri], nm_ring_9[ri], nm_ring_p[ri]);
+            vec3 th = clamp(log2(max(tv, vec3(1.0))) / NM_HIST_LOG_HI, 0.0, 1.0);
+            if (tv.x > 0.0 && abs(yy - th.x) < 0.0375) col = mix(col, pq_nits(NM_ROW_NITS[3]), 1.0);
+            if (tv.y > 0.0 && abs(yy - th.y) < 0.0375) col = mix(col, pq_nits(NM_ROW_NITS[1]), 1.0);
+            if (tv.z > 0.0 && abs(yy - th.z) < 0.0375) col = mix(col, pq_nits(NM_ROW_NITS[0]), 1.0);
+        }
+#endif
     }
     return vec4(col, color.a);
 }

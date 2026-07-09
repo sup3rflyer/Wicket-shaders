@@ -2176,6 +2176,22 @@ void hook() {
 #define PS_SAT_BOOST        0.20
 #define PS_BRIGHT_FLOOR     0.50
 #define PS_CHROMA_CEIL      0.03
+// Skin lift — Hunt-effect compensation for the v5.16 field cooling. With
+// bright FIELDS pulled to ~170-185 nits while skin holds its (elevated)
+// level, the eye adapts to a dimmer surround: the same skin luminance
+// reads brighter AND more colorful, and more-colorful skin reads more TAN
+// vs the SDR grade (author observation, direct-A/B-only magnitude). A
+// small real lift toward pale is the appearance counter — same
+// compensation class as the warm-shift hue rotation. Rides the SCENE
+// cooling weight (smoothstep of apl_t), NOT the pixel cool_w: skin is
+// illum-exempted from cooling, so its own cool_w is ~0 by design — the
+// compensation keys on "this scene's fields are cooled". Chroma window is
+// WIDER than the pale-skin sat boost's (tan skin carries more chroma than
+// pale); hue window and bright/scene gates are shared with PS. Zero at
+// apl_t <= 0.5 — dark/mid-key stay bit-exact.
+#define PS_LIFT             0.10    // linear-light lift at full gate (~3.2% Oklab L)
+#define PS_LIFT_CHROMA_HI   0.09    // lift chroma falloff start (pale band ends ~0.07)
+#define PS_LIFT_CHROMA_CEIL 0.14    // lift fully off — deep-saturated warm colors excluded
 
 // =============================================
 //  OUTPUT — encoding
@@ -3114,6 +3130,15 @@ vec4 hook() {
             expansion = mix(expansion, 1.0, PS_COMPRESS * ps_w);
             #endif
             float ps_sat = PS_SAT_BOOST * ps_w;
+            // Skin lift (see PS_LIFT block): wider chroma window than the
+            // sat boost, scene-cooling weighted. Multiplicative on
+            // expansion and its gates rise with Y (ps_bright_w) or vary in
+            // chroma, not Y — composite curve stays monotone per pixel.
+            float psl_chroma_w = smoothstep(0.015, 0.05, chroma_orig)
+                               * (1.0 - smoothstep(PS_LIFT_CHROMA_HI, PS_LIFT_CHROMA_CEIL, chroma_orig));
+            float psl_w = ps_hue_w * psl_chroma_w * ps_bright_w * ps_gate
+                        * smoothstep(0.5, 1.0, apl_t);
+            expansion *= 1.0 + PS_LIFT * psl_w;
         #endif
 
         // ---- APPLY WARM SHIFT ----

@@ -1,4 +1,4 @@
-// GradientRestore v1.11 — Detect-and-Reconstruct Deband
+// Debandit v1.11 — Detect-and-Reconstruct Deband
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Design goal: restore the smooth gradients the master had before 8-bit
@@ -35,7 +35,7 @@
 // of full-res pixels vs the median field, max across channels so chroma
 // grain counts): CLEAN gradients (digital anime skies) snap to the refit
 // ramp exactly — removing the contour itself, not just the plateau tilt —
-// with authority bounded by 0.375*gr_thr + the measured local noise, so
+// with authority bounded by 0.375*db_thr + the measured local noise, so
 // the snap always has exactly enough reach to finish the job (flatten the
 // step AND absorb the encode dither that was masking it) but can never
 // erase structure beyond sub-step scale plus measured noise. GRAINED
@@ -50,10 +50,10 @@
 // Four soft gates zero all correction where the flat-ramp model does not
 // hold (all fade to ZERO, never clamp, so no residual halos):
 //   1. |c| gate — a true staircase correction never exceeds ~half the step
-//      size, so the knee sits at gr_thr/2 (gr_thr is the STEP ceiling);
+//      size, so the knee sits at db_thr/2 (db_thr is the STEP ceiling);
 //      anything larger is remote-structure bias or uncancelled curvature.
 //   2. Flatness gate — luma range of the median field over a +-32px window
-//      above gr_flat code values means texture/detail; leave it alone.
+//      above db_flat code values means texture/detail; leave it alone.
 //   3. Structure gate — the |DS - M| field (med5's own mean-bias): where
 //      dense micro-texture makes the median an invalid ramp estimate,
 //      nothing is applied. H-median keeps isolated lines invisible to it.
@@ -104,9 +104,9 @@
 //   and plateaus up to ~30-40px flatten inside the rescue zone (wider
 //   plateaus near edges still wait for v2). Field driver: LUMA banding on
 //   a dark uniform collar beside white trim (w_amp median 0.00 — the
-//   sigma-48 bias exceeded gr_thr region-wide) and in hair shading
-//   between strand clusters (w_env median 0.25). gr_ms = 0 restores
-//   exact v1.9 behavior (and composes with gr_chroma = 0 to exact v1.8).
+//   sigma-48 bias exceeded db_thr region-wide) and in hair shading
+//   between strand clusters (w_env median 0.25). db_ms = 0 restores
+//   exact v1.9 behavior (and composes with db_chroma = 0 to exact v1.8).
 //   The honest full fix is still similarity-aware ramp estimation
 //   (region-respecting weights), a v2 architecture step; a directional
 //   envelope was considered and rejected (both brighter and darker
@@ -124,9 +124,9 @@
 //   |c| zeroed EVERYTHING, vetoing a chroma correction whose own model
 //   error was 0.11 codes on a 0.55-code-flat chroma field. Chroma
 //   quantities live in RGB-projected units: one YCbCr chroma code spans
-//   ~2.1 RGB codes on the B axis, so the chroma knees/reach scale gr_thr
-//   by GR_CTHR_GAIN. gr_chroma = 0 restores exact v1.8 behavior.
-//   The chroma path carries its own structure/coherence term (GR_RANGEC
+//   ~2.1 RGB codes on the B axis, so the chroma knees/reach scale db_thr
+//   by DB_CTHR_GAIN. db_chroma = 0 restores exact v1.8 behavior.
+//   The chroma path carries its own structure/coherence term (DB_RANGEC
 //   w channel) so faint coherent colored texture is not absorbed by the
 //   chroma snap; the trust mask stays luma-only (correct — med5 validity
 //   there is a luma-structure question; an equal-luma pure-chroma line is
@@ -141,67 +141,67 @@
 //  USER TUNING
 // =============================================================================
 // Sliders are DYNAMIC: glsl-shader-opts changes apply on the next frame, no
-// recompile. gr_debug is a DEFINE and recompiles on change. Defaults = the
+// recompile. db_debug is a DEFINE and recompiles on change. Defaults = the
 // shipped tune. NOTE: no comment lines may sit between a PARAM block and the
 // next directive — the parser folds them into the value and fails to load.
 
-//!PARAM gr_strength
+//!PARAM db_strength
 //!DESC Deband strength — fraction of the reconstructed gradient applied. 1 = full reconstruction (the shipped tune), 0 = off.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
-//!PARAM gr_thr
+//!PARAM db_thr
 //!DESC Banding step-size ceiling in 8-bit code values; drives the amplitude gate (full up to half this, zero at 1x), the snap reach (0.375x), and the contamination-envelope tolerance. 2 covers 1-2 code banding (typical web encodes). Patchy HALF-corrected strong bands are the signal to raise it (gate and reach compound below the needed size); 4 = brutal sources.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.5
 //!MAXIMUM 4.0
 2.0
 
-//!PARAM gr_flat
+//!PARAM db_flat
 //!DESC Flatness ceiling in 8-bit code values — luma range over a +-32px window above this marks texture/detail and fades correction out (zero at 2x). Raise to reach banding on steeper gradients, lower to protect more detail.
 //!TYPE DYNAMIC float
 //!MINIMUM 2.0
 //!MAXIMUM 24.0
 6.0
 
-//!PARAM gr_chroma
+//!PARAM db_chroma
 //!DESC Chroma-path strength — fraction of the opponent-axis (chroma) correction applied. Chroma banding is gated by its OWN flatness/envelope/noise fields, so it is fixed even where steep luma shading closes the luma gates (the field-found miss: colored banding on a shaded face). 1 = full (shipped tune), 0 = v1.8 luma-only behavior. The luma path is unaffected either way.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
-//!PARAM gr_flat_c
+//!PARAM db_flat_c
 //!DESC Chroma flatness ceiling in RGB-projected code values — opponent-axis (B-Y / R-Y) range of the median field over a +-32px window above this marks colored structure and fades the chroma correction out (zero at 2x). Chroma fields are far flatter than luma: banded surfaces measure ~0.5-1, colored art/iris structure 8+.
 //!TYPE DYNAMIC float
 //!MINIMUM 1.0
 //!MAXIMUM 24.0
 4.0
 
-//!PARAM gr_ms
+//!PARAM db_ms
 //!DESC Multi-scale rescue strength. Near bulk-contrast edges (a bright trim beside a dark uniform, hair strand clusters) the wide sigma-48 ramp estimate is contamination-gated and banding survives in a ~130px collar; this blends in a short sigma-12 refit where only IT is clean, shrinking the collar to ~55px and flattening plateaus up to ~30-40px there. 1 = full (shipped tune), 0 = v1.9 behavior (wide ramp only).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
-//!PARAM gr_snr
+//!PARAM db_snr
 //!DESC SNR-adaptive texture protection. The structure gate's knee is calibrated so 8-bit encode dither (~0.2 codes) cannot close it — but on quiet high-bit-depth sources real texture lives BELOW that static knee (10-bit stone/cloud detail at 0.1-0.35 codes) and the snap absorbs it as if it were dither. At 1 the knee scales with the MEASURED local noise floor (the MAD field): dithered 8-bit content clamps to the static knee (behavior unchanged), quiet sources tighten so faint coherent texture is protected while clean banded flats (whose structure field reads ~0.05) stay correctable. 0 = static knee (v1.10 behavior).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
-//!PARAM gr_dither
+//!PARAM db_dither
 //!DESC Dither absorption / contour snap, scaling BOTH the luma and chroma snap regimes. 1 = full: cleanest possible gradients, but sub-code faint texture in quiet areas (smoke, haze) can read as dither and be absorbed with it. Lower to preserve such texture at the cost of contour removal on clean flats; 0 = low-frequency correction only (all fine texture bit-exact, faint contours may survive).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
-//!PARAM gr_debug
+//!PARAM db_debug
 //!DESC Debug views: 0 = off, 1 = bypass, 2 = applied correction x32 on mid-gray, 3 = gate map (R = flatness kill, G = applied weight, B = snap regime), 4 = chroma gate map (R = chroma flatness kill, G = applied chroma weight, B = chroma snap regime).
 //!TYPE DEFINE
 //!MINIMUM 0
@@ -210,10 +210,10 @@
 
 //!HOOK MAIN
 //!BIND HOOKED
-//!SAVE GR_DS
+//!SAVE DB_DS
 //!WIDTH HOOKED.w 4 /
 //!HEIGHT HOOKED.h 4 /
-//!DESC GradientRestore: Downsample 1/4
+//!DESC Debandit: Downsample 1/4
 
 // =============================================================================
 // PASS 1: DOWNSAMPLE 1/4 — plateau field P (exact 4x4 box mean)
@@ -238,11 +238,11 @@ vec4 hook() {
 }
 
 //!HOOK MAIN
-//!BIND GR_DS
-//!SAVE GR_MED_H
-//!WIDTH GR_DS.w
-//!HEIGHT GR_DS.h
-//!DESC GradientRestore: Median H
+//!BIND DB_DS
+//!SAVE DB_MED_H
+//!WIDTH DB_DS.w
+//!HEIGHT DB_DS.h
+//!DESC Debandit: Median H
 
 // =============================================================================
 // PASS 2/3: SEPARABLE MED5 — line-reject field M
@@ -258,25 +258,25 @@ vec4 hook() {
 // componentwise, so all four channels (rgb + luma alpha) ride in SIMD.
 
 vec4 hook() {
-    vec2 pt = GR_DS_pt;
-    vec2 pos = GR_DS_pos;
-    vec4 a = GR_DS_tex(pos - vec2(2.0 * pt.x, 0.0));
-    vec4 b = GR_DS_tex(pos - vec2(pt.x, 0.0));
-    vec4 c = GR_DS_tex(pos);
-    vec4 d = GR_DS_tex(pos + vec2(pt.x, 0.0));
-    vec4 e = GR_DS_tex(pos + vec2(2.0 * pt.x, 0.0));
+    vec2 pt = DB_DS_pt;
+    vec2 pos = DB_DS_pos;
+    vec4 a = DB_DS_tex(pos - vec2(2.0 * pt.x, 0.0));
+    vec4 b = DB_DS_tex(pos - vec2(pt.x, 0.0));
+    vec4 c = DB_DS_tex(pos);
+    vec4 d = DB_DS_tex(pos + vec2(pt.x, 0.0));
+    vec4 e = DB_DS_tex(pos + vec2(2.0 * pt.x, 0.0));
     vec4 f = max(min(a, b), min(d, e));
     vec4 g = min(max(a, b), max(d, e));
     return max(min(c, f), min(max(c, f), g));
 }
 
 //!HOOK MAIN
-//!BIND GR_MED_H
-//!BIND GR_DS
-//!SAVE GR_MED
-//!WIDTH GR_MED_H.w
-//!HEIGHT GR_MED_H.h
-//!DESC GradientRestore: Median V
+//!BIND DB_MED_H
+//!BIND DB_DS
+//!SAVE DB_MED
+//!WIDTH DB_MED_H.w
+//!HEIGHT DB_MED_H.h
+//!DESC Debandit: Median V
 
 // Alpha of the output is the TRUST MASK, not luma: 1 where this texel's
 // box mean agrees with the median field (flat / banded / dithered /
@@ -288,34 +288,34 @@ vec4 hook() {
 // longer projects a +-32px protected strip of surviving banding around
 // itself (field-found halo). Banding steps read ~0.3 here, sigma-2 grain
 // ~0.7, structure 2+ — the knee sits above grain, below strokes.
-#define GR_CODE_M    (1.0 / 255.0)
-#define GR_MASK_LO   0.9
-#define GR_MASK_HI   1.8
+#define DB_CODE_M    (1.0 / 255.0)
+#define DB_MASK_LO   0.9
+#define DB_MASK_HI   1.8
 
 vec4 hook() {
-    vec2 pt = GR_MED_H_pt;
-    vec2 pos = GR_MED_H_pos;
-    vec4 a = GR_MED_H_tex(pos - vec2(0.0, 2.0 * pt.y));
-    vec4 b = GR_MED_H_tex(pos - vec2(0.0, pt.y));
-    vec4 c = GR_MED_H_tex(pos);
-    vec4 d = GR_MED_H_tex(pos + vec2(0.0, pt.y));
-    vec4 e = GR_MED_H_tex(pos + vec2(0.0, 2.0 * pt.y));
+    vec2 pt = DB_MED_H_pt;
+    vec2 pos = DB_MED_H_pos;
+    vec4 a = DB_MED_H_tex(pos - vec2(0.0, 2.0 * pt.y));
+    vec4 b = DB_MED_H_tex(pos - vec2(0.0, pt.y));
+    vec4 c = DB_MED_H_tex(pos);
+    vec4 d = DB_MED_H_tex(pos + vec2(0.0, pt.y));
+    vec4 e = DB_MED_H_tex(pos + vec2(0.0, 2.0 * pt.y));
     vec4 f = max(min(a, b), min(d, e));
     vec4 g = min(max(a, b), max(d, e));
     vec4 med = max(min(c, f), min(max(c, f), g));
 
     float lum_med = dot(med.rgb, vec3(0.2126, 0.7152, 0.0722));
-    float dev = abs(GR_DS_tex(GR_DS_pos).a - lum_med) / GR_CODE_M;
-    float mask = 1.0 - smoothstep(GR_MASK_LO, GR_MASK_HI, dev);
+    float dev = abs(DB_DS_tex(DB_DS_pos).a - lum_med) / DB_CODE_M;
+    float mask = 1.0 - smoothstep(DB_MASK_LO, DB_MASK_HI, dev);
     return vec4(med.rgb, mask);
 }
 
 //!HOOK MAIN
-//!BIND GR_MED
-//!SAVE GR_BLUR_H
-//!WIDTH GR_MED.w
-//!HEIGHT GR_MED.h
-//!DESC GradientRestore: Ramp Blur H
+//!BIND DB_MED
+//!SAVE DB_BLUR_H
+//!WIDTH DB_MED.w
+//!HEIGHT DB_MED.h
+//!DESC Debandit: Ramp Blur H
 
 // =============================================================================
 // PASS 4/5: RAMP BLUR — refit ramp S (separable Gaussian on M)
@@ -345,33 +345,33 @@ vec4 hook() {
     };
 
     // Precomputed: 1.0 / (1.0 + 2.0 * sum(gw[]))
-    #define GR_BLUR_INV_WSUM 0.0336152719
+    #define DB_BLUR_INV_WSUM 0.0336152719
 
-    vec2 pt = GR_MED_pt;
-    vec2 pos = GR_MED_pos;
+    vec2 pt = DB_MED_pt;
+    vec2 pos = DB_MED_pos;
 
     // Mask-premultiplied (normalized convolution): rgb * mask in rgb,
     // mask in alpha. The Correction pass divides the two blurred halves.
-    vec4 m0 = GR_MED_tex(pos);
+    vec4 m0 = DB_MED_tex(pos);
     vec4 sum = vec4(m0.rgb * m0.a, m0.a);
 
     for (int i = 0; i < 15; i++) {
         float xp = pos.x + go[i] * pt.x;
         float xn = pos.x - go[i] * pt.x;
-        vec4 sp = GR_MED_tex(vec2(xp, pos.y)) * step(xp, 1.0);
-        vec4 sn = GR_MED_tex(vec2(xn, pos.y)) * step(0.0, xn);
+        vec4 sp = DB_MED_tex(vec2(xp, pos.y)) * step(xp, 1.0);
+        vec4 sn = DB_MED_tex(vec2(xn, pos.y)) * step(0.0, xn);
         sum += (vec4(sp.rgb * sp.a, sp.a) + vec4(sn.rgb * sn.a, sn.a)) * gw[i];
     }
 
-    return sum * GR_BLUR_INV_WSUM;
+    return sum * DB_BLUR_INV_WSUM;
 }
 
 //!HOOK MAIN
-//!BIND GR_BLUR_H
-//!SAVE GR_SMOOTH
-//!WIDTH GR_BLUR_H.w
-//!HEIGHT GR_BLUR_H.h
-//!DESC GradientRestore: Ramp Blur V
+//!BIND DB_BLUR_H
+//!SAVE DB_SMOOTH
+//!WIDTH DB_BLUR_H.w
+//!HEIGHT DB_BLUR_H.h
+//!DESC Debandit: Ramp Blur V
 
 vec4 hook() {
     const float go[15] = {
@@ -388,31 +388,31 @@ vec4 hook() {
     };
 
     // Precomputed: 1.0 / (1.0 + 2.0 * sum(gw[]))
-    #define GR_BLUR_INV_WSUM 0.0336152719
+    #define DB_BLUR_INV_WSUM 0.0336152719
 
-    vec2 pt = GR_BLUR_H_pt;
-    vec2 pos = GR_BLUR_H_pos;
+    vec2 pt = DB_BLUR_H_pt;
+    vec2 pos = DB_BLUR_H_pos;
 
     // Input is already mask-premultiplied; blur all four channels as-is.
-    vec4 sum = GR_BLUR_H_tex(pos);
+    vec4 sum = DB_BLUR_H_tex(pos);
 
     for (int i = 0; i < 15; i++) {
         float yp = pos.y + go[i] * pt.y;
         float yn = pos.y - go[i] * pt.y;
-        vec4 sp = GR_BLUR_H_tex(vec2(pos.x, yp)) * step(yp, 1.0);
-        vec4 sn = GR_BLUR_H_tex(vec2(pos.x, yn)) * step(0.0, yn);
+        vec4 sp = DB_BLUR_H_tex(vec2(pos.x, yp)) * step(yp, 1.0);
+        vec4 sn = DB_BLUR_H_tex(vec2(pos.x, yn)) * step(0.0, yn);
         sum += (sp + sn) * gw[i];
     }
 
-    return sum * GR_BLUR_INV_WSUM;
+    return sum * DB_BLUR_INV_WSUM;
 }
 
 //!HOOK MAIN
-//!BIND GR_SMOOTH
-//!SAVE GR_BLUR2_H
-//!WIDTH GR_SMOOTH.w
-//!HEIGHT GR_SMOOTH.h
-//!DESC GradientRestore: Refit Blur H
+//!BIND DB_SMOOTH
+//!SAVE DB_BLUR2_H
+//!WIDTH DB_SMOOTH.w
+//!HEIGHT DB_SMOOTH.h
+//!DESC Debandit: Refit Blur H
 
 // =============================================================================
 // PASS 6/7: REFIT BLUR — S2 = blur(S), same kernel, for the 2S - S2
@@ -437,33 +437,33 @@ vec4 hook() {
     };
 
     // Precomputed: 1.0 / (1.0 + 2.0 * sum(gw[]))
-    #define GR_BLUR_INV_WSUM 0.0336152719
+    #define DB_BLUR_INV_WSUM 0.0336152719
 
-    vec2 pt = GR_SMOOTH_pt;
-    vec2 pos = GR_SMOOTH_pos;
+    vec2 pt = DB_SMOOTH_pt;
+    vec2 pos = DB_SMOOTH_pos;
 
     // Premultiplied throughout; the division happens once, in Correction.
-    vec4 sum = GR_SMOOTH_tex(pos);
+    vec4 sum = DB_SMOOTH_tex(pos);
 
     for (int i = 0; i < 15; i++) {
         float xp = pos.x + go[i] * pt.x;
         float xn = pos.x - go[i] * pt.x;
-        vec4 sp = GR_SMOOTH_tex(vec2(xp, pos.y)) * step(xp, 1.0);
-        vec4 sn = GR_SMOOTH_tex(vec2(xn, pos.y)) * step(0.0, xn);
+        vec4 sp = DB_SMOOTH_tex(vec2(xp, pos.y)) * step(xp, 1.0);
+        vec4 sn = DB_SMOOTH_tex(vec2(xn, pos.y)) * step(0.0, xn);
         sum += (sp + sn) * gw[i];
     }
 
-    return sum * GR_BLUR_INV_WSUM;
+    return sum * DB_BLUR_INV_WSUM;
 }
 
 //!HOOK MAIN
-//!BIND GR_BLUR_H
-//!BIND GR_BLUR2_H
-//!BIND GR_MED
-//!SAVE GR_CORR
-//!WIDTH GR_BLUR_H.w
-//!HEIGHT GR_BLUR_H.h
-//!DESC GradientRestore: Correction
+//!BIND DB_BLUR_H
+//!BIND DB_BLUR2_H
+//!BIND DB_MED
+//!SAVE DB_CORR
+//!WIDTH DB_BLUR_H.w
+//!HEIGHT DB_BLUR_H.h
+//!DESC Debandit: Correction
 
 // Fused precision pass: recomputes BOTH V-blurs in fp32 registers (the
 // fp16 storage noise of the H-blurred inputs averages out across 31 taps,
@@ -492,25 +492,25 @@ vec4 hook() {
     };
 
     // Precomputed: 1.0 / (1.0 + 2.0 * sum(gw[]))
-    #define GR_BLUR_INV_WSUM 0.0336152719
+    #define DB_BLUR_INV_WSUM 0.0336152719
 
-    vec2 pt = GR_BLUR_H_pt;
-    vec2 pos = GR_BLUR_H_pos;
+    vec2 pt = DB_BLUR_H_pt;
+    vec2 pos = DB_BLUR_H_pos;
 
-    vec4 sum_s  = GR_BLUR_H_tex(pos);
-    vec4 sum_s2 = GR_BLUR2_H_tex(pos);
+    vec4 sum_s  = DB_BLUR_H_tex(pos);
+    vec4 sum_s2 = DB_BLUR2_H_tex(pos);
 
     for (int i = 0; i < 15; i++) {
         float yp = pos.y + go[i] * pt.y;
         float yn = pos.y - go[i] * pt.y;
         float vp = step(yp, 1.0);
         float vn = step(0.0, yn);
-        sum_s  += (GR_BLUR_H_tex(vec2(pos.x, yp)) * vp  + GR_BLUR_H_tex(vec2(pos.x, yn)) * vn)  * gw[i];
-        sum_s2 += (GR_BLUR2_H_tex(vec2(pos.x, yp)) * vp + GR_BLUR2_H_tex(vec2(pos.x, yn)) * vn) * gw[i];
+        sum_s  += (DB_BLUR_H_tex(vec2(pos.x, yp)) * vp  + DB_BLUR_H_tex(vec2(pos.x, yn)) * vn)  * gw[i];
+        sum_s2 += (DB_BLUR2_H_tex(vec2(pos.x, yp)) * vp + DB_BLUR2_H_tex(vec2(pos.x, yn)) * vn) * gw[i];
     }
 
-    sum_s  *= GR_BLUR_INV_WSUM;
-    sum_s2 *= GR_BLUR_INV_WSUM;
+    sum_s  *= DB_BLUR_INV_WSUM;
+    sum_s2 *= DB_BLUR_INV_WSUM;
 
     // Normalized-convolution division: the ramp is estimated from TRUSTED
     // texels only. Confidence fades the correction out where the local
@@ -519,7 +519,7 @@ vec4 hook() {
     vec3 s  = sum_s.rgb  / max(sum_s.a,  1e-4);
     vec3 s2 = sum_s2.rgb / max(sum_s2.a, 1e-4);
     float conf = smoothstep(0.06, 0.20, min(sum_s.a, sum_s2.a));
-    vec4 m = GR_MED_tex(GR_MED_pos);
+    vec4 m = DB_MED_tex(DB_MED_pos);
     vec3 c = (2.0 * s - s2 - m.rgb) * conf;
     // Alpha: |c| (max channel) WEIGHTED BY THE TRUST MASK — dilated by the
     // ENV passes into the contamination envelope the apply pass gates on.
@@ -534,11 +534,11 @@ vec4 hook() {
 }
 
 //!HOOK MAIN
-//!BIND GR_MED
-//!SAVE GR_SBLUR_H
-//!WIDTH GR_MED.w
-//!HEIGHT GR_MED.h
-//!DESC GradientRestore: Short Ramp Blur H
+//!BIND DB_MED
+//!SAVE DB_SBLUR_H
+//!WIDTH DB_MED.w
+//!HEIGHT DB_MED.h
+//!DESC Debandit: Short Ramp Blur H
 
 // =============================================================================
 // PASS 8/9/10 (v1.10): SHORT REFIT — sigma 3 at 1/4 res (12px full res)
@@ -568,32 +568,32 @@ vec4 hook() {
     };
 
     // Precomputed: 1.0 / (1.0 + 2.0 * sum(gw[]))
-    #define GR_SBLUR_INV_WSUM 0.1330390063
+    #define DB_SBLUR_INV_WSUM 0.1330390063
 
-    vec2 pt = GR_MED_pt;
-    vec2 pos = GR_MED_pos;
+    vec2 pt = DB_MED_pt;
+    vec2 pos = DB_MED_pos;
 
     // Mask-premultiplied normalized convolution, off-frame taps zero-weight.
-    vec4 m0 = GR_MED_tex(pos);
+    vec4 m0 = DB_MED_tex(pos);
     vec4 sum = vec4(m0.rgb * m0.a, m0.a);
 
     for (int i = 0; i < 5; i++) {
         float xp = pos.x + go[i] * pt.x;
         float xn = pos.x - go[i] * pt.x;
-        vec4 sp = GR_MED_tex(vec2(xp, pos.y)) * step(xp, 1.0);
-        vec4 sn = GR_MED_tex(vec2(xn, pos.y)) * step(0.0, xn);
+        vec4 sp = DB_MED_tex(vec2(xp, pos.y)) * step(xp, 1.0);
+        vec4 sn = DB_MED_tex(vec2(xn, pos.y)) * step(0.0, xn);
         sum += (vec4(sp.rgb * sp.a, sp.a) + vec4(sn.rgb * sn.a, sn.a)) * gw[i];
     }
 
-    return sum * GR_SBLUR_INV_WSUM;
+    return sum * DB_SBLUR_INV_WSUM;
 }
 
 //!HOOK MAIN
-//!BIND GR_MED
-//!SAVE GR_SBLUR2_H
-//!WIDTH GR_MED.w
-//!HEIGHT GR_MED.h
-//!DESC GradientRestore: Short Refit Blur H
+//!BIND DB_MED
+//!SAVE DB_SBLUR2_H
+//!WIDTH DB_MED.w
+//!HEIGHT DB_MED.h
+//!DESC Debandit: Short Refit Blur H
 
 // H half of the sigma-4.2426 (= 3*sqrt2) blur of M for the short S2.
 
@@ -608,33 +608,33 @@ vec4 hook() {
     };
 
     // Precomputed: 1.0 / (1.0 + 2.0 * sum(gw[]))
-    #define GR_SBLUR2_INV_WSUM 0.0940893179
+    #define DB_SBLUR2_INV_WSUM 0.0940893179
 
-    vec2 pt = GR_MED_pt;
-    vec2 pos = GR_MED_pos;
+    vec2 pt = DB_MED_pt;
+    vec2 pos = DB_MED_pos;
 
-    vec4 m0 = GR_MED_tex(pos);
+    vec4 m0 = DB_MED_tex(pos);
     vec4 sum = vec4(m0.rgb * m0.a, m0.a);
 
     for (int i = 0; i < 7; i++) {
         float xp = pos.x + go[i] * pt.x;
         float xn = pos.x - go[i] * pt.x;
-        vec4 sp = GR_MED_tex(vec2(xp, pos.y)) * step(xp, 1.0);
-        vec4 sn = GR_MED_tex(vec2(xn, pos.y)) * step(0.0, xn);
+        vec4 sp = DB_MED_tex(vec2(xp, pos.y)) * step(xp, 1.0);
+        vec4 sn = DB_MED_tex(vec2(xn, pos.y)) * step(0.0, xn);
         sum += (vec4(sp.rgb * sp.a, sp.a) + vec4(sn.rgb * sn.a, sn.a)) * gw[i];
     }
 
-    return sum * GR_SBLUR2_INV_WSUM;
+    return sum * DB_SBLUR2_INV_WSUM;
 }
 
 //!HOOK MAIN
-//!BIND GR_SBLUR_H
-//!BIND GR_SBLUR2_H
-//!BIND GR_MED
-//!SAVE GR_SCORR
-//!WIDTH GR_SBLUR_H.w
-//!HEIGHT GR_SBLUR_H.h
-//!DESC GradientRestore: Short Correction
+//!BIND DB_SBLUR_H
+//!BIND DB_SBLUR2_H
+//!BIND DB_MED
+//!SAVE DB_SCORR
+//!WIDTH DB_SBLUR_H.w
+//!HEIGHT DB_SBLUR_H.h
+//!DESC Debandit: Short Correction
 
 // Fused precision pass, mirror of the wide Correction: both V blurs in
 // fp32 registers, normalized-conv division once, and the complete short
@@ -660,46 +660,46 @@ vec4 hook() {
         0.1675757486, 0.0530123245, 0.0134661865
     };
 
-    #define GR_SBLURA_INV_WSUM 0.1330390063
-    #define GR_SBLURB_INV_WSUM 0.0940893179
+    #define DB_SBLURA_INV_WSUM 0.1330390063
+    #define DB_SBLURB_INV_WSUM 0.0940893179
 
-    vec2 pt = GR_SBLUR_H_pt;
-    vec2 pos = GR_SBLUR_H_pos;
+    vec2 pt = DB_SBLUR_H_pt;
+    vec2 pos = DB_SBLUR_H_pos;
 
-    vec4 sum_s  = GR_SBLUR_H_tex(pos);
-    vec4 sum_s2 = GR_SBLUR2_H_tex(pos);
+    vec4 sum_s  = DB_SBLUR_H_tex(pos);
+    vec4 sum_s2 = DB_SBLUR2_H_tex(pos);
 
     for (int i = 0; i < 5; i++) {
         float yp = pos.y + goA[i] * pt.y;
         float yn = pos.y - goA[i] * pt.y;
-        sum_s += (GR_SBLUR_H_tex(vec2(pos.x, yp)) * step(yp, 1.0)
-                + GR_SBLUR_H_tex(vec2(pos.x, yn)) * step(0.0, yn)) * gwA[i];
+        sum_s += (DB_SBLUR_H_tex(vec2(pos.x, yp)) * step(yp, 1.0)
+                + DB_SBLUR_H_tex(vec2(pos.x, yn)) * step(0.0, yn)) * gwA[i];
     }
     for (int i = 0; i < 7; i++) {
         float yp = pos.y + goB[i] * pt.y;
         float yn = pos.y - goB[i] * pt.y;
-        sum_s2 += (GR_SBLUR2_H_tex(vec2(pos.x, yp)) * step(yp, 1.0)
-                 + GR_SBLUR2_H_tex(vec2(pos.x, yn)) * step(0.0, yn)) * gwB[i];
+        sum_s2 += (DB_SBLUR2_H_tex(vec2(pos.x, yp)) * step(yp, 1.0)
+                 + DB_SBLUR2_H_tex(vec2(pos.x, yn)) * step(0.0, yn)) * gwB[i];
     }
 
-    sum_s  *= GR_SBLURA_INV_WSUM;
-    sum_s2 *= GR_SBLURB_INV_WSUM;
+    sum_s  *= DB_SBLURA_INV_WSUM;
+    sum_s2 *= DB_SBLURB_INV_WSUM;
 
     vec3 s  = sum_s.rgb  / max(sum_s.a,  1e-4);
     vec3 s2 = sum_s2.rgb / max(sum_s2.a, 1e-4);
     float conf = smoothstep(0.06, 0.20, min(sum_s.a, sum_s2.a));
-    vec4 m = GR_MED_tex(GR_MED_pos);
+    vec4 m = DB_MED_tex(DB_MED_pos);
     vec3 c = (2.0 * s - s2 - m.rgb) * conf;
     return vec4(vec3(0.5) + c, max(max(abs(c.r), abs(c.g)), abs(c.b)) * m.a * m.a);
 }
 
 //!HOOK MAIN
-//!BIND GR_CORR
-//!BIND GR_SCORR
-//!SAVE GR_ENV_H
-//!WIDTH GR_CORR.w
-//!HEIGHT GR_CORR.h
-//!DESC GradientRestore: Contamination Env H
+//!BIND DB_CORR
+//!BIND DB_SCORR
+//!SAVE DB_ENV_H
+//!WIDTH DB_CORR.w
+//!HEIGHT DB_CORR.h
+//!DESC Debandit: Contamination Env H
 
 // =============================================================================
 // PASS 11/12: CONTAMINATION ENVELOPE — separable max of |c| over +-8 texels
@@ -726,20 +726,20 @@ vec4 hook() {
 // (~10% at half-code |c|) on the wide 0.5-1.0x cthr chroma knee — never
 // additively.
 
-const vec3 GR_ENVH_W709 = vec3(0.2126, 0.7152, 0.0722);
+const vec3 DB_ENVH_W709 = vec3(0.2126, 0.7152, 0.0722);
 
 vec4 hook() {
-    vec2 pt = GR_CORR_pt;
-    vec2 pos = GR_CORR_pos;
+    vec2 pt = DB_CORR_pt;
+    vec2 pos = DB_CORR_pos;
     vec4 m = vec4(0.0);
     for (int i = -8; i <= 8; i++) {
         vec2 tp = pos + vec2(float(i) * pt.x, 0.0);
-        vec4 tL = GR_CORR_tex(tp);
-        vec4 tS = GR_SCORR_tex(tp);
+        vec4 tL = DB_CORR_tex(tp);
+        vec4 tS = DB_SCORR_tex(tp);
         vec3 cL = tL.rgb - vec3(0.5);
         vec3 cS = tS.rgb - vec3(0.5);
-        vec3 oL = cL - vec3(dot(cL, GR_ENVH_W709));
-        vec3 oS = cS - vec3(dot(cS, GR_ENVH_W709));
+        vec3 oL = cL - vec3(dot(cL, DB_ENVH_W709));
+        vec3 oS = cS - vec3(dot(cS, DB_ENVH_W709));
         float mcL = max(max(abs(cL.r), abs(cL.g)), abs(cL.b));
         float mcS = max(max(abs(cS.r), abs(cS.g)), abs(cS.b));
         float moL = max(max(abs(oL.r), abs(oL.g)), abs(oL.b));
@@ -753,31 +753,31 @@ vec4 hook() {
 }
 
 //!HOOK MAIN
-//!BIND GR_ENV_H
-//!SAVE GR_ENV
-//!WIDTH GR_ENV_H.w
-//!HEIGHT GR_ENV_H.h
-//!DESC GradientRestore: Contamination Env V
+//!BIND DB_ENV_H
+//!SAVE DB_ENV
+//!WIDTH DB_ENV_H.w
+//!HEIGHT DB_ENV_H.h
+//!DESC Debandit: Contamination Env V
 
 vec4 hook() {
-    vec2 pt = GR_ENV_H_pt;
-    vec2 pos = GR_ENV_H_pos;
-    vec4 m = GR_ENV_H_tex(pos);
+    vec2 pt = DB_ENV_H_pt;
+    vec2 pos = DB_ENV_H_pos;
+    vec4 m = DB_ENV_H_tex(pos);
     for (int i = 1; i <= 8; i++) {
-        m = max(m, GR_ENV_H_tex(pos + vec2(0.0, float(i) * pt.y)));
-        m = max(m, GR_ENV_H_tex(pos - vec2(0.0, float(i) * pt.y)));
+        m = max(m, DB_ENV_H_tex(pos + vec2(0.0, float(i) * pt.y)));
+        m = max(m, DB_ENV_H_tex(pos - vec2(0.0, float(i) * pt.y)));
     }
     return m;
 }
 
 //!HOOK MAIN
 //!BIND HOOKED
-//!BIND GR_DS
-//!BIND GR_MED
-//!SAVE GR_RANGE_H
-//!WIDTH GR_MED.w
-//!HEIGHT GR_MED.h
-//!DESC GradientRestore: Flatness Range H
+//!BIND DB_DS
+//!BIND DB_MED
+//!SAVE DB_RANGE_H
+//!WIDTH DB_MED.w
+//!HEIGHT DB_MED.h
+//!DESC Debandit: Flatness Range H
 
 // =============================================================================
 // PASS 13/14: FLATNESS RANGE + NOISE FIELD
@@ -813,26 +813,26 @@ vec4 hook() {
 // both extrema so a fully-masked window degrades to range 0 (the structure
 // gate owns that case).
 
-const vec3 GR_W709 = vec3(0.2126, 0.7152, 0.0722);
+const vec3 DB_W709 = vec3(0.2126, 0.7152, 0.0722);
 
 vec4 hook() {
-    vec2 pt = GR_MED_pt;
-    vec2 pos = GR_MED_pos;
+    vec2 pt = DB_MED_pt;
+    vec2 pos = DB_MED_pos;
 
-    vec4 center = GR_MED_tex(pos);
-    float lum_c = dot(center.rgb, GR_W709);
+    vec4 center = DB_MED_tex(pos);
+    float lum_c = dot(center.rgb, DB_W709);
     float lo = lum_c;
     float hi = lum_c;
 
     for (int i = 1; i <= 8; i++) {
-        vec4 tp = GR_MED_tex(pos + vec2(float(i) * pt.x, 0.0));
-        vec4 tn = GR_MED_tex(pos - vec2(float(i) * pt.x, 0.0));
+        vec4 tp = DB_MED_tex(pos + vec2(float(i) * pt.x, 0.0));
+        vec4 tn = DB_MED_tex(pos - vec2(float(i) * pt.x, 0.0));
         float op = step(0.5, tp.a);
         float on = step(0.5, tn.a);
-        lo = min(lo, min(mix(1e3, dot(tp.rgb, GR_W709), op),
-                         mix(1e3, dot(tn.rgb, GR_W709), on)));
-        hi = max(hi, max(mix(-1e3, dot(tp.rgb, GR_W709), op),
-                         mix(-1e3, dot(tn.rgb, GR_W709), on)));
+        lo = min(lo, min(mix(1e3, dot(tp.rgb, DB_W709), op),
+                         mix(1e3, dot(tn.rgb, DB_W709), on)));
+        hi = max(hi, max(mix(-1e3, dot(tp.rgb, DB_W709), op),
+                         mix(-1e3, dot(tn.rgb, DB_W709), on)));
     }
 
     vec2 fpt = HOOKED_pt;
@@ -859,11 +859,11 @@ vec4 hook() {
     //    eating faint structured texture it cannot distinguish from dither
     //    by magnitude alone (field-found behind smoke, ~0.5-code detail).
     //    Banding contours self-cancel too (thin, 1-2 samples of 5).
-    float s0 = GR_DS_tex(pos - vec2(2.0 * pt.x, 0.0)).a - lum_c;
-    float s1 = GR_DS_tex(pos - vec2(pt.x, 0.0)).a - lum_c;
-    float s2 = GR_DS_tex(pos).a - lum_c;
-    float s3 = GR_DS_tex(pos + vec2(pt.x, 0.0)).a - lum_c;
-    float s4 = GR_DS_tex(pos + vec2(2.0 * pt.x, 0.0)).a - lum_c;
+    float s0 = DB_DS_tex(pos - vec2(2.0 * pt.x, 0.0)).a - lum_c;
+    float s1 = DB_DS_tex(pos - vec2(pt.x, 0.0)).a - lum_c;
+    float s2 = DB_DS_tex(pos).a - lum_c;
+    float s3 = DB_DS_tex(pos + vec2(pt.x, 0.0)).a - lum_c;
+    float s4 = DB_DS_tex(pos + vec2(2.0 * pt.x, 0.0)).a - lum_c;
 
     float d0 = abs(s0); float d1 = abs(s1); float d2 = abs(s2);
     float d3 = abs(s3); float d4 = abs(s4);
@@ -879,25 +879,25 @@ vec4 hook() {
 }
 
 //!HOOK MAIN
-//!BIND GR_RANGE_H
-//!SAVE GR_RANGE
-//!WIDTH GR_RANGE_H.w
-//!HEIGHT GR_RANGE_H.h
-//!DESC GradientRestore: Flatness Range V
+//!BIND DB_RANGE_H
+//!SAVE DB_RANGE
+//!WIDTH DB_RANGE_H.w
+//!HEIGHT DB_RANGE_H.h
+//!DESC Debandit: Flatness Range V
 
 // The MAD field max-dilates over +-2 here (V axis); the apply pass does the
 // matching +-2 H dilation, so the snap regime is stabilized isotropically
 // against per-frame wobble at grain-region borders.
 
 vec4 hook() {
-    vec2 pt = GR_RANGE_H_pt;
-    vec2 pos = GR_RANGE_H_pos;
+    vec2 pt = DB_RANGE_H_pt;
+    vec2 pos = DB_RANGE_H_pos;
 
-    vec4 mm = GR_RANGE_H_tex(pos);
+    vec4 mm = DB_RANGE_H_tex(pos);
 
     for (int i = 1; i <= 8; i++) {
-        vec4 sp = GR_RANGE_H_tex(pos + vec2(0.0, float(i) * pt.y));
-        vec4 sn = GR_RANGE_H_tex(pos - vec2(0.0, float(i) * pt.y));
+        vec4 sp = DB_RANGE_H_tex(pos + vec2(0.0, float(i) * pt.y));
+        vec4 sn = DB_RANGE_H_tex(pos - vec2(0.0, float(i) * pt.y));
         mm.x = min(mm.x, min(sp.x, sn.x));
         mm.y = max(mm.y, max(sp.y, sn.y));
         if (i <= 2) {
@@ -913,11 +913,11 @@ vec4 hook() {
 }
 
 //!HOOK MAIN
-//!BIND GR_MED
-//!SAVE GR_RANGEC_H
-//!WIDTH GR_MED.w
-//!HEIGHT GR_MED.h
-//!DESC GradientRestore: Chroma Range H
+//!BIND DB_MED
+//!SAVE DB_RANGEC_H
+//!WIDTH DB_MED.w
+//!HEIGHT DB_MED.h
+//!DESC Debandit: Chroma Range H
 
 // =============================================================================
 // PASS 15/16 (v1.9): CHROMA FLATNESS RANGE + CHROMA NOISE FIELD
@@ -928,26 +928,26 @@ vec4 hook() {
 // flatness gate at apply. The same M.a trust mask excludes line art and
 // text; a rare equal-luma pure-chroma structure is unmasked and simply
 // closes this gate around itself (conservative, correct). Stored as
-// o * 0.5 + 0.5 so both signs survive a unorm FBO fallback (the GR_CORR
+// o * 0.5 + 0.5 so both signs survive a unorm FBO fallback (the DB_CORR
 // pattern); the V pass decodes and collapses to plain ranges.
 
-const vec3 GR_RC_W709 = vec3(0.2126, 0.7152, 0.0722);
+const vec3 DB_RC_W709 = vec3(0.2126, 0.7152, 0.0722);
 
 vec4 hook() {
-    vec2 pt = GR_MED_pt;
-    vec2 pos = GR_MED_pos;
+    vec2 pt = DB_MED_pt;
+    vec2 pos = DB_MED_pos;
 
-    vec4 center = GR_MED_tex(pos);
-    float y_c = dot(center.rgb, GR_RC_W709);
+    vec4 center = DB_MED_tex(pos);
+    float y_c = dot(center.rgb, DB_RC_W709);
     vec2 o_c = vec2(center.b - y_c, center.r - y_c);
     vec2 lo = o_c;
     vec2 hi = o_c;
 
     for (int i = 1; i <= 8; i++) {
-        vec4 tp = GR_MED_tex(pos + vec2(float(i) * pt.x, 0.0));
-        vec4 tn = GR_MED_tex(pos - vec2(float(i) * pt.x, 0.0));
-        float yp = dot(tp.rgb, GR_RC_W709);
-        float yn = dot(tn.rgb, GR_RC_W709);
+        vec4 tp = DB_MED_tex(pos + vec2(float(i) * pt.x, 0.0));
+        vec4 tn = DB_MED_tex(pos - vec2(float(i) * pt.x, 0.0));
+        float yp = dot(tp.rgb, DB_RC_W709);
+        float yn = dot(tn.rgb, DB_RC_W709);
         vec2 op = vec2(tp.b - yp, tp.r - yp);
         vec2 on = vec2(tn.b - yn, tn.r - yn);
         float wp = step(0.5, tp.a);
@@ -961,13 +961,13 @@ vec4 hook() {
 
 //!HOOK MAIN
 //!BIND HOOKED
-//!BIND GR_DS
-//!BIND GR_MED
-//!BIND GR_RANGEC_H
-//!SAVE GR_RANGEC
-//!WIDTH GR_RANGEC_H.w
-//!HEIGHT GR_RANGEC_H.h
-//!DESC GradientRestore: Chroma Range V
+//!BIND DB_DS
+//!BIND DB_MED
+//!BIND DB_RANGEC_H
+//!SAVE DB_RANGEC
+//!WIDTH DB_RANGEC_H.w
+//!HEIGHT DB_RANGEC_H.h
+//!DESC Debandit: Chroma Range V
 
 // V-axis min/max reduction, then collapse to ranges: x = o1 range,
 // y = o2 range (RGB-projected codes; the raw range can theoretically
@@ -994,47 +994,47 @@ vec4 hook() {
 // = coherence (dither self-cancels, structure survives; banding contours
 // contaminate only 1-2 samples of 5 and stay invisible). Max over axes.
 
-const vec3 GR_RCV_W709 = vec3(0.2126, 0.7152, 0.0722);
+const vec3 DB_RCV_W709 = vec3(0.2126, 0.7152, 0.0722);
 
 vec4 hook() {
-    vec2 pt = GR_RANGEC_H_pt;
-    vec2 pos = GR_RANGEC_H_pos;
+    vec2 pt = DB_RANGEC_H_pt;
+    vec2 pos = DB_RANGEC_H_pos;
 
-    vec4 mm = GR_RANGEC_H_tex(pos);
+    vec4 mm = DB_RANGEC_H_tex(pos);
     vec2 lo = mm.xz;
     vec2 hi = mm.yw;
 
     for (int i = 1; i <= 8; i++) {
-        vec4 sp = GR_RANGEC_H_tex(pos + vec2(0.0, float(i) * pt.y));
-        vec4 sn = GR_RANGEC_H_tex(pos - vec2(0.0, float(i) * pt.y));
+        vec4 sp = DB_RANGEC_H_tex(pos + vec2(0.0, float(i) * pt.y));
+        vec4 sn = DB_RANGEC_H_tex(pos - vec2(0.0, float(i) * pt.y));
         lo = min(lo, min(sp.xz, sn.xz));
         hi = max(hi, max(sp.yw, sn.yw));
     }
     // Decode the 0.5-offset affine encode: range = (hi_e - lo_e) * 2.
     vec2 rng = (hi - lo) * 2.0;
 
-    vec4 center = GR_MED_tex(GR_MED_pos);
+    vec4 center = DB_MED_tex(DB_MED_pos);
     vec2 fpt = HOOKED_pt;
     float mad_c = 0.0;
     for (int y = 0; y < 4; y++) {
         for (int x = 0; x < 4; x++) {
             vec2 off = vec2(float(x) - 1.5, float(y) - 1.5) * fpt;
             vec3 d = HOOKED_tex(HOOKED_pos + off).rgb - center.rgb;
-            vec3 d_op = d - vec3(dot(d, GR_RCV_W709));
+            vec3 d_op = d - vec3(dot(d, DB_RCV_W709));
             mad_c += max(max(abs(d_op.r), abs(d_op.g)), abs(d_op.b));
         }
     }
     mad_c *= (1.0 / 16.0);
 
-    // Chroma structure/coherence: opponent components of GR_DS (alpha IS
+    // Chroma structure/coherence: opponent components of DB_DS (alpha IS
     // its luma) vs the median field's, five V taps.
-    float y_c = dot(center.rgb, GR_RCV_W709);
+    float y_c = dot(center.rgb, DB_RCV_W709);
     vec2 o_c = vec2(center.b - y_c, center.r - y_c);
-    vec4 d0t = GR_DS_tex(GR_DS_pos - vec2(0.0, 2.0 * pt.y));
-    vec4 d1t = GR_DS_tex(GR_DS_pos - vec2(0.0, pt.y));
-    vec4 d2t = GR_DS_tex(GR_DS_pos);
-    vec4 d3t = GR_DS_tex(GR_DS_pos + vec2(0.0, pt.y));
-    vec4 d4t = GR_DS_tex(GR_DS_pos + vec2(0.0, 2.0 * pt.y));
+    vec4 d0t = DB_DS_tex(DB_DS_pos - vec2(0.0, 2.0 * pt.y));
+    vec4 d1t = DB_DS_tex(DB_DS_pos - vec2(0.0, pt.y));
+    vec4 d2t = DB_DS_tex(DB_DS_pos);
+    vec4 d3t = DB_DS_tex(DB_DS_pos + vec2(0.0, pt.y));
+    vec4 d4t = DB_DS_tex(DB_DS_pos + vec2(0.0, 2.0 * pt.y));
     vec2 s0 = vec2(d0t.b - d0t.a, d0t.r - d0t.a) - o_c;
     vec2 s1 = vec2(d1t.b - d1t.a, d1t.r - d1t.a) - o_c;
     vec2 s2 = vec2(d2t.b - d2t.a, d2t.r - d2t.a) - o_c;
@@ -1057,13 +1057,13 @@ vec4 hook() {
 
 //!HOOK MAIN
 //!BIND HOOKED
-//!BIND GR_MED
-//!BIND GR_CORR
-//!BIND GR_SCORR
-//!BIND GR_ENV
-//!BIND GR_RANGE
-//!BIND GR_RANGEC
-//!DESC GradientRestore: Apply
+//!BIND DB_MED
+//!BIND DB_CORR
+//!BIND DB_SCORR
+//!BIND DB_ENV
+//!BIND DB_RANGE
+//!BIND DB_RANGEC
+//!DESC Debandit: Apply
 
 // =============================================================================
 // PASS 17: APPLY (full resolution)
@@ -1081,8 +1081,8 @@ vec4 hook() {
 
 // One 8-bit code value in full-range [0,1] terms. Limited-range sources land
 // ~1.17x this after expansion to full — the thresholds are soft, so the
-// approximation just shifts the knee slightly; tune gr_thr, not this.
-#define GR_CODE (1.0 / 255.0)
+// approximation just shifts the knee slightly; tune db_thr, not this.
+#define DB_CODE (1.0 / 255.0)
 
 // Snap regime knees on the DILATED MAD, in code values: sigma-1 encode
 // dither dilates to ~1.1 — the LO knee sits ABOVE it so dither lands on
@@ -1090,8 +1090,8 @@ vec4 hook() {
 // MAD wobble; audit-found breathing risk at the old knee foot). Sigma-2
 // grain dilates to ~2.2, fully outside — grain untouched. The continuum
 // around sigma ~1.5 blends proportionally.
-#define GR_SNAP_MAD_LO  1.3
-#define GR_SNAP_MAD_HI  2.1
+#define DB_SNAP_MAD_LO  1.3
+#define DB_SNAP_MAD_HI  2.1
 // In DARKS the knees tighten: faint sub-code signal in dark regions is
 // far more likely deliberate texture (smoke, haze, shadow detail behind
 // transparency) than encode dither, and CelFlare never expands darks so
@@ -1099,20 +1099,20 @@ vec4 hook() {
 // (MAD well under the dark knee) keep FULL snap — dark banding is the
 // most visible kind, and this bias must not soften it. The dark HI knee
 // leaves DITHERED clean dark gradients roughly half-snapped (audit: the
-// old 1.2 floored them at ~0 with no recovery path) — gr_dither scales
+// old 1.2 floored them at ~0 with no recovery path) — db_dither scales
 // from there in both directions of taste; coherent texture is protected
 // independently by the structure and envelope gates.
-#define GR_SNAP_MAD_LO_D  0.6
-#define GR_SNAP_MAD_HI_D  1.6
+#define DB_SNAP_MAD_LO_D  0.6
+#define DB_SNAP_MAD_HI_D  1.6
 // Dark ramp in M-field luma (gamma domain): fully dark-biased below
 // ~26/255, fully bright-calibrated above ~77/255.
-#define GR_DARK_LO      0.10
-#define GR_DARK_HI      0.30
+#define DB_DARK_LO      0.10
+#define DB_DARK_HI      0.30
 // Structure-field knee (codes): kills the snap on coherent micro-texture
 // (hatching, fine pattern) whose full-res MAD mimics dither, and on
 // gradients too steep for banding to be visible. Dither reads ~0.2 here.
 // v1.11: the static knee is the CEILING of an SNR-adaptive knee (scaled
-// by gr_snr): tex_lo = ratio x local MAD, clamped to [floor, static].
+// by db_snr): tex_lo = ratio x local MAD, clamped to [floor, static].
 // Rationale: the 0.45 floor exists so 8-bit dither cannot close the
 // gate — but dither reads ~0.2 ONLY on dithered sources. On quiet
 // high-bit-depth content (10-bit BD anime, field 2026-07-10: 30-50% of
@@ -1123,29 +1123,29 @@ vec4 hook() {
 // Banding contours stay invisible to the field at ANY knee (they
 // contaminate only 1-2 of 5 median samples), so clean flats still
 // deband. The floor keeps sampling noise (~0.05) from closing it.
-#define GR_TEX_LO       0.45
-#define GR_TEX_SNR      0.4
-#define GR_TEX_LO_MIN   0.18
-// Snap authority = GR_SNAP_REACH * gr_thr + local MAD, in code values:
+#define DB_TEX_LO       0.45
+#define DB_TEX_SNR      0.4
+#define DB_TEX_LO_MIN   0.18
+// Snap authority = DB_SNAP_REACH * db_thr + local MAD, in code values:
 // enough to flatten a half-step quantization offset (0.75 codes at the
-// default gr_thr = 2) PLUS the measured local noise (so an open snap can
+// default db_thr = 2) PLUS the measured local noise (so an open snap can
 // always finish absorbing the dither instead of stalling half-way), while
 // staying physically unable to erase structure beyond sub-step scale plus
-// noise. Scales with gr_thr so the brutal-source knob raises real reach.
-#define GR_SNAP_REACH   0.375
+// noise. Scales with db_thr so the brutal-source knob raises real reach.
+#define DB_SNAP_REACH   0.375
 // Never darken where the plateau field sits AT the signal ceiling — a
 // clipped region gets expansion gradation downstream (CelFlare rule #1),
 // not attenuation here. Deliberately tight (engages only above ~247/255):
 // near-white banded skies below that need both correction signs.
-#define GR_CLIP_LO      0.97
-#define GR_CLIP_HI      0.995
+#define DB_CLIP_LO      0.97
+#define DB_CLIP_HI      0.995
 // ---- v1.9 chroma path ----
 // Chroma quantities live in RGB-PROJECTED units: one YCbCr chroma code
 // spans ~2.11 RGB codes on its dominant axis (255/224 * 1.8556 for Cb->B;
 // Cr->R is 1.79 — the max is used so both axes gate TIGHT, never loose),
-// so every chroma knee/reach derives from gr_thr * this gain — gr_thr
+// so every chroma knee/reach derives from db_thr * this gain — db_thr
 // keeps its "step ceiling in source-plane codes" meaning on both paths.
-#define GR_CTHR_GAIN    2.11
+#define DB_CTHR_GAIN    2.11
 // Chroma snap knees on the plus-dilated opponent MAD, in RGB codes. The
 // opponent projection already cancels Y-plane dither exactly, so what
 // remains is chroma-plane noise and the chroma contours themselves: a
@@ -1159,64 +1159,64 @@ vec4 hook() {
 // Y-dither is already projected out, faint dark chroma texture is rare,
 // and dark chroma banding (night scenes) is the motivating case and must
 // keep full snap.
-#define GR_SNAP_MAD_LO_C  1.2
-#define GR_SNAP_MAD_HI_C  2.0
+#define DB_SNAP_MAD_LO_C  1.2
+#define DB_SNAP_MAD_HI_C  2.0
 
 vec4 hook() {
     vec4 orig = HOOKED_tex(HOOKED_pos);
 
-    vec4 M = GR_MED_tex(GR_MED_pos);
+    vec4 M = DB_MED_tex(DB_MED_pos);
 
     // 5-tap tent over the range/noise fields: softens gate transitions AND
     // completes the +-2 texel MAD dilation isotropically (V half in PASS 9).
-    vec2 rpt = GR_RANGE_pt;
-    vec4 mm  = GR_RANGE_tex(GR_RANGE_pos);
-    vec4 mmL = GR_RANGE_tex(GR_RANGE_pos - vec2(2.0 * rpt.x, 0.0));
-    vec4 mmR = GR_RANGE_tex(GR_RANGE_pos + vec2(2.0 * rpt.x, 0.0));
-    vec4 mmU = GR_RANGE_tex(GR_RANGE_pos - vec2(0.0, 2.0 * rpt.y));
-    vec4 mmD = GR_RANGE_tex(GR_RANGE_pos + vec2(0.0, 2.0 * rpt.y));
+    vec2 rpt = DB_RANGE_pt;
+    vec4 mm  = DB_RANGE_tex(DB_RANGE_pos);
+    vec4 mmL = DB_RANGE_tex(DB_RANGE_pos - vec2(2.0 * rpt.x, 0.0));
+    vec4 mmR = DB_RANGE_tex(DB_RANGE_pos + vec2(2.0 * rpt.x, 0.0));
+    vec4 mmU = DB_RANGE_tex(DB_RANGE_pos - vec2(0.0, 2.0 * rpt.y));
+    vec4 mmD = DB_RANGE_tex(DB_RANGE_pos + vec2(0.0, 2.0 * rpt.y));
     float range_soft = (mm.y - mm.x) * 0.4
                      + ((mmL.y - mmL.x) + (mmR.y - mmR.x)
                      +  (mmU.y - mmU.x) + (mmD.y - mmD.x)) * 0.15;
     // +-1 taps close the H-dilation gap (audit: {-2,0,+2} alone skips a MAD
     // spike one texel away; the V pass covers +-2 gaplessly on its axis).
-    float mad1 = max(max(GR_RANGE_tex(GR_RANGE_pos - vec2(rpt.x, 0.0)).z,
-                         GR_RANGE_tex(GR_RANGE_pos + vec2(rpt.x, 0.0)).z),
-                     max(GR_RANGE_tex(GR_RANGE_pos - vec2(0.0, rpt.y)).z,
-                         GR_RANGE_tex(GR_RANGE_pos + vec2(0.0, rpt.y)).z));
+    float mad1 = max(max(DB_RANGE_tex(DB_RANGE_pos - vec2(rpt.x, 0.0)).z,
+                         DB_RANGE_tex(DB_RANGE_pos + vec2(rpt.x, 0.0)).z),
+                     max(DB_RANGE_tex(DB_RANGE_pos - vec2(0.0, rpt.y)).z,
+                         DB_RANGE_tex(DB_RANGE_pos + vec2(0.0, rpt.y)).z));
     float mad_codes = max(max(mm.z, mad1),
-                          max(max(mmL.z, mmR.z), max(mmU.z, mmD.z))) / GR_CODE;
-    float tex_codes = (mm.w + mmL.w + mmR.w + mmU.w + mmD.w) * 0.2 / GR_CODE;
+                          max(max(mmL.z, mmR.z), max(mmU.z, mmD.z))) / DB_CODE;
+    float tex_codes = (mm.w + mmL.w + mmR.w + mmU.w + mmD.w) * 0.2 / DB_CODE;
 
     // Chroma range/noise fields, same tent geometry; the MAD max adds the
     // +-1 diagonals (13 taps total) so an isolated diagonal chroma-grain
     // filament cannot thread between the plus arms and breathe the snap
     // (v1.9 audit F5) — still short of the luma path's full 5x5, see the
     // Chroma Range V note.
-    vec2 cpt = GR_RANGEC_pt;
-    vec4 cc  = GR_RANGEC_tex(GR_RANGEC_pos);
-    vec4 ccL = GR_RANGEC_tex(GR_RANGEC_pos - vec2(2.0 * cpt.x, 0.0));
-    vec4 ccR = GR_RANGEC_tex(GR_RANGEC_pos + vec2(2.0 * cpt.x, 0.0));
-    vec4 ccU = GR_RANGEC_tex(GR_RANGEC_pos - vec2(0.0, 2.0 * cpt.y));
-    vec4 ccD = GR_RANGEC_tex(GR_RANGEC_pos + vec2(0.0, 2.0 * cpt.y));
+    vec2 cpt = DB_RANGEC_pt;
+    vec4 cc  = DB_RANGEC_tex(DB_RANGEC_pos);
+    vec4 ccL = DB_RANGEC_tex(DB_RANGEC_pos - vec2(2.0 * cpt.x, 0.0));
+    vec4 ccR = DB_RANGEC_tex(DB_RANGEC_pos + vec2(2.0 * cpt.x, 0.0));
+    vec4 ccU = DB_RANGEC_tex(DB_RANGEC_pos - vec2(0.0, 2.0 * cpt.y));
+    vec4 ccD = DB_RANGEC_tex(DB_RANGEC_pos + vec2(0.0, 2.0 * cpt.y));
     vec2 rangec_soft = cc.xy * 0.4
                      + (ccL.xy + ccR.xy + ccU.xy + ccD.xy) * 0.15;
-    float madc1 = max(max(GR_RANGEC_tex(GR_RANGEC_pos - vec2(cpt.x, 0.0)).z,
-                          GR_RANGEC_tex(GR_RANGEC_pos + vec2(cpt.x, 0.0)).z),
-                      max(GR_RANGEC_tex(GR_RANGEC_pos - vec2(0.0, cpt.y)).z,
-                          GR_RANGEC_tex(GR_RANGEC_pos + vec2(0.0, cpt.y)).z));
-    float madc2 = max(max(GR_RANGEC_tex(GR_RANGEC_pos + vec2( cpt.x,  cpt.y)).z,
-                          GR_RANGEC_tex(GR_RANGEC_pos + vec2( cpt.x, -cpt.y)).z),
-                      max(GR_RANGEC_tex(GR_RANGEC_pos + vec2(-cpt.x,  cpt.y)).z,
-                          GR_RANGEC_tex(GR_RANGEC_pos + vec2(-cpt.x, -cpt.y)).z));
+    float madc1 = max(max(DB_RANGEC_tex(DB_RANGEC_pos - vec2(cpt.x, 0.0)).z,
+                          DB_RANGEC_tex(DB_RANGEC_pos + vec2(cpt.x, 0.0)).z),
+                      max(DB_RANGEC_tex(DB_RANGEC_pos - vec2(0.0, cpt.y)).z,
+                          DB_RANGEC_tex(DB_RANGEC_pos + vec2(0.0, cpt.y)).z));
+    float madc2 = max(max(DB_RANGEC_tex(DB_RANGEC_pos + vec2( cpt.x,  cpt.y)).z,
+                          DB_RANGEC_tex(DB_RANGEC_pos + vec2( cpt.x, -cpt.y)).z),
+                      max(DB_RANGEC_tex(DB_RANGEC_pos + vec2(-cpt.x,  cpt.y)).z,
+                          DB_RANGEC_tex(DB_RANGEC_pos + vec2(-cpt.x, -cpt.y)).z));
     float madc_codes = max(max(cc.z, max(madc1, madc2)),
-                           max(max(ccL.z, ccR.z), max(ccU.z, ccD.z))) / GR_CODE;
-    float texc_codes = (cc.w + ccL.w + ccR.w + ccU.w + ccD.w) * 0.2 / GR_CODE;
+                           max(max(ccL.z, ccR.z), max(ccU.z, ccD.z))) / DB_CODE;
+    float texc_codes = (cc.w + ccL.w + ccR.w + ccU.w + ccD.w) * 0.2 / DB_CODE;
 
     // The complete LF corrections, precomputed at 1/4 res: wide (sigma 48)
     // and short (sigma 12) refits, c = S_refit - M each.
-    vec3 c  = GR_CORR_tex(GR_CORR_pos).rgb - vec3(0.5);
-    vec3 cs = GR_SCORR_tex(GR_SCORR_pos).rgb - vec3(0.5);
+    vec3 c  = DB_CORR_tex(DB_CORR_pos).rgb - vec3(0.5);
+    vec3 cs = DB_SCORR_tex(DB_SCORR_pos).rgb - vec3(0.5);
 
     // ---- v1.10 multi-scale blend, per axis ----
     // Envelope validities of each scale (the envelope IS the gate 4
@@ -1225,12 +1225,12 @@ vec4 hook() {
     // ~6, so blending toward the short refit where only IT is valid
     // shrinks the unfixable collar from ~130px to ~55px. Wide is
     // preferred wherever valid (it spans the plateaus the short one
-    // cannot). gr_ms = 0 collapses every blend to the wide field: exact
-    // v1.9 behavior (and with gr_chroma = 0, exact v1.8).
-    float cthr = gr_thr * GR_CTHR_GAIN;
-    vec4 env_codes = GR_ENV_tex(GR_ENV_pos) / GR_CODE;
-    float v_Ly = 1.0 - smoothstep(0.5 * gr_thr, gr_thr, env_codes.x);
-    float v_Sy = 1.0 - smoothstep(0.5 * gr_thr, gr_thr, env_codes.z);
+    // cannot). db_ms = 0 collapses every blend to the wide field: exact
+    // v1.9 behavior (and with db_chroma = 0, exact v1.8).
+    float cthr = db_thr * DB_CTHR_GAIN;
+    vec4 env_codes = DB_ENV_tex(DB_ENV_pos) / DB_CODE;
+    float v_Ly = 1.0 - smoothstep(0.5 * db_thr, db_thr, env_codes.x);
+    float v_Sy = 1.0 - smoothstep(0.5 * db_thr, db_thr, env_codes.z);
     float v_Lc = 1.0 - smoothstep(0.5 * cthr, cthr, env_codes.y);
     float v_Sc = 1.0 - smoothstep(0.5 * cthr, cthr, env_codes.w);
 
@@ -1248,33 +1248,33 @@ vec4 hook() {
     // kills it, exactly as v1.9 did.
     float pref_Sy = (1.0 - v_Ly) * v_Sy;
     float pref_Sc = (1.0 - v_Lc) * v_Sc;
-    float cy_eff  = mix(cy_L,  cy_S,  pref_Sy * gr_ms);
-    vec3 cop_eff  = mix(cop_L, cop_S, pref_Sc * gr_ms);
+    float cy_eff  = mix(cy_L,  cy_S,  pref_Sy * db_ms);
+    vec3 cop_eff  = mix(cop_L, cop_S, pref_Sc * db_ms);
     vec3 c_eff    = vec3(cy_eff) + cop_eff;
 
     // Gate 1: correction amplitude, max across channels so a big miss in any
     // channel kills the whole correction (no per-channel hue twist). The
-    // knee is HALF of gr_thr: gr_thr is a STEP-size ceiling, and the true
+    // knee is HALF of db_thr: db_thr is a STEP-size ceiling, and the true
     // correction for a staircase never exceeds ~half the step — anything
     // larger is remote-structure bias or mid-scale curvature the refit
-    // could not cancel (field-found: the 2*gr_thr knee passed 1.5-2.5-code
+    // could not cancel (field-found: the 2*db_thr knee passed 1.5-2.5-code
     // pseudo-corrections on murky large-amplitude soft structure).
-    float c_codes = max(max(abs(c_eff.r), abs(c_eff.g)), abs(c_eff.b)) / GR_CODE;
-    float w_amp = 1.0 - smoothstep(0.5 * gr_thr, gr_thr, c_codes);
+    float c_codes = max(max(abs(c_eff.r), abs(c_eff.g)), abs(c_eff.b)) / DB_CODE;
+    float w_amp = 1.0 - smoothstep(0.5 * db_thr, db_thr, c_codes);
 
     // Gate 2: local flatness — median-field luma range over +-32px.
-    float range_codes = range_soft / GR_CODE;
-    float w_flat = 1.0 - smoothstep(gr_flat, 2.0 * gr_flat, range_codes);
+    float range_codes = range_soft / DB_CODE;
+    float w_flat = 1.0 - smoothstep(db_flat, 2.0 * db_flat, range_codes);
 
     // Gate 3: structure — med5's mean-bias field; where the median field
     // is not a valid ramp estimate (dense micro-texture), apply nothing.
     // v1.11: SNR-adaptive knee (see the define block) — tightens toward
     // the measured noise floor on quiet sources so faint coherent
     // texture is protected from snap absorption; clamps to the static
-    // knee on dithered content (bit-identical there at any gr_snr).
-    float tex_lo = mix(GR_TEX_LO,
-                       clamp(GR_TEX_SNR * mad_codes, GR_TEX_LO_MIN, GR_TEX_LO),
-                       gr_snr);
+    // knee on dithered content (bit-identical there at any db_snr).
+    float tex_lo = mix(DB_TEX_LO,
+                       clamp(DB_TEX_SNR * mad_codes, DB_TEX_LO_MIN, DB_TEX_LO),
+                       db_snr);
     float w_tex = 1.0 - smoothstep(tex_lo, 2.0 * tex_lo, tex_codes);
 
     // Gate 4: contamination envelope — if any point within +-32px needs a
@@ -1283,31 +1283,31 @@ vec4 hook() {
     // validity of the field ACTUALLY BLENDED, mix(v_L, v_S, pref_S) — a
     // plain max(v_L, v_S) over-reports confidence in the graduated
     // mid-zone where c_eff is still mostly the less-trusted wide field
-    // (v1.10 audits, both passes). At gr_ms = 0 it degenerates to the
+    // (v1.10 audits, both passes). At db_ms = 0 it degenerates to the
     // wide validity alone.
-    float w_env = mix(v_Ly, mix(v_Ly, v_Sy, pref_Sy), gr_ms);
+    float w_env = mix(v_Ly, mix(v_Ly, v_Sy, pref_Sy), db_ms);
 
-    float w = w_amp * w_flat * w_tex * w_env * gr_strength;
+    float w = w_amp * w_flat * w_tex * w_env * db_strength;
 
     // ---- v1.9 chroma path: opponent decomposition ----
     // The luma-path component rides every gate above exactly as v1.8
     // applied the full c (the amplitude gate stays max-channel: when c is
     // luma-dominated that is the v1.8 conservatism, and when it is
     // chroma-dominated the luma part is ~0 anyway). The opponent part
-    // gets chroma-native gates in chroma units (gr_thr x GR_CTHR_GAIN).
-    // gr_chroma MIGRATES the opponent component between the paths: at 0
+    // gets chroma-native gates in chroma units (db_thr x DB_CTHR_GAIN).
+    // db_chroma MIGRATES the opponent component between the paths: at 0
     // it rides the luma path exactly as v1.8 routed it (bit-exact
     // fallback), at 1 it is gated purely by its own fields.
     vec3 c_op = cop_eff;
-    vec3 c_lp = vec3(cy_eff) + c_op * (1.0 - gr_chroma);
+    vec3 c_lp = vec3(cy_eff) + c_op * (1.0 - db_chroma);
 
     // Chroma gate 1: amplitude — a staircase correction never exceeds
     // ~half the step, in the chroma step's own units.
-    float cop_codes = max(max(abs(c_op.r), abs(c_op.g)), abs(c_op.b)) / GR_CODE;
+    float cop_codes = max(max(abs(c_op.r), abs(c_op.g)), abs(c_op.b)) / DB_CODE;
     float w_amp_c = 1.0 - smoothstep(0.5 * cthr, cthr, cop_codes);
     // Chroma gate 2: opponent-axis flatness over +-32px.
-    float rangec_codes = max(rangec_soft.x, rangec_soft.y) / GR_CODE;
-    float w_flat_c = 1.0 - smoothstep(gr_flat_c, 2.0 * gr_flat_c, rangec_codes);
+    float rangec_codes = max(rangec_soft.x, rangec_soft.y) / DB_CODE;
+    float w_flat_c = 1.0 - smoothstep(db_flat_c, 2.0 * db_flat_c, rangec_codes);
     // Chroma gate 3: structure, two layers. The shared luma term (w_tex)
     // covers med5-invalidity — where the median is not a valid ramp
     // estimate, no field derived from M is, chroma included. The chroma
@@ -1321,27 +1321,27 @@ vec4 hook() {
     // halves at the luma floor, while the 10-bit texture-retention win is
     // entirely luma-driven (retention identical with or without chroma
     // adaptation). Weak upside, concrete downside: static knee stays.
-    float w_texc = 1.0 - smoothstep(GR_TEX_LO, 2.0 * GR_TEX_LO, texc_codes);
+    float w_texc = 1.0 - smoothstep(DB_TEX_LO, 2.0 * DB_TEX_LO, texc_codes);
     // Chroma gate 4: chroma contamination envelope, blend-weighted like
     // gate 4 above.
-    float w_env_c = mix(v_Lc, mix(v_Lc, v_Sc, pref_Sc), gr_ms);
+    float w_env_c = mix(v_Lc, mix(v_Lc, v_Sc, pref_Sc), db_ms);
 
     float w_c = w_amp_c * w_flat_c * w_tex * w_texc * w_env_c
-              * gr_strength * gr_chroma;
+              * db_strength * db_chroma;
 
     // Regime blend: clean gradients snap to the ramp itself (removes the
     // contour, absorbs the dither that masked it); grained regions take the
     // LF-only correction (grain rides through bit-exact).
     float lum = dot(M.rgb, vec3(0.2126, 0.7152, 0.0722));
-    float dark_w = 1.0 - smoothstep(GR_DARK_LO, GR_DARK_HI, lum);
-    float mad_lo = mix(GR_SNAP_MAD_LO, GR_SNAP_MAD_LO_D, dark_w);
-    float mad_hi = mix(GR_SNAP_MAD_HI, GR_SNAP_MAD_HI_D, dark_w);
-    float snap = (1.0 - smoothstep(mad_lo, mad_hi, mad_codes)) * gr_dither;
+    float dark_w = 1.0 - smoothstep(DB_DARK_LO, DB_DARK_HI, lum);
+    float mad_lo = mix(DB_SNAP_MAD_LO, DB_SNAP_MAD_LO_D, dark_w);
+    float mad_hi = mix(DB_SNAP_MAD_HI, DB_SNAP_MAD_HI_D, dark_w);
+    float snap = (1.0 - smoothstep(mad_lo, mad_hi, mad_codes)) * db_dither;
     // Chroma snap: keyed to the OPPONENT MAD (Y-plane dither projected
-    // out), flat knees — see the define block. gr_dither scales both
+    // out), flat knees — see the define block. db_dither scales both
     // regimes: it is the one taste knob for contour-vs-texture.
-    float snap_c = (1.0 - smoothstep(GR_SNAP_MAD_LO_C, GR_SNAP_MAD_HI_C,
-                                     madc_codes)) * gr_dither;
+    float snap_c = (1.0 - smoothstep(DB_SNAP_MAD_LO_C, DB_SNAP_MAD_HI_C,
+                                     madc_codes)) * db_dither;
     // The +MAD authority exists to finish absorbing dither; grant it only in
     // proportion to dither-confidence (snap), or blend-zone texture (fine
     // hatching, weak grain) gets pulled ~1 code toward the refit.
@@ -1350,8 +1350,8 @@ vec4 hook() {
     // own absorption — amplitude fields cannot make this distinction.
     // DC-coherence and structure-tensor discriminators were also built
     // and reverted this session: see CHANGELOG v1.11 before retrying.)
-    float auth   = (GR_SNAP_REACH * gr_thr + mad_codes * snap) * GR_CODE;
-    float auth_c = (GR_SNAP_REACH * cthr + madc_codes * snap_c) * GR_CODE;
+    float auth   = (DB_SNAP_REACH * db_thr + mad_codes * snap) * DB_CODE;
+    float auth_c = (DB_SNAP_REACH * cthr + madc_codes * snap_c) * DB_CODE;
     // Snap target reconstructed as c_eff + M (= the blended S_refit): the
     // stored M's quantization cancels between this M and the -M inside
     // each c. The total pull t is decomposed BEFORE clamping so each axis
@@ -1360,7 +1360,7 @@ vec4 hook() {
     vec3 t = c_eff + M.rgb - orig.rgb;
     vec3 t_y  = vec3(dot(t, vec3(0.2126, 0.7152, 0.0722)));
     vec3 t_op = t - t_y;
-    vec3 t_lp = t_y + t_op * (1.0 - gr_chroma);
+    vec3 t_lp = t_y + t_op * (1.0 - db_chroma);
     vec3 r_lp = clamp(t_lp, vec3(-auth),   vec3(auth));
     vec3 r_op = clamp(t_op, vec3(-auth_c), vec3(auth_c));
     vec3 corr_l = mix(c_lp, r_lp, snap) * w;
@@ -1372,19 +1372,19 @@ vec4 hook() {
     // plateau — but a per-channel max() on a signed opponent vector clamps
     // its negative channels, injecting luma and twisting hue exactly on
     // near-clip colored banding, which CelFlare then expands. At
-    // gr_chroma = 0 the opponent component rides corr_l and receives the
+    // db_chroma = 0 the opponent component rides corr_l and receives the
     // v1.8 per-channel guard verbatim.
-    float clip_w = smoothstep(GR_CLIP_LO, GR_CLIP_HI, lum);
+    float clip_w = smoothstep(DB_CLIP_LO, DB_CLIP_HI, lum);
     corr_l = mix(corr_l, max(corr_l, vec3(0.0)), clip_w);
     vec3 corr = corr_l + corr_c;
 
-#if gr_debug == 1
+#if db_debug == 1
     return orig;
-#elif gr_debug == 2
+#elif db_debug == 2
     return vec4(vec3(0.5) + corr * 32.0, 1.0);
-#elif gr_debug == 3
+#elif db_debug == 3
     return vec4(1.0 - w_flat, w, snap, 1.0);
-#elif gr_debug == 4
+#elif db_debug == 4
     return vec4(1.0 - w_flat_c, w_c, snap_c, 1.0);
 #else
     return vec4(orig.rgb + corr, orig.a);

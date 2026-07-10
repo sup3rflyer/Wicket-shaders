@@ -55,6 +55,19 @@
 //                    grain (1 = fresh grain every source frame / "on ones", the
 //                    default; 0.5 = every 2nd source frame / "on twos"). Seeded
 //                    from m_gen_frame so it's display-refresh independent.
+//   grain_gen_rate   field REGENERATION cadence as a fraction of grain_rate ticks.
+//                    0.5 (default) / 0.25 = regenerate every 2nd / 4th tick and
+//                    present a randomized toroidal shift+flip of the standing
+//                    field on the others — statistically fresh grain at
+//                    ~half/quarter generation cost; 1 = regenerate every tick
+//                    (exact pre-feature behavior). 0.25 is the practical
+//                    minimum: steady-state character steps stay masked by the
+//                    reseed; below it the savings asymptote while slow
+//                    grain-regime crossfades start stepping. Amplitude/tone
+//                    keying stays per-frame at any rate, warming/fast-EMA
+//                    frames always regenerate at full rate, and a confident
+//                    hard cut regenerates in place, so the measured grain
+//                    character never goes stale across a cut.
 //   grain_base_sat   per-channel independence of the BASE grain (the baked-in hue
 //                    speckle). 0.25 = calibrated look; 0 = true mono. NB the RMS
 //                    bookkeeping (value_warp / chroma_amp scaling) assumes 0.25, so
@@ -149,6 +162,13 @@
 //!MINIMUM 0.1
 //!MAXIMUM 1.0
 1.0
+
+//!PARAM grain_gen_rate
+//!DESC Field regeneration cadence as a fraction of grain_rate ticks: 1 = regenerate every tick (exact pre-feature behavior), 0.5 (default) / 0.25 = regenerate every 2nd / 4th tick and present a randomized toroidal shift+flip of the standing field on the others (statistically fresh, ~half/quarter generation cost). 0.25 is the practical minimum (character steps stay masked); a confident hard cut always regenerates in place.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.1
+//!MAXIMUM 1.0
+0.5
 
 //!PARAM grain_base_sat
 //!TYPE DYNAMIC float
@@ -264,6 +284,8 @@
 //!VAR float m_eff_steep
 //!VAR float m_conf
 //!VAR float m_shape_w
+//!VAR float m_regen
+//!VAR float m_field_seed
 //!VAR float prev_grid[9216]
 //!VAR float prev_grid_off[9216]
 //!STORAGE
@@ -393,7 +415,7 @@
 #define ALPHA_FAST    0.20
 #define ALPHA_MISSING 0.35
 #define CUT_REREADY   8.0
-#define STATE_MAGIC   0.5567819
+#define STATE_MAGIC   0.5577819
 
 #define STEEP_MIN     0.6
 #define STEEP_MAX     9.0
@@ -628,6 +650,7 @@ void hook() {
             m_gen_frame = 0.0;
             m_eff_render = 0.0; m_eff_mid = MID_FLOOR; m_eff_steep = STEEP_FLOOR;
             m_conf = 0.0; m_shape_w = 0.0;
+            m_regen = 1.0; m_field_seed = 0.0;
             for (int b = 0; b < NBINS; b++) {
                 hist_amp[b] = 0.0; hist_temporal[b] = 0.0; hist_spatial[b] = 0.0;
                 hist_held[b] = 0.0;
@@ -673,6 +696,45 @@ void hook() {
             bool hard_cut = sat_frac > hardcut_frac;
             if (hard_cut) m_measured = min(m_measured, CUT_REREADY);
             bool content_held = content_total > 0.0 && content_mean_abs < CONTENT_HELD_EPS;
+            // FIELD REGEN decision (single thread here -> race-free; the gen pass
+            // consumes m_regen next dispatch, the composite m_field_seed). A
+            // visible tick regenerates only every 1/grain_gen_rate ticks; skipped
+            // ticks are presented as a randomized toroidal shift+flip of the
+            // standing field by the composite (see the recycle transform there).
+            // m_field_seed = the visible seed the field was generated AT: the gen
+            // pass seeds its noise from it (so a hard-cut regen refreshes the
+            // measured character while HOLDING the standing pattern), and the
+            // composite derives the recycle transform from vseed - m_field_seed
+            // (0 = identity = bit-exact prior behavior). hard_cut (the confident
+            // regime-change detector above) forces the in-place regen so the
+            // baked grain character can never go stale across a cut. And any
+            // frame that advances a FAST-phase EMA regenerates at full rate:
+            // the field-baked character (size law, soften, bandpass fire) moves
+            // ALPHA_FAST ~20% on such a frame, and a recycled multi-tick step
+            // would land several of those moves in one visible hit. Two fast
+            // windows exist, each guarded AT the gate that actually advances
+            // its EMAs: here, the held-cel histogram (content_held && !cut
+            // advances m_held_count and hist_held -> grain_presence -> the
+            // baked gs_fire) while m_held_count < 8; the main shape/amplitude
+            // warming test (m_measured < 32) lives in the second reducer block
+            // below, inside its real update_ok && valid_bins gate — NOT here,
+            // and NOT keyed on the held/cut locals: m_measured only advances
+            // when the shape histogram has >= 2 valid bins, so a flat/degenerate
+            // source keeps m_measured pinned forever while its EMAs are equally
+            // pinned — recycling there is exact, and gating on a mirror of the
+            // wrong condition held the door open forever (found empirically on
+            // the flat-gray harness source). Frames that advance NO EMA cannot
+            // move the baked character at all; settled ALPHA_SLOW drift steps
+            // ~3% per skipped tick through a pow-law map, masked by the pattern
+            // reseed it always coincides with.
+            float vseed = floor(m_gen_frame * grain_rate);
+            float vprev = floor(max(m_gen_frame - 1.0, 0.0) * grain_rate);
+            bool vtick = vseed != vprev;
+            bool ema_fast = content_held && !cut && m_held_count < 8.0;
+            bool regen_tick = floor(vseed * grain_gen_rate) != floor(vprev * grain_gen_rate)
+                              || ema_fast;
+            m_regen = ((vtick && regen_tick) || hard_cut) ? 1.0 : 0.0;
+            if (vtick && regen_tick) m_field_seed = vseed;
             s_update_prev_grid = (!held || no_flat || cut) ? 1u : 0u;
             if (held && !no_flat && !cut) {
                 m_held_frames += 1.0;
@@ -1137,6 +1199,24 @@ void hook() {
                 m_steepness = mix(m_steepness, steep, alpha);
                 m_intensity_raw = mix(m_intensity_raw, irraw, int_alpha);
             }
+            // FIELD REGEN warming override (see the decision in the first
+            // reducer block above). THIS branch is what actually advances
+            // m_measured and the shape/amplitude EMAs (update_ok &&
+            // valid_bins >= 2), so the ALPHA_FAST warming test lives here:
+            // while m_measured < 32 (covers the < 8 snap phase too), any
+            // frame that moves those EMAs forces a full regen so the
+            // field-baked character tracks per-frame. Same thread as the
+            // decision above -> plain program-order override, consumed by
+            // the gen pass after this dispatch completes. On a non-tick
+            // frame (grain_rate < 1) m_field_seed deliberately stays put:
+            // the regen re-bakes IN PLACE (same seed -> same pattern,
+            // freshly measured character), the hard-cut semantics.
+            if (m_measured < 32.0) {
+                m_regen = 1.0;
+                float ov_vseed = floor(m_gen_frame * grain_rate);
+                if (ov_vseed != floor(max(m_gen_frame - 1.0, 0.0) * grain_rate))
+                    m_field_seed = ov_vseed;
+            }
             m_measured += 1.0;
         }
     }
@@ -1473,7 +1553,41 @@ void hook() {
     // ("on ones", the tuned look); 0.5 = on twos. The measured distinct
     // counter is retained for held-grain-cadence detection (twos/threes),
     // deferred until source-grain cadence is measured directly.
-    uint frame_seed = uint(max(0.0, floor(m_gen_frame * grain_rate)));
+    // Seed value = m_field_seed, the visible-tick seed the measure pass pinned
+    // for this field (equals floor(m_gen_frame * grain_rate) on every regular
+    // regen tick, so at grain_gen_rate 1.0 this is the exact prior seed
+    // sequence). On a hard-cut forced regen it deliberately KEEPS the standing
+    // tick's seed: same noise pattern, freshly measured character.
+    uint frame_seed = uint(max(0.0, m_field_seed));
+
+    // Composite-side scalars, computed ONCE here (uniform math over
+    // GRAIN_STATE + params) and passed through the state buffer so the
+    // two translation units can't drift on duplicated defines. Written
+    // by a single thread; the composite dispatch reads them after this
+    // pass completes. Written BEFORE the regen gate below so amplitude/
+    // tone keying stays fresh on every source frame even while the field
+    // itself is held (grain_gen_rate < 1).
+    if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u) {
+        m_eff_render = eff_render;
+        m_eff_mid    = eff_mid;
+        m_eff_steep  = eff_steep;
+        m_conf       = conf;
+        m_shape_w    = shape_w;
+        // The SAVE'd trigger target only exists to size the dispatch and is
+        // never bound; write it from ONE invocation so we don't pay a second
+        // full-4K store.
+        imageStore(out_image, ivec2(0), vec4(0.0));
+    }
+
+    // FIELD REGEN GATE (grain_gen_rate). m_regen is a single SSBO value decided
+    // by the measure pass, identical for every invocation of this dispatch, so
+    // this is UNIFORM control flow — returning before the barriered generation
+    // below is legal (each workgroup's invocations all take the same branch).
+    // On skip frames the persistent GRAIN_FIELD keeps its last-generated
+    // content and the composite presents it through the per-tick recycle
+    // transform; only the scalar block above needed to run.
+    if (m_regen < 0.5)
+        return;
 
     // GRAIN SIZE/SHARPNESS + OPERATING POINT (re-anchored 2026-06-03, grain-stock
     // calibration). The generator MODEL is fine: tested against real 4K film plates,
@@ -1782,18 +1896,8 @@ void hook() {
     // Final field store. rgb = the finished signed grain (bandpass + warp +
     // chroma); a = the pre-warp LOWPASS grain's luma so the debug A/B strips
     // can still show lowpass-vs-bandpass without a second saved texture.
-    if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u) {
-        // Composite-side scalars, computed ONCE here (uniform math over
-        // GRAIN_STATE + params) and passed through the state buffer so the
-        // two translation units can't drift on duplicated defines. Written
-        // by a single thread; the composite dispatch reads them after this
-        // pass completes.
-        m_eff_render = eff_render;
-        m_eff_mid    = eff_mid;
-        m_eff_steep  = eff_steep;
-        m_conf       = conf;
-        m_shape_w    = shape_w;
-    }
+    // (The composite-side scalars + the dispatch-trigger write moved above the
+    // regen gate — they must run on every source frame, this store must not.)
     float lowpass_luma = dot(vec3(vsum1_r, vsum1_g, vsum1_b), luma_coeff);
     // Write the finished field into the PERSISTENT storage texture (survives across
     // presents). The 4K trigger dispatch rounds 2160 up to 2176 rows (COMPUTE 32),
@@ -1803,10 +1907,6 @@ void hook() {
     ivec2 gpos = ivec2(gl_GlobalInvocationID.xy);
     if (all(lessThan(gpos, imageSize(GRAIN_FIELD))))
         imageStore(GRAIN_FIELD, gpos, vec4(vsum_r, vsum_g, vsum_b, lowpass_luma));
-    // The SAVE'd trigger target only exists to size the dispatch and is never bound;
-    // write it from ONE invocation so we don't pay a second full-4K store.
-    if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u)
-        imageStore(out_image, ivec2(0), vec4(0.0));
 }
 
 //!HOOK OUTPUT
@@ -1868,6 +1968,14 @@ vec4 grain_point(vec2 fpos, ivec2 g) {
     return imageLoad(GRAIN_FIELD, a);
 }
 
+// Same PCG as the measure/gen units — the recycle transform below needs a few
+// decorrelated words per visible tick.
+uint pcg_hash(uint s) {
+    uint state = s * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
 void hook() {
     vec4 color = HOOKED_tex(HOOKED_pos);
 
@@ -1885,6 +1993,33 @@ void hook() {
     ivec2 gsize = imageSize(GRAIN_FIELD);
     float gscale = float(gsize.y) / max(HOOKED_size.y, 1.0);
     vec2 fpos = (vec2(gid) + 0.5) * gscale;
+    // FIELD RECYCLE TRANSFORM (grain_gen_rate < 1). On visible ticks the gen
+    // pass skipped, present a per-tick randomized toroidal shift + flip of the
+    // standing field: offsets are hashed independently per tick (no coherent
+    // drift, so nothing can read as motion/swimming) and displace uniformly
+    // over the whole grid — far beyond the grain correlation length — so the
+    // per-pixel frame-to-frame correlation is ~0, i.e. statistically fresh
+    // grain for the cost of a few ALU ops. Flips kill any large-scale texture
+    // familiarity; 90-degree rotations are excluded (the grid is not square).
+    // The float mod() keeps the flip input in [0,grid) so the wrap in
+    // grain_point never sees a negative coordinate (int % is undefined on
+    // negatives); flipping about the grid extent maps texel centres to texel
+    // centres and offsets are whole texels, so the gscale==1.0 exact-texel
+    // property survives the transform. sub == 0 — every tick at the default
+    // grain_gen_rate 1.0, and every regen tick otherwise — is the identity:
+    // bit-identical to prior behavior.
+    float vseed = floor(m_gen_frame * grain_rate);
+    float sub = vseed - m_field_seed;
+    if (sub > 0.5) {
+        uint h1 = pcg_hash(uint(vseed));
+        uint h2 = pcg_hash(h1);
+        uint h3 = pcg_hash(h2);
+        vec2 gext = vec2(gsize);
+        fpos = mod(fpos, gext);
+        if ((h3 & 1u) != 0u) fpos.x = gext.x - fpos.x;
+        if ((h3 & 2u) != 0u) fpos.y = gext.y - fpos.y;
+        fpos += vec2(float(h1 % uint(gsize.x)), float(h2 % uint(gsize.y)));
+    }
     vec4 gfield4 = grain_point(fpos, gsize);
     vec3 vsum = gfield4.rgb;
 

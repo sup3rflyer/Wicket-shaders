@@ -1,4 +1,4 @@
-// GradientRestore v1.8 — Detect-and-Reconstruct Deband
+// GradientRestore v1.11 — Detect-and-Reconstruct Deband
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Design goal: restore the smooth gradients the master had before 8-bit
@@ -93,17 +93,44 @@
 //   texels in both axes, and the knees place dither on the saturated
 //   plateau; sigma ~1.5 continuum noise still sits mid-knee and can
 //   breathe slightly).
-// - Bulk-edge collar (audit F1, THE top v2 candidate): the flatness and
-//   envelope gates protect ~32px around solid-object boundaries, and near
-//   CLIPPED highlights this hands residual bright banding to CelFlare's
-//   expansion — the one place this shader bows out where the suite
-//   amplifies. The honest fix is similarity-aware ramp estimation
+// - Bulk-edge collar (audit F1) — REDUCED by the v1.10 MULTI-SCALE
+//   RESCUE, not eliminated: a second refit at sigma 12 full-res (built
+//   with the composition identity S2 = G(sigma*sqrt2) conv M, three
+//   passes) carries its own contamination envelopes in the spare ENV
+//   channels, and the apply blends per axis — the wide ramp where its
+//   envelope trusts it, the short ramp where only IT is clean. The short
+//   refit's bias reach is ~2 sigma = 6 quarter-res texels, so with the
+//   +-8-texel envelope window the collar shrinks from ~130px to ~55px,
+//   and plateaus up to ~30-40px flatten inside the rescue zone (wider
+//   plateaus near edges still wait for v2). Field driver: LUMA banding on
+//   a dark uniform collar beside white trim (w_amp median 0.00 — the
+//   sigma-48 bias exceeded gr_thr region-wide) and in hair shading
+//   between strand clusters (w_env median 0.25). gr_ms = 0 restores
+//   exact v1.9 behavior (and composes with gr_chroma = 0 to exact v1.8).
+//   The honest full fix is still similarity-aware ramp estimation
 //   (region-respecting weights), a v2 architecture step; a directional
 //   envelope was considered and rejected (both brighter and darker
 //   neighbors corrupt a ramp estimate equally).
-// - The trust mask and flatness range are luma-only: equal-luma chroma
-//   seams are neither masked nor range-gated (the max-channel |c| and MAD
-//   gates still bound the damage). Revisit if colored seams surface.
+// - v1.9 CHROMA PATH: the correction is opponent-decomposed at apply
+//   (since v1.10 on the multi-scale-blended field c_eff) — the luma
+//   projection rides the original (unchanged) luma gates, while the
+//   opponent part is gated by CHROMA-native fields: opponent-axis
+//   flatness ranges, a chroma contamination envelope, and a chroma MAD
+//   whose opponent projection cancels Y-plane dither EXACTLY (the Y
+//   coefficient is identical for R/G/B, so common-mode dither vanishes).
+//   Field-found motivation (2026-07-10, night face close-up): chroma
+//   banding riding a steep luma shading field — the luma flatness gate
+//   plus ~1.7 codes of 50-150px curvature error in the shared max-channel
+//   |c| zeroed EVERYTHING, vetoing a chroma correction whose own model
+//   error was 0.11 codes on a 0.55-code-flat chroma field. Chroma
+//   quantities live in RGB-projected units: one YCbCr chroma code spans
+//   ~2.1 RGB codes on the B axis, so the chroma knees/reach scale gr_thr
+//   by GR_CTHR_GAIN. gr_chroma = 0 restores exact v1.8 behavior.
+//   The chroma path carries its own structure/coherence term (GR_RANGEC
+//   w channel) so faint coherent colored texture is not absorbed by the
+//   chroma snap; the trust mask stays luma-only (correct — med5 validity
+//   there is a luma-structure question; an equal-luma pure-chroma line is
+//   rare and simply closes the chroma range gate around itself).
 // - At extreme frame borders the one-sided refit is not strictly monotone
 //   -bounded; the envelope guards it only above its own knee.
 
@@ -139,18 +166,46 @@
 //!MAXIMUM 24.0
 6.0
 
+//!PARAM gr_chroma
+//!DESC Chroma-path strength — fraction of the opponent-axis (chroma) correction applied. Chroma banding is gated by its OWN flatness/envelope/noise fields, so it is fixed even where steep luma shading closes the luma gates (the field-found miss: colored banding on a shaded face). 1 = full (shipped tune), 0 = v1.8 luma-only behavior. The luma path is unaffected either way.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
+
+//!PARAM gr_flat_c
+//!DESC Chroma flatness ceiling in RGB-projected code values — opponent-axis (B-Y / R-Y) range of the median field over a +-32px window above this marks colored structure and fades the chroma correction out (zero at 2x). Chroma fields are far flatter than luma: banded surfaces measure ~0.5-1, colored art/iris structure 8+.
+//!TYPE DYNAMIC float
+//!MINIMUM 1.0
+//!MAXIMUM 24.0
+4.0
+
+//!PARAM gr_ms
+//!DESC Multi-scale rescue strength. Near bulk-contrast edges (a bright trim beside a dark uniform, hair strand clusters) the wide sigma-48 ramp estimate is contamination-gated and banding survives in a ~130px collar; this blends in a short sigma-12 refit where only IT is clean, shrinking the collar to ~55px and flattening plateaus up to ~30-40px there. 1 = full (shipped tune), 0 = v1.9 behavior (wide ramp only).
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
+
+//!PARAM gr_snr
+//!DESC SNR-adaptive texture protection. The structure gate's knee is calibrated so 8-bit encode dither (~0.2 codes) cannot close it — but on quiet high-bit-depth sources real texture lives BELOW that static knee (10-bit stone/cloud detail at 0.1-0.35 codes) and the snap absorbs it as if it were dither. At 1 the knee scales with the MEASURED local noise floor (the MAD field): dithered 8-bit content clamps to the static knee (behavior unchanged), quiet sources tighten so faint coherent texture is protected while clean banded flats (whose structure field reads ~0.05) stay correctable. 0 = static knee (v1.10 behavior).
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
+
 //!PARAM gr_dither
-//!DESC Dither absorption / contour snap. 1 = full: cleanest possible gradients, but sub-code faint texture in quiet areas (smoke, haze) can read as dither and be absorbed with it. Lower to preserve such texture at the cost of contour removal on clean flats; 0 = low-frequency correction only (all fine texture bit-exact, faint contours may survive).
+//!DESC Dither absorption / contour snap, scaling BOTH the luma and chroma snap regimes. 1 = full: cleanest possible gradients, but sub-code faint texture in quiet areas (smoke, haze) can read as dither and be absorbed with it. Lower to preserve such texture at the cost of contour removal on clean flats; 0 = low-frequency correction only (all fine texture bit-exact, faint contours may survive).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM gr_debug
-//!DESC Debug views: 0 = off, 1 = bypass, 2 = applied correction x32 on mid-gray, 3 = gate map (R = flatness kill, G = applied weight, B = snap regime).
+//!DESC Debug views: 0 = off, 1 = bypass, 2 = applied correction x32 on mid-gray, 3 = gate map (R = flatness kill, G = applied weight, B = snap regime), 4 = chroma gate map (R = chroma flatness kill, G = applied chroma weight, B = chroma snap regime).
 //!TYPE DEFINE
 //!MINIMUM 0
-//!MAXIMUM 3
+//!MAXIMUM 4
 0
 
 //!HOOK MAIN
@@ -470,19 +525,184 @@ vec4 hook() {
     // ENV passes into the contamination envelope the apply pass gates on.
     // Masked texels (text strokes, line clusters) have huge but never-
     // applied c; counting them would spread a false protection halo around
-    // structure the masking machinery already handles.
+    // structure the masking machinery already handles. Computed HERE at
+    // fp32 and stored near zero (sweet-spot ulp) — the luma envelope must
+    // NOT be re-derived from the 0.5 + c encode (fp16 ulp at 0.5 is ~0.06
+    // code, measured 0.3-code apply wobble on env-knee content); the
+    // chroma ENV seed is derived as a bounded RATIO of this exact seed.
+    return vec4(vec3(0.5) + c, max(max(abs(c.r), abs(c.g)), abs(c.b)) * m.a * m.a);
+}
+
+//!HOOK MAIN
+//!BIND GR_MED
+//!SAVE GR_SBLUR_H
+//!WIDTH GR_MED.w
+//!HEIGHT GR_MED.h
+//!DESC GradientRestore: Short Ramp Blur H
+
+// =============================================================================
+// PASS 8/9/10 (v1.10): SHORT REFIT — sigma 3 at 1/4 res (12px full res)
+// =============================================================================
+// The multi-scale rescue ramp: same masked normalized convolution and
+// 2S - S2 deconvolution as the wide chain, at a quarter of its reach.
+// S2 is built with the Gaussian composition identity blur_s(blur_s(M)) =
+// G(s*sqrt2) conv M — one direct sigma-4.2426 blur of M instead of
+// re-blurring S — so the short chain costs three passes, not four (the
+// discrete-kernel difference from true double-blurring is ~1e-3 of the
+// weight mass, far below code scale). A sigma-12-full-res refit spans
+// plateaus up to ~30-40px and its bias reach near a bulk edge is ~2
+// sigma = 6 quarter-res texels, vs ~25 for the wide ramp — that reach
+// difference is the whole point (see the apply-pass blend). Tables are
+// stride-2 bilinear-merged like the wide chain; the sigma-3 pair appears
+// TWICE (here + Short Correction) and the sigma-4.2426 pair twice
+// (Short Refit Blur H + Short Correction) — copies MUST stay in sync.
+
+vec4 hook() {
+    const float go[5] = {
+        1.4584295168, 3.4039848067, 5.3518057801, 7.3029407160,
+        9.2581597095
+    };
+    const float gw[5] = {
+        1.7466968718, 1.0176429502, 0.3846874920, 0.0942940294,
+        0.0149749167
+    };
+
+    // Precomputed: 1.0 / (1.0 + 2.0 * sum(gw[]))
+    #define GR_SBLUR_INV_WSUM 0.1330390063
+
+    vec2 pt = GR_MED_pt;
+    vec2 pos = GR_MED_pos;
+
+    // Mask-premultiplied normalized convolution, off-frame taps zero-weight.
+    vec4 m0 = GR_MED_tex(pos);
+    vec4 sum = vec4(m0.rgb * m0.a, m0.a);
+
+    for (int i = 0; i < 5; i++) {
+        float xp = pos.x + go[i] * pt.x;
+        float xn = pos.x - go[i] * pt.x;
+        vec4 sp = GR_MED_tex(vec2(xp, pos.y)) * step(xp, 1.0);
+        vec4 sn = GR_MED_tex(vec2(xn, pos.y)) * step(0.0, xn);
+        sum += (vec4(sp.rgb * sp.a, sp.a) + vec4(sn.rgb * sn.a, sn.a)) * gw[i];
+    }
+
+    return sum * GR_SBLUR_INV_WSUM;
+}
+
+//!HOOK MAIN
+//!BIND GR_MED
+//!SAVE GR_SBLUR2_H
+//!WIDTH GR_MED.w
+//!HEIGHT GR_MED.h
+//!DESC GradientRestore: Short Refit Blur H
+
+// H half of the sigma-4.2426 (= 3*sqrt2) blur of M for the short S2.
+
+vec4 hook() {
+    const float go[7] = {
+        1.4791787146, 3.4515414720, 5.4241999464, 7.3973146620,
+        9.3710353351, 11.3454977507, 13.3208213008
+    };
+    const float gw[7] = {
+        1.8674437939, 1.4199811715, 0.8672312298, 0.4253890721,
+        0.1675757486, 0.0530123245, 0.0134661865
+    };
+
+    // Precomputed: 1.0 / (1.0 + 2.0 * sum(gw[]))
+    #define GR_SBLUR2_INV_WSUM 0.0940893179
+
+    vec2 pt = GR_MED_pt;
+    vec2 pos = GR_MED_pos;
+
+    vec4 m0 = GR_MED_tex(pos);
+    vec4 sum = vec4(m0.rgb * m0.a, m0.a);
+
+    for (int i = 0; i < 7; i++) {
+        float xp = pos.x + go[i] * pt.x;
+        float xn = pos.x - go[i] * pt.x;
+        vec4 sp = GR_MED_tex(vec2(xp, pos.y)) * step(xp, 1.0);
+        vec4 sn = GR_MED_tex(vec2(xn, pos.y)) * step(0.0, xn);
+        sum += (vec4(sp.rgb * sp.a, sp.a) + vec4(sn.rgb * sn.a, sn.a)) * gw[i];
+    }
+
+    return sum * GR_SBLUR2_INV_WSUM;
+}
+
+//!HOOK MAIN
+//!BIND GR_SBLUR_H
+//!BIND GR_SBLUR2_H
+//!BIND GR_MED
+//!SAVE GR_SCORR
+//!WIDTH GR_SBLUR_H.w
+//!HEIGHT GR_SBLUR_H.h
+//!DESC GradientRestore: Short Correction
+
+// Fused precision pass, mirror of the wide Correction: both V blurs in
+// fp32 registers, normalized-conv division once, and the complete short
+// correction c_s = 2*S_s - S2_s - M stored small-valued as 0.5 + c_s.
+// Alpha = max-channel |c_s| * trust-mask^2, computed HERE at fp32 (the
+// v1.9 envelope-precision lesson applies identically to this seed).
+
+vec4 hook() {
+    const float goA[5] = {
+        1.4584295168, 3.4039848067, 5.3518057801, 7.3029407160,
+        9.2581597095
+    };
+    const float gwA[5] = {
+        1.7466968718, 1.0176429502, 0.3846874920, 0.0942940294,
+        0.0149749167
+    };
+    const float goB[7] = {
+        1.4791787146, 3.4515414720, 5.4241999464, 7.3973146620,
+        9.3710353351, 11.3454977507, 13.3208213008
+    };
+    const float gwB[7] = {
+        1.8674437939, 1.4199811715, 0.8672312298, 0.4253890721,
+        0.1675757486, 0.0530123245, 0.0134661865
+    };
+
+    #define GR_SBLURA_INV_WSUM 0.1330390063
+    #define GR_SBLURB_INV_WSUM 0.0940893179
+
+    vec2 pt = GR_SBLUR_H_pt;
+    vec2 pos = GR_SBLUR_H_pos;
+
+    vec4 sum_s  = GR_SBLUR_H_tex(pos);
+    vec4 sum_s2 = GR_SBLUR2_H_tex(pos);
+
+    for (int i = 0; i < 5; i++) {
+        float yp = pos.y + goA[i] * pt.y;
+        float yn = pos.y - goA[i] * pt.y;
+        sum_s += (GR_SBLUR_H_tex(vec2(pos.x, yp)) * step(yp, 1.0)
+                + GR_SBLUR_H_tex(vec2(pos.x, yn)) * step(0.0, yn)) * gwA[i];
+    }
+    for (int i = 0; i < 7; i++) {
+        float yp = pos.y + goB[i] * pt.y;
+        float yn = pos.y - goB[i] * pt.y;
+        sum_s2 += (GR_SBLUR2_H_tex(vec2(pos.x, yp)) * step(yp, 1.0)
+                 + GR_SBLUR2_H_tex(vec2(pos.x, yn)) * step(0.0, yn)) * gwB[i];
+    }
+
+    sum_s  *= GR_SBLURA_INV_WSUM;
+    sum_s2 *= GR_SBLURB_INV_WSUM;
+
+    vec3 s  = sum_s.rgb  / max(sum_s.a,  1e-4);
+    vec3 s2 = sum_s2.rgb / max(sum_s2.a, 1e-4);
+    float conf = smoothstep(0.06, 0.20, min(sum_s.a, sum_s2.a));
+    vec4 m = GR_MED_tex(GR_MED_pos);
+    vec3 c = (2.0 * s - s2 - m.rgb) * conf;
     return vec4(vec3(0.5) + c, max(max(abs(c.r), abs(c.g)), abs(c.b)) * m.a * m.a);
 }
 
 //!HOOK MAIN
 //!BIND GR_CORR
+//!BIND GR_SCORR
 //!SAVE GR_ENV_H
 //!WIDTH GR_CORR.w
 //!HEIGHT GR_CORR.h
 //!DESC GradientRestore: Contamination Env H
 
 // =============================================================================
-// PASS 8/9: CONTAMINATION ENVELOPE — separable max of |c| over +-8 texels
+// PASS 11/12: CONTAMINATION ENVELOPE — separable max of |c| over +-8 texels
 // =============================================================================
 // A banded flat needs corrections of at most ~half a step EVERYWHERE in a
 // neighborhood; if ANY point within +-32px wants more, the ramp estimate
@@ -493,16 +713,43 @@ vec4 hook() {
 // leg in a corner pocket). The apply pass fades all correction on this
 // envelope. Legit fields measure well under the knee: 1-code ramps ~0.5,
 // curved glow interiors ~0.9 (the refit keeps them small).
+// v1.9: separate luma/chroma envelopes — so luma curvature contamination
+// (a shaded face) cannot veto a chroma correction whose own neighborhood
+// is clean, and vice versa. v1.10: FOUR envelopes ride the pair, the
+// same two per refit scale: x/y = wide (sigma 48) luma/chroma, z/w =
+// short (sigma 12) luma/chroma — the apply blends toward the short ramp
+// where only ITS envelope is clean (bulk-edge rescue). Each luma seed is
+// the corresponding CORR alpha verbatim (fp32-exact); each chroma seed
+// is that exact seed times the opponent RATIO of the decoded c: the
+// ratio is bounded in [0, 2] by construction (|c_op| <= 2 max|c|), so
+// the 0.5 + c decode's fp16 ulp only perturbs the ratio multiplicatively
+// (~10% at half-code |c|) on the wide 0.5-1.0x cthr chroma knee — never
+// additively.
+
+const vec3 GR_ENVH_W709 = vec3(0.2126, 0.7152, 0.0722);
 
 vec4 hook() {
     vec2 pt = GR_CORR_pt;
     vec2 pos = GR_CORR_pos;
-    float m = GR_CORR_tex(pos).a;
-    for (int i = 1; i <= 8; i++) {
-        m = max(m, GR_CORR_tex(pos + vec2(float(i) * pt.x, 0.0)).a);
-        m = max(m, GR_CORR_tex(pos - vec2(float(i) * pt.x, 0.0)).a);
+    vec4 m = vec4(0.0);
+    for (int i = -8; i <= 8; i++) {
+        vec2 tp = pos + vec2(float(i) * pt.x, 0.0);
+        vec4 tL = GR_CORR_tex(tp);
+        vec4 tS = GR_SCORR_tex(tp);
+        vec3 cL = tL.rgb - vec3(0.5);
+        vec3 cS = tS.rgb - vec3(0.5);
+        vec3 oL = cL - vec3(dot(cL, GR_ENVH_W709));
+        vec3 oS = cS - vec3(dot(cS, GR_ENVH_W709));
+        float mcL = max(max(abs(cL.r), abs(cL.g)), abs(cL.b));
+        float mcS = max(max(abs(cS.r), abs(cS.g)), abs(cS.b));
+        float moL = max(max(abs(oL.r), abs(oL.g)), abs(oL.b));
+        float moS = max(max(abs(oS.r), abs(oS.g)), abs(oS.b));
+        m.x = max(m.x, tL.a);
+        m.y = max(m.y, tL.a * moL / max(mcL, 1e-6));
+        m.z = max(m.z, tS.a);
+        m.w = max(m.w, tS.a * moS / max(mcS, 1e-6));
     }
-    return vec4(m, 0.0, 0.0, 1.0);
+    return m;
 }
 
 //!HOOK MAIN
@@ -515,12 +762,12 @@ vec4 hook() {
 vec4 hook() {
     vec2 pt = GR_ENV_H_pt;
     vec2 pos = GR_ENV_H_pos;
-    float m = GR_ENV_H_tex(pos).x;
+    vec4 m = GR_ENV_H_tex(pos);
     for (int i = 1; i <= 8; i++) {
-        m = max(m, GR_ENV_H_tex(pos + vec2(0.0, float(i) * pt.y)).x);
-        m = max(m, GR_ENV_H_tex(pos - vec2(0.0, float(i) * pt.y)).x);
+        m = max(m, GR_ENV_H_tex(pos + vec2(0.0, float(i) * pt.y)));
+        m = max(m, GR_ENV_H_tex(pos - vec2(0.0, float(i) * pt.y)));
     }
-    return vec4(m, 0.0, 0.0, 1.0);
+    return m;
 }
 
 //!HOOK MAIN
@@ -533,7 +780,7 @@ vec4 hook() {
 //!DESC GradientRestore: Flatness Range H
 
 // =============================================================================
-// PASS 10/11: FLATNESS RANGE + NOISE FIELD
+// PASS 13/14: FLATNESS RANGE + NOISE FIELD
 // =============================================================================
 // Separable min/max of the MEDIAN-field luma over +-8 texels (+-32px full
 // res). Box min/max separates exactly (min over rows then columns = min
@@ -666,15 +913,160 @@ vec4 hook() {
 }
 
 //!HOOK MAIN
+//!BIND GR_MED
+//!SAVE GR_RANGEC_H
+//!WIDTH GR_MED.w
+//!HEIGHT GR_MED.h
+//!DESC GradientRestore: Chroma Range H
+
+// =============================================================================
+// PASS 15/16 (v1.9): CHROMA FLATNESS RANGE + CHROMA NOISE FIELD
+// =============================================================================
+// Separable trust-masked min/max of the median field's OPPONENT axes
+// (o1 = B - Y, o2 = R - Y, both in RGB-projected units) over +-8 texels —
+// the chroma analogue of the luma flatness range, feeding the chroma
+// flatness gate at apply. The same M.a trust mask excludes line art and
+// text; a rare equal-luma pure-chroma structure is unmasked and simply
+// closes this gate around itself (conservative, correct). Stored as
+// o * 0.5 + 0.5 so both signs survive a unorm FBO fallback (the GR_CORR
+// pattern); the V pass decodes and collapses to plain ranges.
+
+const vec3 GR_RC_W709 = vec3(0.2126, 0.7152, 0.0722);
+
+vec4 hook() {
+    vec2 pt = GR_MED_pt;
+    vec2 pos = GR_MED_pos;
+
+    vec4 center = GR_MED_tex(pos);
+    float y_c = dot(center.rgb, GR_RC_W709);
+    vec2 o_c = vec2(center.b - y_c, center.r - y_c);
+    vec2 lo = o_c;
+    vec2 hi = o_c;
+
+    for (int i = 1; i <= 8; i++) {
+        vec4 tp = GR_MED_tex(pos + vec2(float(i) * pt.x, 0.0));
+        vec4 tn = GR_MED_tex(pos - vec2(float(i) * pt.x, 0.0));
+        float yp = dot(tp.rgb, GR_RC_W709);
+        float yn = dot(tn.rgb, GR_RC_W709);
+        vec2 op = vec2(tp.b - yp, tp.r - yp);
+        vec2 on = vec2(tn.b - yn, tn.r - yn);
+        float wp = step(0.5, tp.a);
+        float wn = step(0.5, tn.a);
+        lo = min(lo, min(mix(vec2( 1e3), op, wp), mix(vec2( 1e3), on, wn)));
+        hi = max(hi, max(mix(vec2(-1e3), op, wp), mix(vec2(-1e3), on, wn)));
+    }
+
+    return vec4(lo * 0.5 + 0.5, hi * 0.5 + 0.5).xzyw;
+}
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!BIND GR_DS
+//!BIND GR_MED
+//!BIND GR_RANGEC_H
+//!SAVE GR_RANGEC
+//!WIDTH GR_RANGEC_H.w
+//!HEIGHT GR_RANGEC_H.h
+//!DESC GradientRestore: Chroma Range V
+
+// V-axis min/max reduction, then collapse to ranges: x = o1 range,
+// y = o2 range (RGB-projected codes; the raw range can theoretically
+// reach ~1.86 — past unorm 1.0 — but any clamp engages ~5x beyond the
+// widest possible fully-closed flatness knee, so a unorm FBO fallback
+// changes nothing). Z carries the CHROMA noise field: MAD of the
+// full-res 4x4 block's OPPONENT deviation against the median field. The
+// opponent projection cancels Y-plane encode dither EXACTLY (Y moves
+// R/G/B by the same coefficient, so common-mode vanishes) — this field
+// reads chroma-plane noise and chroma grain only, which is what the
+// chroma snap regime must discriminate on. No +-2 pre-dilation here
+// (channel budget); the apply pass reads it through a 13-tap max
+// ({0,+-1,+-2} both axes plus the +-1 diagonals) — weaker than the luma
+// path's full 5x5, accepted because the chroma knees are plateau-placed
+// with a wider margin (see apply) so the blend zone this stabilizes is
+// narrower.
+// W carries the CHROMA STRUCTURE field (v1.9 audit F2): opponent-MAD
+// magnitude alone cannot tell faint COHERENT colored texture (haze, a
+// soft colored rim — luma-flat, so the shared luma structure gate never
+// sees it) from chroma dither; without this the chroma snap would absorb
+// it. Mirror of the luma term on the V axis: signed deviations of the
+// raw plateau field's opponent components against the median field's,
+// med5 per axis — UNSIGNED median = raw activity, |SIGNED median| x 2.5
+// = coherence (dither self-cancels, structure survives; banding contours
+// contaminate only 1-2 samples of 5 and stay invisible). Max over axes.
+
+const vec3 GR_RCV_W709 = vec3(0.2126, 0.7152, 0.0722);
+
+vec4 hook() {
+    vec2 pt = GR_RANGEC_H_pt;
+    vec2 pos = GR_RANGEC_H_pos;
+
+    vec4 mm = GR_RANGEC_H_tex(pos);
+    vec2 lo = mm.xz;
+    vec2 hi = mm.yw;
+
+    for (int i = 1; i <= 8; i++) {
+        vec4 sp = GR_RANGEC_H_tex(pos + vec2(0.0, float(i) * pt.y));
+        vec4 sn = GR_RANGEC_H_tex(pos - vec2(0.0, float(i) * pt.y));
+        lo = min(lo, min(sp.xz, sn.xz));
+        hi = max(hi, max(sp.yw, sn.yw));
+    }
+    // Decode the 0.5-offset affine encode: range = (hi_e - lo_e) * 2.
+    vec2 rng = (hi - lo) * 2.0;
+
+    vec4 center = GR_MED_tex(GR_MED_pos);
+    vec2 fpt = HOOKED_pt;
+    float mad_c = 0.0;
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            vec2 off = vec2(float(x) - 1.5, float(y) - 1.5) * fpt;
+            vec3 d = HOOKED_tex(HOOKED_pos + off).rgb - center.rgb;
+            vec3 d_op = d - vec3(dot(d, GR_RCV_W709));
+            mad_c += max(max(abs(d_op.r), abs(d_op.g)), abs(d_op.b));
+        }
+    }
+    mad_c *= (1.0 / 16.0);
+
+    // Chroma structure/coherence: opponent components of GR_DS (alpha IS
+    // its luma) vs the median field's, five V taps.
+    float y_c = dot(center.rgb, GR_RCV_W709);
+    vec2 o_c = vec2(center.b - y_c, center.r - y_c);
+    vec4 d0t = GR_DS_tex(GR_DS_pos - vec2(0.0, 2.0 * pt.y));
+    vec4 d1t = GR_DS_tex(GR_DS_pos - vec2(0.0, pt.y));
+    vec4 d2t = GR_DS_tex(GR_DS_pos);
+    vec4 d3t = GR_DS_tex(GR_DS_pos + vec2(0.0, pt.y));
+    vec4 d4t = GR_DS_tex(GR_DS_pos + vec2(0.0, 2.0 * pt.y));
+    vec2 s0 = vec2(d0t.b - d0t.a, d0t.r - d0t.a) - o_c;
+    vec2 s1 = vec2(d1t.b - d1t.a, d1t.r - d1t.a) - o_c;
+    vec2 s2 = vec2(d2t.b - d2t.a, d2t.r - d2t.a) - o_c;
+    vec2 s3 = vec2(d3t.b - d3t.a, d3t.r - d3t.a) - o_c;
+    vec2 s4 = vec2(d4t.b - d4t.a, d4t.r - d4t.a) - o_c;
+
+    vec2 a0 = abs(s0); vec2 a1 = abs(s1); vec2 a2 = abs(s2);
+    vec2 a3 = abs(s3); vec2 a4 = abs(s4);
+    vec2 f = max(min(a0, a1), min(a3, a4));
+    vec2 g = min(max(a0, a1), max(a3, a4));
+    vec2 tex = max(min(a2, f), min(max(a2, f), g));
+
+    vec2 fs = max(min(s0, s1), min(s3, s4));
+    vec2 gs = min(max(s0, s1), max(s3, s4));
+    vec2 coh = abs(max(min(s2, fs), min(max(s2, fs), gs)));
+
+    vec2 sc = max(tex, 2.5 * coh);
+    return vec4(rng, mad_c, max(sc.x, sc.y));
+}
+
+//!HOOK MAIN
 //!BIND HOOKED
 //!BIND GR_MED
 //!BIND GR_CORR
+//!BIND GR_SCORR
 //!BIND GR_ENV
 //!BIND GR_RANGE
+//!BIND GR_RANGEC
 //!DESC GradientRestore: Apply
 
 // =============================================================================
-// PASS 12: APPLY (full resolution)
+// PASS 17: APPLY (full resolution)
 // =============================================================================
 // out = orig + mix(c, snap, regime) * w, with the ramp taken as the
 // deconvolved S_refit = 2S - S2 (curvature-unbiased: a structural no-op on
@@ -719,8 +1111,21 @@ vec4 hook() {
 // Structure-field knee (codes): kills the snap on coherent micro-texture
 // (hatching, fine pattern) whose full-res MAD mimics dither, and on
 // gradients too steep for banding to be visible. Dither reads ~0.2 here.
+// v1.11: the static knee is the CEILING of an SNR-adaptive knee (scaled
+// by gr_snr): tex_lo = ratio x local MAD, clamped to [floor, static].
+// Rationale: the 0.45 floor exists so 8-bit dither cannot close the
+// gate — but dither reads ~0.2 ONLY on dithered sources. On quiet
+// high-bit-depth content (10-bit BD anime, field 2026-07-10: 30-50% of
+// texture energy eaten inside snap zones) the noise floor is ~0.1 and
+// real texture lives at 0.1-0.35 codes, under the static knee. Scaling
+// the knee to the measured MAD makes the gate a signal-to-NOISE test:
+// texture must merely exceed the local noise floor to be protected.
+// Banding contours stay invisible to the field at ANY knee (they
+// contaminate only 1-2 of 5 median samples), so clean flats still
+// deband. The floor keeps sampling noise (~0.05) from closing it.
 #define GR_TEX_LO       0.45
-#define GR_TEX_HI       0.9
+#define GR_TEX_SNR      0.4
+#define GR_TEX_LO_MIN   0.18
 // Snap authority = GR_SNAP_REACH * gr_thr + local MAD, in code values:
 // enough to flatten a half-step quantization offset (0.75 codes at the
 // default gr_thr = 2) PLUS the measured local noise (so an open snap can
@@ -734,6 +1139,28 @@ vec4 hook() {
 // near-white banded skies below that need both correction signs.
 #define GR_CLIP_LO      0.97
 #define GR_CLIP_HI      0.995
+// ---- v1.9 chroma path ----
+// Chroma quantities live in RGB-PROJECTED units: one YCbCr chroma code
+// spans ~2.11 RGB codes on its dominant axis (255/224 * 1.8556 for Cb->B;
+// Cr->R is 1.79 — the max is used so both axes gate TIGHT, never loose),
+// so every chroma knee/reach derives from gr_thr * this gain — gr_thr
+// keeps its "step ceiling in source-plane codes" meaning on both paths.
+#define GR_CTHR_GAIN    2.11
+// Chroma snap knees on the plus-dilated opponent MAD, in RGB codes. The
+// opponent projection already cancels Y-plane dither exactly, so what
+// remains is chroma-plane noise and the chroma contours themselves: a
+// full 1-chroma-code step contour crossing a block reads ~1.0 here
+// (2.1 RGB codes x the crossing fraction) — the LO knee sits ABOVE that
+// so banding contours land on the full-snap plateau (a knee below 1.0
+// would half-close the snap exactly on the contours it must remove).
+// Chroma-plane sigma-1 dither reads ~0.8 (upscale-smoothed): plateau.
+// Chromatic film grain sigma 1.5+ reads past 2.0: fully outside. NO dark
+// tightening (unlike luma): the dark-texture prior does not transfer —
+// Y-dither is already projected out, faint dark chroma texture is rare,
+// and dark chroma banding (night scenes) is the motivating case and must
+// keep full snap.
+#define GR_SNAP_MAD_LO_C  1.2
+#define GR_SNAP_MAD_HI_C  2.0
 
 vec4 hook() {
     vec4 orig = HOOKED_tex(HOOKED_pos);
@@ -761,8 +1188,69 @@ vec4 hook() {
                           max(max(mmL.z, mmR.z), max(mmU.z, mmD.z))) / GR_CODE;
     float tex_codes = (mm.w + mmL.w + mmR.w + mmU.w + mmD.w) * 0.2 / GR_CODE;
 
-    // The complete LF correction, precomputed at 1/4 res: c = S_refit - M.
-    vec3 c = GR_CORR_tex(GR_CORR_pos).rgb - vec3(0.5);
+    // Chroma range/noise fields, same tent geometry; the MAD max adds the
+    // +-1 diagonals (13 taps total) so an isolated diagonal chroma-grain
+    // filament cannot thread between the plus arms and breathe the snap
+    // (v1.9 audit F5) — still short of the luma path's full 5x5, see the
+    // Chroma Range V note.
+    vec2 cpt = GR_RANGEC_pt;
+    vec4 cc  = GR_RANGEC_tex(GR_RANGEC_pos);
+    vec4 ccL = GR_RANGEC_tex(GR_RANGEC_pos - vec2(2.0 * cpt.x, 0.0));
+    vec4 ccR = GR_RANGEC_tex(GR_RANGEC_pos + vec2(2.0 * cpt.x, 0.0));
+    vec4 ccU = GR_RANGEC_tex(GR_RANGEC_pos - vec2(0.0, 2.0 * cpt.y));
+    vec4 ccD = GR_RANGEC_tex(GR_RANGEC_pos + vec2(0.0, 2.0 * cpt.y));
+    vec2 rangec_soft = cc.xy * 0.4
+                     + (ccL.xy + ccR.xy + ccU.xy + ccD.xy) * 0.15;
+    float madc1 = max(max(GR_RANGEC_tex(GR_RANGEC_pos - vec2(cpt.x, 0.0)).z,
+                          GR_RANGEC_tex(GR_RANGEC_pos + vec2(cpt.x, 0.0)).z),
+                      max(GR_RANGEC_tex(GR_RANGEC_pos - vec2(0.0, cpt.y)).z,
+                          GR_RANGEC_tex(GR_RANGEC_pos + vec2(0.0, cpt.y)).z));
+    float madc2 = max(max(GR_RANGEC_tex(GR_RANGEC_pos + vec2( cpt.x,  cpt.y)).z,
+                          GR_RANGEC_tex(GR_RANGEC_pos + vec2( cpt.x, -cpt.y)).z),
+                      max(GR_RANGEC_tex(GR_RANGEC_pos + vec2(-cpt.x,  cpt.y)).z,
+                          GR_RANGEC_tex(GR_RANGEC_pos + vec2(-cpt.x, -cpt.y)).z));
+    float madc_codes = max(max(cc.z, max(madc1, madc2)),
+                           max(max(ccL.z, ccR.z), max(ccU.z, ccD.z))) / GR_CODE;
+    float texc_codes = (cc.w + ccL.w + ccR.w + ccU.w + ccD.w) * 0.2 / GR_CODE;
+
+    // The complete LF corrections, precomputed at 1/4 res: wide (sigma 48)
+    // and short (sigma 12) refits, c = S_refit - M each.
+    vec3 c  = GR_CORR_tex(GR_CORR_pos).rgb - vec3(0.5);
+    vec3 cs = GR_SCORR_tex(GR_SCORR_pos).rgb - vec3(0.5);
+
+    // ---- v1.10 multi-scale blend, per axis ----
+    // Envelope validities of each scale (the envelope IS the gate 4
+    // quantity — see below): near a bulk edge the wide ramp's envelope
+    // condemns a ~25-texel reach while the short ramp stays clean beyond
+    // ~6, so blending toward the short refit where only IT is valid
+    // shrinks the unfixable collar from ~130px to ~55px. Wide is
+    // preferred wherever valid (it spans the plateaus the short one
+    // cannot). gr_ms = 0 collapses every blend to the wide field: exact
+    // v1.9 behavior (and with gr_chroma = 0, exact v1.8).
+    float cthr = gr_thr * GR_CTHR_GAIN;
+    vec4 env_codes = GR_ENV_tex(GR_ENV_pos) / GR_CODE;
+    float v_Ly = 1.0 - smoothstep(0.5 * gr_thr, gr_thr, env_codes.x);
+    float v_Sy = 1.0 - smoothstep(0.5 * gr_thr, gr_thr, env_codes.z);
+    float v_Lc = 1.0 - smoothstep(0.5 * cthr, cthr, env_codes.y);
+    float v_Sc = 1.0 - smoothstep(0.5 * cthr, cthr, env_codes.w);
+
+    const vec3 W709 = vec3(0.2126, 0.7152, 0.0722);
+    float cy_L = dot(c,  W709);
+    float cy_S = dot(cs, W709);
+    vec3 cop_L = c  - vec3(cy_L);
+    vec3 cop_S = cs - vec3(cy_S);
+    // The substitution weight requires the short scale to be valid ON ITS
+    // OWN TERMS: pref_S = (1 - v_L) * v_S. Falling back on (1 - v_L)
+    // alone swaps in the short refit's BIAS wherever both scales are
+    // contaminated (hair strand clusters: v_S ~ 0 too) — field-measured
+    // as a total-weight collapse 0.49 -> 0.01 there. With both invalid
+    // the blend stays on the wide field and the envelope gate (below)
+    // kills it, exactly as v1.9 did.
+    float pref_Sy = (1.0 - v_Ly) * v_Sy;
+    float pref_Sc = (1.0 - v_Lc) * v_Sc;
+    float cy_eff  = mix(cy_L,  cy_S,  pref_Sy * gr_ms);
+    vec3 cop_eff  = mix(cop_L, cop_S, pref_Sc * gr_ms);
+    vec3 c_eff    = vec3(cy_eff) + cop_eff;
 
     // Gate 1: correction amplitude, max across channels so a big miss in any
     // channel kills the whole correction (no per-channel hue twist). The
@@ -771,7 +1259,7 @@ vec4 hook() {
     // larger is remote-structure bias or mid-scale curvature the refit
     // could not cancel (field-found: the 2*gr_thr knee passed 1.5-2.5-code
     // pseudo-corrections on murky large-amplitude soft structure).
-    float c_codes = max(max(abs(c.r), abs(c.g)), abs(c.b)) / GR_CODE;
+    float c_codes = max(max(abs(c_eff.r), abs(c_eff.g)), abs(c_eff.b)) / GR_CODE;
     float w_amp = 1.0 - smoothstep(0.5 * gr_thr, gr_thr, c_codes);
 
     // Gate 2: local flatness — median-field luma range over +-32px.
@@ -780,16 +1268,66 @@ vec4 hook() {
 
     // Gate 3: structure — med5's mean-bias field; where the median field
     // is not a valid ramp estimate (dense micro-texture), apply nothing.
-    float w_tex = 1.0 - smoothstep(GR_TEX_LO, GR_TEX_HI, tex_codes);
+    // v1.11: SNR-adaptive knee (see the define block) — tightens toward
+    // the measured noise floor on quiet sources so faint coherent
+    // texture is protected from snap absorption; clamps to the static
+    // knee on dithered content (bit-identical there at any gr_snr).
+    float tex_lo = mix(GR_TEX_LO,
+                       clamp(GR_TEX_SNR * mad_codes, GR_TEX_LO_MIN, GR_TEX_LO),
+                       gr_snr);
+    float w_tex = 1.0 - smoothstep(tex_lo, 2.0 * tex_lo, tex_codes);
 
     // Gate 4: contamination envelope — if any point within +-32px needs a
-    // correction beyond banding scale, this whole zone's ramp estimate is
-    // untrustworthy; pass the source through. Scales with gr_thr like the
-    // amplitude gate.
-    float env_codes = GR_ENV_tex(GR_ENV_pos).x / GR_CODE;
-    float w_env = 1.0 - smoothstep(0.5 * gr_thr, 1.0 * gr_thr, env_codes);
+    // correction beyond banding scale, that scale's ramp estimate is
+    // untrustworthy there. With the multi-scale blend the gate is the
+    // validity of the field ACTUALLY BLENDED, mix(v_L, v_S, pref_S) — a
+    // plain max(v_L, v_S) over-reports confidence in the graduated
+    // mid-zone where c_eff is still mostly the less-trusted wide field
+    // (v1.10 audits, both passes). At gr_ms = 0 it degenerates to the
+    // wide validity alone.
+    float w_env = mix(v_Ly, mix(v_Ly, v_Sy, pref_Sy), gr_ms);
 
     float w = w_amp * w_flat * w_tex * w_env * gr_strength;
+
+    // ---- v1.9 chroma path: opponent decomposition ----
+    // The luma-path component rides every gate above exactly as v1.8
+    // applied the full c (the amplitude gate stays max-channel: when c is
+    // luma-dominated that is the v1.8 conservatism, and when it is
+    // chroma-dominated the luma part is ~0 anyway). The opponent part
+    // gets chroma-native gates in chroma units (gr_thr x GR_CTHR_GAIN).
+    // gr_chroma MIGRATES the opponent component between the paths: at 0
+    // it rides the luma path exactly as v1.8 routed it (bit-exact
+    // fallback), at 1 it is gated purely by its own fields.
+    vec3 c_op = cop_eff;
+    vec3 c_lp = vec3(cy_eff) + c_op * (1.0 - gr_chroma);
+
+    // Chroma gate 1: amplitude — a staircase correction never exceeds
+    // ~half the step, in the chroma step's own units.
+    float cop_codes = max(max(abs(c_op.r), abs(c_op.g)), abs(c_op.b)) / GR_CODE;
+    float w_amp_c = 1.0 - smoothstep(0.5 * cthr, cthr, cop_codes);
+    // Chroma gate 2: opponent-axis flatness over +-32px.
+    float rangec_codes = max(rangec_soft.x, rangec_soft.y) / GR_CODE;
+    float w_flat_c = 1.0 - smoothstep(gr_flat_c, 2.0 * gr_flat_c, rangec_codes);
+    // Chroma gate 3: structure, two layers. The shared luma term (w_tex)
+    // covers med5-invalidity — where the median is not a valid ramp
+    // estimate, no field derived from M is, chroma included. The chroma
+    // term (w_texc, audit F2) covers coherent COLORED texture the luma
+    // field cannot see (luma-flat haze, soft colored rims): same knees —
+    // chroma dither's self-cancelled residue reads ~0.2 here too.
+    // The CHROMA knee is EXEMPT from SNR adaptation (audit v1.11 F2):
+    // madc is Y-projected, so it reads low even on 8-bit luma-dithered
+    // content and the knee would tighten exactly where the v1.9 chroma
+    // banding fix operates — measured: the face-scene chroma deband
+    // halves at the luma floor, while the 10-bit texture-retention win is
+    // entirely luma-driven (retention identical with or without chroma
+    // adaptation). Weak upside, concrete downside: static knee stays.
+    float w_texc = 1.0 - smoothstep(GR_TEX_LO, 2.0 * GR_TEX_LO, texc_codes);
+    // Chroma gate 4: chroma contamination envelope, blend-weighted like
+    // gate 4 above.
+    float w_env_c = mix(v_Lc, mix(v_Lc, v_Sc, pref_Sc), gr_ms);
+
+    float w_c = w_amp_c * w_flat_c * w_tex * w_texc * w_env_c
+              * gr_strength * gr_chroma;
 
     // Regime blend: clean gradients snap to the ramp itself (removes the
     // contour, absorbs the dither that masked it); grained regions take the
@@ -799,27 +1337,56 @@ vec4 hook() {
     float mad_lo = mix(GR_SNAP_MAD_LO, GR_SNAP_MAD_LO_D, dark_w);
     float mad_hi = mix(GR_SNAP_MAD_HI, GR_SNAP_MAD_HI_D, dark_w);
     float snap = (1.0 - smoothstep(mad_lo, mad_hi, mad_codes)) * gr_dither;
+    // Chroma snap: keyed to the OPPONENT MAD (Y-plane dither projected
+    // out), flat knees — see the define block. gr_dither scales both
+    // regimes: it is the one taste knob for contour-vs-texture.
+    float snap_c = (1.0 - smoothstep(GR_SNAP_MAD_LO_C, GR_SNAP_MAD_HI_C,
+                                     madc_codes)) * gr_dither;
     // The +MAD authority exists to finish absorbing dither; grant it only in
     // proportion to dither-confidence (snap), or blend-zone texture (fine
     // hatching, weak grain) gets pulled ~1 code toward the refit.
-    float auth = (GR_SNAP_REACH * gr_thr + mad_codes * snap) * GR_CODE;
-    // Snap target reconstructed as c + M (= S_refit): the stored M's
-    // quantization cancels between this M and the -M inside c.
-    vec3 r = clamp(c + M.rgb - orig.rgb, vec3(-auth), vec3(auth));
-    vec3 corr = mix(c, r, snap);
+    // (An env-scaled snap reach was tried and measured INERT here: the
+    // texture itself inflates |c| and thus the envelope, licensing its
+    // own absorption — amplitude fields cannot make this distinction.
+    // DC-coherence and structure-tensor discriminators were also built
+    // and reverted this session: see CHANGELOG v1.11 before retrying.)
+    float auth   = (GR_SNAP_REACH * gr_thr + mad_codes * snap) * GR_CODE;
+    float auth_c = (GR_SNAP_REACH * cthr + madc_codes * snap_c) * GR_CODE;
+    // Snap target reconstructed as c_eff + M (= the blended S_refit): the
+    // stored M's quantization cancels between this M and the -M inside
+    // each c. The total pull t is decomposed BEFORE clamping so each axis
+    // spends only its own authority (a luma-clamp cannot eat chroma reach
+    // or vice versa).
+    vec3 t = c_eff + M.rgb - orig.rgb;
+    vec3 t_y  = vec3(dot(t, vec3(0.2126, 0.7152, 0.0722)));
+    vec3 t_op = t - t_y;
+    vec3 t_lp = t_y + t_op * (1.0 - gr_chroma);
+    vec3 r_lp = clamp(t_lp, vec3(-auth),   vec3(auth));
+    vec3 r_op = clamp(t_op, vec3(-auth_c), vec3(auth_c));
+    vec3 corr_l = mix(c_lp, r_lp, snap) * w;
+    vec3 corr_c = mix(c_op, r_op, snap_c) * w_c;
 
     // Clip guard: one-sided near the ceiling — never pull a clipped/near-
-    // clipped plateau down.
+    // clipped plateau down. LUMA-PATH TERM ONLY (v1.9 audit F1): the
+    // chroma term is luma-neutral by construction, so it cannot darken a
+    // plateau — but a per-channel max() on a signed opponent vector clamps
+    // its negative channels, injecting luma and twisting hue exactly on
+    // near-clip colored banding, which CelFlare then expands. At
+    // gr_chroma = 0 the opponent component rides corr_l and receives the
+    // v1.8 per-channel guard verbatim.
     float clip_w = smoothstep(GR_CLIP_LO, GR_CLIP_HI, lum);
-    corr = mix(corr, max(corr, vec3(0.0)), clip_w);
+    corr_l = mix(corr_l, max(corr_l, vec3(0.0)), clip_w);
+    vec3 corr = corr_l + corr_c;
 
 #if gr_debug == 1
     return orig;
 #elif gr_debug == 2
-    return vec4(vec3(0.5) + corr * w * 32.0, 1.0);
+    return vec4(vec3(0.5) + corr * 32.0, 1.0);
 #elif gr_debug == 3
     return vec4(1.0 - w_flat, w, snap, 1.0);
+#elif gr_debug == 4
+    return vec4(1.0 - w_flat_c, w_c, snap_c, 1.0);
 #else
-    return vec4(orig.rgb + corr * w, orig.a);
+    return vec4(orig.rgb + corr, orig.a);
 #endif
 }

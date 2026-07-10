@@ -1,9 +1,12 @@
-// Small-template (TPL) architecture since 2026-07-10: grain is generated into
-// a 960x540 toroidal template (texels represent 4K-scan texels) and the
-// composite assembles a virtual 3840x2160 scan from per-block randomized
-// template windows, AV1-FGS style. This file is CANONICAL and hand-maintained;
-// the pre-TPL full-field build is parked as filmgrain-matchv1.glsl for A/B
-// (same params/state layout — load one, never both).
+// ===== PARKED v1 (full-field build) =====================================
+// The shipping filmgrain-match.glsl is the small-template (TPL) build as of
+// 2026-07-10; this file is the pre-TPL full 3840x2160-field architecture,
+// kept for field A/B (same grain_* params, same GRAIN_STATE layout).
+// Load ONE of the two, never both. NB when swapping between builds
+// mid-session, restart mpv: the persistent GRAIN_FIELD texture differs in
+// size between builds and reload behavior for a size-mismatched persistent
+// texture is unverified (SSBO state is guarded by STATE_MAGIC; the texture
+// is not).
 // Copyright (C) 2026 Ágúst Ari
 // Licensed under GPL-3.0 — see LICENSE
 //
@@ -61,15 +64,16 @@
 //                    grain (1 = fresh grain every source frame / "on ones", the
 //                    default; 0.5 = every 2nd source frame / "on twos"). Seeded
 //                    from m_gen_frame so it's display-refresh independent.
-//   grain_gen_rate   TEMPLATE regeneration cadence as a fraction of grain_rate
-//                    ticks. In the TPL architecture the on-screen arrangement
-//                    rehashes every tick regardless (block shuffle), so this
-//                    only sets how often the template's texel vocabulary and
-//                    baked character refresh. 1 (default) = every tick — the
-//                    template gen is ~0.1 ms so there is no longer a perf
-//                    reason to lower it; <1 remains as a knob for weak GPUs.
-//                    Amplitude/tone keying stays per-frame at any rate,
-//                    warming/fast-EMA
+//   grain_gen_rate   field REGENERATION cadence as a fraction of grain_rate ticks.
+//                    0.5 (default) / 0.25 = regenerate every 2nd / 4th tick and
+//                    present a randomized toroidal shift+flip of the standing
+//                    field on the others — statistically fresh grain at
+//                    ~half/quarter generation cost; 1 = regenerate every tick
+//                    (exact pre-feature behavior). 0.25 is the practical
+//                    minimum: steady-state character steps stay masked by the
+//                    reseed; below it the savings asymptote while slow
+//                    grain-regime crossfades start stepping. Amplitude/tone
+//                    keying stays per-frame at any rate, warming/fast-EMA
 //                    frames always regenerate at full rate, and a confident
 //                    hard cut regenerates in place, so the measured grain
 //                    character never goes stale across a cut.
@@ -169,11 +173,11 @@
 1.0
 
 //!PARAM grain_gen_rate
-//!DESC Template regeneration cadence as a fraction of grain_rate ticks. The on-screen grain arrangement rehashes every tick regardless (block shuffle), so this only sets how often the template's texel vocabulary and baked character refresh. 1 (default) = every tick; the template gen is ~0.1 ms, so lower values are a knob for weak GPUs, not a tuned look. A confident hard cut always regenerates in place.
+//!DESC Field regeneration cadence as a fraction of grain_rate ticks: 1 = regenerate every tick (exact pre-feature behavior), 0.5 (default) / 0.25 = regenerate every 2nd / 4th tick and present a randomized toroidal shift+flip of the standing field on the others (statistically fresh, ~half/quarter generation cost). 0.25 is the practical minimum (character steps stay masked); a confident hard cut always regenerates in place.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.1
 //!MAXIMUM 1.0
-1.0
+0.5
 
 //!PARAM grain_base_sat
 //!TYPE DYNAMIC float
@@ -296,7 +300,7 @@
 //!STORAGE
 
 //!TEXTURE GRAIN_FIELD
-//!SIZE 960 540
+//!SIZE 3840 2160
 //!FORMAT rgba16f
 //!STORAGE
 
@@ -307,7 +311,7 @@
 //!WIDTH 1
 //!HEIGHT 1
 //!COMPUTE 32 32
-//!DESC Film Grain Match: LUMA measure
+//!DESC Film Grain Match v1: LUMA measure
 
 #define MID_FLOOR    0.15
 #define STEEP_FLOOR  2.6
@@ -701,19 +705,18 @@ void hook() {
             bool hard_cut = sat_frac > hardcut_frac;
             if (hard_cut) m_measured = min(m_measured, CUT_REREADY);
             bool content_held = content_total > 0.0 && content_mean_abs < CONTENT_HELD_EPS;
-            // TEMPLATE REGEN decision (single thread here -> race-free; the gen
-            // pass consumes m_regen next dispatch). grain_gen_rate gates only
-            // the TEMPLATE's regeneration — the on-screen grain ARRANGEMENT
-            // rehashes every visible tick regardless, in the composite's block
-            // shuffle — so at rate < 1 the skipped ticks reuse the standing
-            // template's texel vocabulary under a fresh arrangement.
-            // m_field_seed = the visible seed the template was generated AT:
-            // the gen pass seeds its noise from it, so a hard-cut regen
-            // refreshes the measured character while HOLDING the same noise
-            // lattice (the composite does not read m_field_seed). hard_cut
-            // (the confident regime-change detector above) forces that
-            // in-place regen so the baked grain character (size law, soften,
-            // bandpass fire) can never go stale across a cut. And any
+            // FIELD REGEN decision (single thread here -> race-free; the gen pass
+            // consumes m_regen next dispatch, the composite m_field_seed). A
+            // visible tick regenerates only every 1/grain_gen_rate ticks; skipped
+            // ticks are presented as a randomized toroidal shift+flip of the
+            // standing field by the composite (see the recycle transform there).
+            // m_field_seed = the visible seed the field was generated AT: the gen
+            // pass seeds its noise from it (so a hard-cut regen refreshes the
+            // measured character while HOLDING the standing pattern), and the
+            // composite derives the recycle transform from vseed - m_field_seed
+            // (0 = identity = bit-exact prior behavior). hard_cut (the confident
+            // regime-change detector above) forces the in-place regen so the
+            // baked grain character can never go stale across a cut. And any
             // frame that advances a FAST-phase EMA regenerates at full rate:
             // the field-baked character (size law, soften, bandpass fire) moves
             // ALPHA_FAST ~20% on such a frame, and a recycled multi-tick step
@@ -731,7 +734,8 @@ void hook() {
             // wrong condition held the door open forever (found empirically on
             // the flat-gray harness source). Frames that advance NO EMA cannot
             // move the baked character at all; settled ALPHA_SLOW drift steps
-            // through a pow-law map, masked by the always-fresh arrangement.
+            // ~3% per skipped tick through a pow-law map, masked by the pattern
+            // reseed it always coincides with.
             float vseed = floor(m_gen_frame * grain_rate);
             float vprev = floor(max(m_gen_frame - 1.0, 0.0) * grain_rate);
             bool vtick = vseed != vprev;
@@ -1236,23 +1240,18 @@ void hook() {
 //!BIND GRAIN_STATE
 //!BIND GRAIN_FIELD
 //!SAVE GRAIN_GEN_TRIGGER
-//!WIDTH 960
-//!HEIGHT 540
+//!WIDTH 3840
+//!HEIGHT 2160
 //!COMPUTE 32 32
-//!DESC Film Grain Match: GRAIN gen (960x540 template, source-locked)
+//!DESC Film Grain Match v1: GRAIN gen (fixed 4K, source-locked)
 
 // LUMA hook = mpv's FRESH group: runs once per SOURCE frame regardless of
 // video-sync / display refresh (measured 24.x/s under both display-resample
 // @120Hz and audio sync, 2026-07-06). The OUTPUT composite (redraw group,
 // per-present) just fetches GRAIN_FIELD, so re-presents cost ~nothing and
-// grain cadence can't ride the display refresh. TPL ARCHITECTURE
-// (2026-07-10): the grain "scan" is a VIRTUAL 3840x2160 4K field, but this
-// pass only generates the physical 960x540 TEMPLATE — the composite
-// assembles the virtual scan from per-block randomized template windows
-// (AV1-FGS style; see the block shuffle there). Template texels REPRESENT
-// 4K-scan texels, so every sigma below stays in 4K-reference units and
-// generation cost scales with TEMPLATE area (~0.2 ms vs 3.4 at full size;
-// 960x540 = the measured quality/perf knee, dev grain-genrate README).
+// grain cadence can't ride the display refresh. The 3840x2160 grid is the
+// grain's own resolution ("a fixed 4K scan"): generation cost is constant,
+// and GRAIN_RES_REF scaling below collapses to 1 (the grid IS the 4K ref).
 //
 // STORAGE-TEXTURE RECOVERY (2026-07-06): the earlier split SAVE'd GRAIN_FIELD
 // from this fresh pass and BIND'd it in the OUTPUT redraw pass — but a SAVE'd
@@ -1262,8 +1261,8 @@ void hook() {
 // top-of-file, like the GRAIN_STATE SSBO) that we imageStore into here and
 // imageLoad from in the composite. Persistent storage retains its contents across
 // presents, so a redraw (no fresh dispatch) reads the last-written field. This
-// fresh pass still needs a dispatch grid, so it SAVEs a throwaway trigger
-// texture (GRAIN_GEN_TRIGGER, never bound) purely to size the 960x540 dispatch.
+// fresh pass still needs a dispatch grid, so it SAVEs a throwaway 4K trigger
+// texture (GRAIN_GEN_TRIGGER, never bound) purely to size the 3840x2160 dispatch.
 // GRAIN_FIELD is rgba16f: rgb = final signed grain (bandpass + warp + chroma),
 // a = the pre-warp LOWPASS grain's luma (debug A/B strips).
 
@@ -1288,20 +1287,18 @@ void hook() {
 // Output res the crisp default is calibrated for (grain sigma scales by
 // OUTPUT_height/REF so it reads as a 4K scan at constant visual angle on any display).
 #define GRAIN_RES_REF 2160.0
-// Physical TEMPLATE dims. The noise seed wraps on these so the template is
-// TOROIDAL: the composite's per-block window fetches (offset + flip + overlap
-// halo) wrap on the template extent and must not show a seam. Wrapping the
-// seed coordinate makes noise(grid)==noise(0); the separable DoG halo then
-// wraps too (each workgroup regenerates its halo from global coords), so the
-// seam is continuous. In-range coords (the whole template interior) are
-// unchanged. MUST equal this pass's WIDTH/HEIGHT directives above (960 x 540)
-// — same translation unit, no compile guard. NOT the 4K scan size: the scan
-// is virtual (GRAIN_RES_REF anchors it); template texels represent 4K-scan
-// texels. The composite derives its dims from imageSize(GRAIN_FIELD) so it
-// can't desync; only these two same-file sites are hand-kept in lockstep.
-// (Directive prefix omitted here on purpose: the parser splits sections on
-// that marker even inside a comment.)
-#define GEN_GRID ivec2(960, 540)
+// Fixed grain-grid dims. The noise seed wraps on these so the field is TOROIDAL:
+// the composite fetches gid % grid, and a display taller/wider than the grid
+// (e.g. the 3456x2234 XDR wraps vertically at 2160) must not show a seam. Wrapping
+// the seed coordinate makes noise(grid)==noise(0); the separable DoG halo then
+// wraps too (each workgroup regenerates its halo from global coords), so the seam
+// is continuous. In-range coords (the whole grid interior) are unchanged.
+// MUST equal this pass's WIDTH/HEIGHT directives above (3840 x 2160) — same
+// translation unit, no compile guard. The composite derives its dims from
+// imageSize(GRAIN_FIELD) so it can't desync; only these two same-file sites are
+// hand-kept in lockstep. (Directive prefix omitted here on purpose: the parser
+// splits sections on that marker even inside a comment.)
+#define GEN_GRID ivec2(3840, 2160)
 // Per-channel render-sigma cap. The 9-tap support holds a Gaussian cleanly to ~1.5;
 // beyond that it would truncate. The coarse extreme (low-fineR firing) and >4K
 // res-scaling can push a channel past it, so cap GRACEFULLY (slightly finer than
@@ -1636,10 +1633,9 @@ void hook() {
     float gs_fire = smoothstep(0.12, 0.30, w);
     float gs = grain_sharpness * match_grain;
     // RESOLUTION NORMALIZATION (two different scalings, folded into the k mix).
-    // Grain is generated into the 960x540 TEMPLATE whose texels represent
-    // texels of the virtual GRAIN_RES_REF 4K scan; the composite assembles the
-    // scan from block windows and samples it at 2160/output_h -> the sigmas
-    // here are all in 4K-REFERENCE texels, and the composite converts to
+    // Grain is generated at the FIXED 3840x2160 grid = GRAIN_RES_REF (the "4K
+    // scan"), then the composite SAMPLES it scaled by grid_h/output_h -> so the
+    // sigmas here are all in 4K-REFERENCE texels, and the composite converts to
     // display size (constant visual angle):
     //  - NEUTRAL (the clean-content 4K-film-scan default) is a fixed 4K-reference
     //    sigma -> vis_scale is identically 1 (the grid IS the 4K ref); the
@@ -1650,7 +1646,7 @@ void hook() {
     //    stretched to 4K; the composite scale then carries it to the display.
     float src_h = (m_source_height > 1.0) ? m_source_height : HOOKED_size.y;
     float vis_scale = 1.0;                                        // grid IS the 4K ref
-    float src_scale = 2160.0 / src_h;                             // VIRTUAL 4K-scan ref / SOURCE (TPL: stays 2160, template texels REPRESENT 4K-scan texels — do NOT tie to GEN_GRID.y)
+    float src_scale = 2160.0 / src_h;                             // GRID / SOURCE (2160 MUST equal GEN_GRID.y / //HEIGHT / //SIZE)
     float k_neutral = mix(1.0, K_NEUTRAL * vis_scale, gs);
     float k_size = mix(k_neutral, gs_k_tgt * src_scale, gs * gs_fire);
     // grain_size: live size multiplier (1.0 = calibrated). <1 finer, >1 coarser. Lets
@@ -1912,9 +1908,9 @@ void hook() {
     // (The composite-side scalars + the dispatch-trigger write moved above the
     // regen gate — they must run on every source frame, this store must not.)
     float lowpass_luma = dot(vec3(vsum1_r, vsum1_g, vsum1_b), luma_coeff);
-    // Write the finished template into the PERSISTENT storage texture (survives
-    // across presents). The trigger dispatch rounds 540 up to 544 rows (COMPUTE 32),
-    // so guard against the 4 out-of-range rows: an OOB imageStore is a spec-legal
+    // Write the finished field into the PERSISTENT storage texture (survives across
+    // presents). The 4K trigger dispatch rounds 2160 up to 2176 rows (COMPUTE 32),
+    // so guard against the 16 out-of-range rows: an OOB imageStore is a spec-legal
     // silent no-op on both Vulkan and D3D11, but gate it explicitly rather than lean
     // on backend drop behavior (no barrier follows, so the divergent branch is safe).
     ivec2 gpos = ivec2(gl_GlobalInvocationID.xy);
@@ -1927,7 +1923,7 @@ void hook() {
 //!BIND GRAIN_STATE
 //!BIND GRAIN_FIELD
 //!COMPUTE 32 32
-//!DESC Film Grain Match: OUTPUT composite + debug
+//!DESC Film Grain Match v1: OUTPUT composite + debug
 
 // The per-present half: this is the shader's only pass in mpv's REDRAW group
 // (re-runs per present -- up to display Hz under display-resample), so it
@@ -1935,8 +1931,6 @@ void hook() {
 // to be derived here (eff_render/mid/steep, conf, shape_w) now come from the
 // source-locked gen pass via GRAIN_STATE / GRAIN_FIELD.
 #define DENSITY_GAIN 1.0
-#define TPL_BLOCK 64.0   // shuffle tile size in 4K-scan texels
-#define TPL_OV    8.0    // overlap-blend band width past each block boundary
 #define TUKEY_SCALE  0.459
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
@@ -1983,36 +1977,12 @@ vec4 grain_point(vec2 fpos, ivec2 g) {
     return imageLoad(GRAIN_FIELD, a);
 }
 
-// Same PCG as the measure/gen units — the block shuffle below needs a few
+// Same PCG as the measure/gen units — the recycle transform below needs a few
 // decorrelated words per visible tick.
 uint pcg_hash(uint s) {
     uint state = s * 747796405u + 2891336453u;
     uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
-}
-
-// One block's grain sample for an arbitrary virtual-scan position pos. b is
-// the block index doing the presenting (possibly a neighbour of pos's own
-// block, when evaluating the overlap bands — intra then exceeds [0,BLOCK)
-// and the flip can go one period negative, bounded by -TPL_OV). One template
-// extent is added before the fetch so the coordinate reaching grain_point's
-// integer wrap is ALWAYS non-negative: GLSL leaves % formally undefined on
-// negative operands, and while every real backend folds it correctly through
-// the double-mod, the D3D11/SPIRV-Cross path is unvalidated — one vec2 add
-// buys spec-clean portability (audit 2026-07-10). Wrap-equivalent, so output
-// is bit-identical. Each block shows a randomized (integer offset + H/V
-// flip) window of the toroidal template, re-hashed per visible tick.
-vec4 tpl_sample(vec2 b, vec2 pos, float vseed, ivec2 g) {
-    vec2 intra = pos - b * TPL_BLOCK;
-    uint h0 = pcg_hash(uint(int(b.x)) * 374761393u
-                     + uint(int(b.y)) * 3266489917u
-                     + uint(vseed) * 668265263u);
-    uint h1 = pcg_hash(h0);
-    uint h2 = pcg_hash(h1);
-    if ((h2 & 1u) != 0u) intra.x = TPL_BLOCK - intra.x;
-    if ((h2 & 2u) != 0u) intra.y = TPL_BLOCK - intra.y;
-    return grain_point(intra + vec2(g)
-                       + vec2(float(h0 % uint(g.x)), float(h1 % uint(g.y))), g);
 }
 
 void hook() {
@@ -2030,61 +2000,36 @@ void hook() {
     // directives (the cross-TU "constant sync" footgun; audit 2026-07-06).
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     ivec2 gsize = imageSize(GRAIN_FIELD);
-    // TPL: gscale maps to the VIRTUAL 4K scan (2160-ref), NOT the physical
-    // template extent — gsize only wraps the per-block template fetches.
-    float gscale = 2160.0 / max(HOOKED_size.y, 1.0);
+    float gscale = float(gsize.y) / max(HOOKED_size.y, 1.0);
     vec2 fpos = (vec2(gid) + 0.5) * gscale;
-    // KNOWN LIMIT (audit 2026-07-10): the overlap blend preserves variance
-    // exactly (weights' squares sum to 1) but not DISTRIBUTION SHAPE — a
-    // weighted sum of independent warped samples is more Gaussian than its
-    // inputs. At value_warp >= ~2 (deliberately bimodal grain) the bands
-    // carry measurably softer per-grain contrast (kurtosis 1.19 -> 1.65
-    // edge / 2.01 corner at warp 3), on ~23% of pixels. Invisible in
-    // playback (the jitter moves the bands every tick) and borderline even
-    // in adversarial freeze-frames at gain 12; accepted freeze-frame-only
-    // limitation rather than restructuring warp to post-blend.
-    // TPL BLOCK SHUFFLE (small-template architecture, AV1-FGS style).
-    // Each TPL_BLOCK-sized tile of the virtual 4K scan presents a per-tile
-    // randomized (integer offset + H/V flip) window of the physical
-    // template, re-hashed every visible tick (see tpl_sample above).
-    // Per-grain statistics are the template's texels (same DoG/warp/chroma
-    // pipeline at 4K-scan texel scale); only the long-range arrangement
-    // reuses template windows. The per-tick rehash supersedes the
-    // full-size build's whole-field recycle transform. Two seam defenses,
-    // both empirically required (dev/grain-genrate/README):
-    //  - per-tick LATTICE PHASE JITTER (whole-texel origin shift hashed
-    //    from vseed) so the boundary discontinuity never sits on the same
-    //    pixels twice — kills temporal accumulation of the 64px grid;
-    //  - AV1-style OVERLAP BLEND: within TPL_OV texels past a boundary,
-    //    crossfade from the neighbour block's window with cos/sin weights
-    //    (sum of squares = 1 -> grain RMS exactly preserved; adjacent
-    //    windows are independent template regions) — kills the
-    //    freeze-frame lattice (in-block DoG correlation breaks at raw
-    //    boundaries: measured 1.65x gradient energy without this).
-    // Continuity: at u == 0 the sample IS the neighbour's (weight 1) and
-    // ramps out by u == TPL_OV. Outside the bands it is a single exact
-    // texel fetch at gscale == 1.0, as before.
+    // FIELD RECYCLE TRANSFORM (grain_gen_rate < 1). On visible ticks the gen
+    // pass skipped, present a per-tick randomized toroidal shift + flip of the
+    // standing field: offsets are hashed independently per tick (no coherent
+    // drift, so nothing can read as motion/swimming) and displace uniformly
+    // over the whole grid — far beyond the grain correlation length — so the
+    // per-pixel frame-to-frame correlation is ~0, i.e. statistically fresh
+    // grain for the cost of a few ALU ops. Flips kill any large-scale texture
+    // familiarity; 90-degree rotations are excluded (the grid is not square).
+    // The float mod() keeps the flip input in [0,grid) so the wrap in
+    // grain_point never sees a negative coordinate (int % is undefined on
+    // negatives); flipping about the grid extent maps texel centres to texel
+    // centres and offsets are whole texels, so the gscale==1.0 exact-texel
+    // property survives the transform. sub == 0 — every tick at the default
+    // grain_gen_rate 1.0, and every regen tick otherwise — is the identity:
+    // bit-identical to prior behavior.
     float vseed = floor(m_gen_frame * grain_rate);
-    uint j0 = pcg_hash(uint(vseed) * 2246822519u + 3u);
-    vec2 fj = fpos + vec2(float(j0 % 64u), float((j0 >> 8) % 64u));
-    vec2 b = floor(fj / TPL_BLOCK);
-    vec2 u = fj - b * TPL_BLOCK;
-    float wxp = 0.0, wxc = 1.0, wyp = 0.0, wyc = 1.0;
-    if (u.x < TPL_OV) {
-        float t = u.x / TPL_OV * 1.5707963;
-        wxp = cos(t); wxc = sin(t);
+    float sub = vseed - m_field_seed;
+    if (sub > 0.5) {
+        uint h1 = pcg_hash(uint(vseed));
+        uint h2 = pcg_hash(h1);
+        uint h3 = pcg_hash(h2);
+        vec2 gext = vec2(gsize);
+        fpos = mod(fpos, gext);
+        if ((h3 & 1u) != 0u) fpos.x = gext.x - fpos.x;
+        if ((h3 & 2u) != 0u) fpos.y = gext.y - fpos.y;
+        fpos += vec2(float(h1 % uint(gsize.x)), float(h2 % uint(gsize.y)));
     }
-    if (u.y < TPL_OV) {
-        float t = u.y / TPL_OV * 1.5707963;
-        wyp = cos(t); wyc = sin(t);
-    }
-    vec4 gfield4 = (wxc * wyc) * tpl_sample(b, fj, vseed, gsize);
-    if (wxp > 0.0)
-        gfield4 += (wxp * wyc) * tpl_sample(b - vec2(1.0, 0.0), fj, vseed, gsize);
-    if (wyp > 0.0)
-        gfield4 += (wyp * wxc) * tpl_sample(b - vec2(0.0, 1.0), fj, vseed, gsize);
-    if (wxp > 0.0 && wyp > 0.0)
-        gfield4 += (wxp * wyp) * tpl_sample(b - vec2(1.0, 1.0), fj, vseed, gsize);
+    vec4 gfield4 = grain_point(fpos, gsize);
     vec3 vsum = gfield4.rgb;
 
     // grain_hdr bridge: work in the measured SDR domain (see helpers above).

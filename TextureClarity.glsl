@@ -8,28 +8,28 @@
 //@shampv input any
 
 //!PARAM tc_strength
-//!DESC Sharpening strength. 12 = shipped tune, 0 = off.
+//!DESC Sharpening strength. ↑ = sharper · 12 = shipped tune · 0 = off.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 24.0
 12.0
 
 //!PARAM tc_coring
-//!DESC Coring threshold — high-pass deltas below this are ignored (keeps noise from being sharpened). Raise for noisier sources.
+//!DESC Coring threshold — high-pass deltas below this are ignored (stops noise being sharpened). ↑ for noisier sources · ↓ sharpens finer detail.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 0.003
 0.0005
 
 //!PARAM tc_texture_thresh
-//!DESC Texture floor — minimum local variance that counts as real texture rather than noise. Raise to sharpen only stronger detail.
+//!DESC Texture floor — minimum local variance treated as real texture, not noise. ↑ = sharpen only stronger detail · ↓ = also lift faint texture.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.005
 //!MAXIMUM 0.08
 0.02
 
 //!PARAM tc_max_delta
-//!DESC Per-pixel luma change cap — hard ceiling on how much sharpening may move any pixel.
+//!DESC Per-pixel luma change cap — hard ceiling on how far sharpening may move any pixel. ↑ = allow bigger swings · ↓ = safer.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.001
 //!MAXIMUM 0.05

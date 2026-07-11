@@ -31,63 +31,63 @@
 //@shampv active-if grain_preset 0 grain_intensity grain_saturation grain_mid grain_steepness
 
 //!PARAM grain_preset
-//!DESC Baked look: 0 = custom (use the grain_* knobs below), 1 = light, 2 = medium, 3 = heavy. A preset (>0) drives intensity, saturation, mid, steepness and the per-channel chroma balance, so those knobs are ignored while it is active; grain_size, grain_rate, grain_hdr and grain_ref_white stay independent.
+//!DESC Baked look. 0 = custom (grain_* knobs) · 1 light · 2 medium · 3 heavy. Presets set intensity/saturation/mid/steepness; size/rate/hdr/ref_white stay live.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 3.0
 0.0
 
 //!PARAM grain_intensity
-//!DESC Grain amplitude, used when grain_preset = custom (light ~0.05, medium ~0.12, heavy ~0.20). Ignored when a preset is active.
+//!DESC Grain amplitude (custom preset only). ↑ = stronger, 0 = none. light ~0.05, medium ~0.12, heavy ~0.20. Ignored when a preset is active.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 0.5
 0.05
 
 //!PARAM grain_saturation
-//!DESC Grain chroma (custom only), 0 = monochrome, 1 = full per-channel color. Applied at generation, so it updates on the next source frame. Ignored when a preset is active.
+//!DESC Grain chroma (custom only). 0 = monochrome · ↑ 1 = full per-channel color. Updates on the next source frame. Ignored when a preset is active.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.10
 
 //!PARAM grain_size
-//!DESC Grain cell size at a 4K reference (constant visual angle). 1.0 = calibrated, >1 coarser, <1 finer. Live, display-scaled.
+//!DESC Grain cell size at a 4K reference (constant visual angle). ↓ <1 = finer · ↑ >1 = coarser. 1 = calibrated. Live, display-scaled.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.5
 //!MAXIMUM 3.0
 1.0
 
 //!PARAM grain_mid
-//!DESC Tone where grain peaks (custom only): 0 = shadows, 0.5 = midtones, 1 = highlights. Ignored when a preset is active.
+//!DESC Tone where grain peaks (custom only). ↓ 0 = shadows · 0.5 = midtones · ↑ 1 = highlights. Ignored when a preset is active.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.5
 
 //!PARAM grain_steepness
-//!DESC Tone-bell tightness (custom only). Higher confines grain to the mid and keeps highlights cleaner. Ignored when a preset is active.
+//!DESC Tone-bell tightness (custom only). ↑ = confine grain to the mid tone, cleaner highlights · ↓ = spread wider. Ignored when a preset is active.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.5
 //!MAXIMUM 20.0
 2.0
 
 //!PARAM grain_rate
-//!DESC Reseed cadence in SOURCE frames: 1.0 = every frame (on ones), 0.5 = on twos. Display-refresh independent.
+//!DESC Reseed cadence in SOURCE frames. 1 = every frame / on ones · 0.5 = on twos · ↓ slows the boil. Display-refresh independent.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.1
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grain_hdr
-//!DESC HDR chain mode — set 1 when the output is PQ BT.2020 (the CelFlare SDR-to-HDR chain). Keys and applies grain in the SDR domain via a per-pixel PQ bridge; grain fades to zero above reference white. 0 = plain SDR (exact prior behavior).
+//!DESC HDR chain mode. 1 = output is PQ BT.2020 (CelFlare SDR→HDR): keys/applies grain in SDR via a per-pixel PQ bridge, fades out above ref white · 0 = plain SDR (bit-identical).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
 //!PARAM grain_ref_white
-//!DESC SDR reference white in nits for the HDR bridge — match hdr-reference-white (and CelFlare's cf_ref_white).
+//!DESC SDR reference white (nits) for the HDR bridge — match hdr-reference-white and CelFlare's cf_ref_white. Only used when grain_hdr = 1.
 //!TYPE DYNAMIC float
 //!MINIMUM 80.0
 //!MAXIMUM 480.0

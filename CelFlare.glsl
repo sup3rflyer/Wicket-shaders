@@ -49,84 +49,84 @@
 // directive — the parser folds them into the value and fails to load.
 
 //!PARAM cf_ref_white
-//!DESC SDR white level in nits — MUST match hdr-reference-white in mpv.conf. On Windows this is your "SDR content brightness" slider (see README for the slider-to-nits table).
+//!DESC SDR white level in nits — MUST match hdr-reference-white in mpv.conf. On Windows = the 'SDR content brightness' slider (README has the slider-to-nits table).
 //!TYPE DYNAMIC float
 //!MINIMUM 80.0
 //!MAXIMUM 480.0
 116.0
 
 //!PARAM cf_strength
-//!DESC Overall HDR strength. 1 = the shipped tune, 0 = plain SDR (no expansion at all), 2 = double. Scales everything: base expansion, specular pop, and light pump.
+//!DESC Overall HDR strength. 1 = shipped tune · 0 = plain SDR, no expansion · ↑ 2 = double. Scales base expansion, specular pop and light pump together.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
 1.0
 
 //!PARAM cf_curve
-//!DESC How harshly expansion ramps up. Below 1 = gentle, broad lift spread across the highlights; above 1 = expansion concentrated hard against the brightest pixels for a punchier pop. Peak brightness itself does not change.
+//!DESC Expansion ramp shape. ↓ <1 = gentle broad lift · ↑ >1 = punch on brightest pixels. Peak unchanged. Default 1.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.6
 //!MAXIMUM 1.8
 1.0
 
 //!PARAM cf_shoulder
-//!DESC Highlight shoulder — softens how hard expansion arrives at the brightest pixels. 0 = steepest near-clip differentiation; 1 = expansion reaches its peak with no extra steepening. Default 0.7 — smooths high-APL sources without visibly darkening anything (validated on high-key anime); drop toward 0.4 for maximum near-clip differentiation.
+//!DESC Highlight shoulder — eases how hard expansion hits the brightest pixels. ↑ 1 = smoother, no steepening · ↓ 0 = steepest near-clip pop. 0.7 shipped.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.7
 
 //!PARAM cf_spec
-//!DESC Specular pop — extra punch on glints, light sources, and clipped highlights. Default 0.6 = the shipped tune (scales the internal spec peaks), 0 = off.
+//!DESC Specular pop — extra punch on glints, light sources, clipped highlights. ↑ = punchier · 0 = off. Default 0.6 (shipped, scales internal spec peaks).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
 0.6
 
 //!PARAM cf_pump
-//!DESC Light pump — a temporary surge on sudden sustained brightening (explosions, tunnel exits, spells). 1 = shipped tune, 0 = off.
+//!DESC Light pump — temporary surge on sustained brightening (explosions, tunnel exits, spells). ↑ = stronger surge · 1 = shipped · 0 = off.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
 1.0
 
 //!PARAM cf_grain_stab
-//!DESC Grain stabilization — keeps film grain looking like film grain after expansion instead of shimmering.
+//!DESC Grain stabilization (toggle). 1 = keep film grain filmic after expansion instead of shimmering · 0 = off.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1
 1
 
 //!PARAM cf_spec_bonus
-//!DESC Specular bonus feature — master switch for the cf_spec slider.
+//!DESC Master switch for the cf_spec specular-pop slider. 1 = on · 0 = disables cf_spec.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1
 1
 
 //!PARAM cf_light_pump
-//!DESC Light pump feature — master switch for the cf_pump slider.
+//!DESC Master switch for the cf_pump light-pump slider. 1 = on · 0 = disables cf_pump.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1
 1
 
 //!PARAM cf_spatial_pump
-//!DESC Pump localization — confine the light pump to the region of the frame that is actually brightening. 0 = scene-global pump only.
+//!DESC Pump localization (toggle). 1 = confine the pump to the region actually brightening · 0 = scene-global pump only.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1
 1
 
 //!PARAM cf_warm_shift
-//!DESC Warm-hue correction — stops fire, sunsets, and skin from drifting green as they get brighter.
+//!DESC Warm-hue correction (toggle). 1 = stop fire, sunsets and skin drifting green as they brighten · 0 = off.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1
 1
 
 //!PARAM cf_pale_skin
-//!DESC Pale-skin protection — keeps fair skin from washing out in bright scenes.
+//!DESC Pale-skin protection (toggle). 1 = keep fair skin from washing out in bright scenes · 0 = off.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1

@@ -109,141 +109,161 @@
 //@shampv measures LUMA
 
 //!PARAM match_grain
+//!DESC Master grain mix. 1 = full matched grain (shipped) · 0 = bypass, bit-identical to the source. mix() between, so on/off A/B is non-destructive.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM debug_match
+//!DESC Debug overlay (toggle). 1 = machine-readable state readout + CLEAN|LOWPASS|BANDPASS patches · 0 = normal output.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
 //!PARAM state_epoch
+//!DESC Persisted-state reset token — bump to any new value to wipe the saved grain EMA state live (once per source file). The magnitude itself is meaningless.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 65535.0
 0.0
 
 //!PARAM grain_gain
+//!DESC Overall grain amount. ↑ stronger / more visible · ↓ fainter, 0 = none. Default 2 (1 = calibrated plate match; up to 12). Can push past the internal ceiling.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 12.0
 2.0
 
 //!PARAM grain_size
+//!DESC Grain cell size. ↓ <1 = finer · ↑ >1 = coarser. 1 = calibrated. Rising also lets the bandpass bite harder.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.3
 //!MAXIMUM 2.5
 1.0
 
 //!PARAM grain_contrast
+//!DESC Spectral hardness (difference-of-Gaussians). ↓ toward 0 = soft/lowpass · ↑ 1 = sandpaper bandpass, 2 = peppery / more DC stripped. Default 1.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
 1.0
 
 //!PARAM value_warp
+//!DESC Value-domain contrast, amplitude-preserving. 0 = Gaussian (bit-identical) · ↑ ~2 = hard, ~3 = bimodal/harsh. The amplitude-domain cousin of grain_contrast.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 4.0
 0.0
 
 //!PARAM chroma_amp
+//!DESC Colored-grain layer amplitude (pure hue, luma removed). 0 = monochrome, A/B safe · ↑ = more color speckle. Only fires where grain confidently fires.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
 //!PARAM grain_sharpness
+//!DESC Global crispness. 1 = crisp 4K film-scan matched to plates (shipped) · ↓ toward 0 = softer, 0 = bit-identical to the old soft Light look.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grain_rate
+//!DESC Temporal cadence in SOURCE frames. 1 = fresh grain every frame / on ones · 0.5 = on twos. ↓ slows the boil. Display-refresh independent.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.1
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grain_gen_rate
-//!DESC Template regeneration cadence as a fraction of grain_rate ticks. The on-screen grain arrangement rehashes every tick regardless (block shuffle), so this only sets how often the template's texel vocabulary and baked character refresh. 1 (default) = every tick; the template gen is ~0.1 ms, so lower values are a knob for weak GPUs, not a tuned look. A confident hard cut always regenerates in place.
+//!DESC Template refresh cadence (× grain_rate ticks). 1 = every tick (shipped) · ↓ only eases weak GPUs (gen ~0.1 ms), not a look knob; the block shuffle rehashes every tick.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.1
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grain_base_sat
+//!DESC Per-channel color independence of the base grain. 0 = true mono · ↑ = more baked-in hue speckle. 0.25 = calibrated (RMS bookkeeping is tuned for it).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.25
 
 //!PARAM restore_gain
+//!DESC Grain rebuilt on crushed sources (extrapolate past what survived). ↓ toward 1 = match only survivors · 4 = rebuild most (shipped, = max). Capped by the internal ceiling.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 4.0
 4.0
 
 //!PARAM restore_floor
+//!DESC Grain in low-confidence areas. ↑ = uncertain / borderline regions get grained more readily · ↓ = restrict to confident areas. Default 0.4.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.40
 
 //!PARAM grain_restore_taper
+//!DESC Taper restore_gain→1 as measured amplitude rises (the Lain over-apply fix). 0 = off / flat, A/B safe · 1 = spare already-heavy grain.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
 //!PARAM density_combine
+//!DESC Grain combine mode (toggle). 1 = multiplicative density, rides brightness like film (shipped) · 0 = additive.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grid_snap
+//!DESC Size-measurement mode (toggle). 1 = pixel-snapped grid + autotuned size law (shipped) · 0 = old half-pixel grid + hand-set law (exact pre-snap look).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grain_attack
+//!DESC Attack: how fast grain builds to a new scene (EMA rate). ↑ = ramps up faster · ↓ = slower, cautious. Kept slow so cuts can't pop grain upward.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.002
 //!MAXIMUM 0.30
 0.02
 
 //!PARAM grain_decay
+//!DESC Decay: how fast grain fades out (EMA rate). ↑ = sheds faster on grainy→clean cuts · ↓ = lingers. Default 0.04 > attack = cut-safe.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.002
 //!MAXIMUM 0.30
 0.04
 
 //!PARAM hardcut_frac
+//!DESC Hard-cut threshold (fraction of frame changed). ↑ = stricter, only near-total changes trigger fast re-converge · ↓ = more sensitive. Default 0.85.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.40
 //!MAXIMUM 1.0
 0.85
 
 //!PARAM pan_freeze
+//!DESC Freeze grain build-up during global pans (kills canvas-pan overfire; established grain holds). 1 = full freeze (shipped) · 0 = off. The fall path is untouched.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grain_hdr
-//!DESC HDR chain mode — set 1 when the output is PQ BT.2020 (the CelFlare sdr-to-hdr chain). Keys and applies grain in the measured SDR domain via a per-pixel PQ bridge; grain fades to zero shortly above reference white. 0 = exact prior SDR behavior.
+//!DESC HDR chain mode. 1 = output is PQ BT.2020 (CelFlare SDR→HDR): keys/applies grain in SDR via a per-pixel PQ bridge, fades out above ref white · 0 = plain SDR (bit-identical).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
 //!PARAM grain_ref_white
-//!DESC SDR reference white in nits for the HDR bridge — must match hdr-reference-white (and CelFlare's cf_ref_white).
+//!DESC SDR reference white (nits) for the HDR bridge — match hdr-reference-white and CelFlare's cf_ref_white. Only used when grain_hdr = 1.
 //!TYPE DYNAMIC float
 //!MINIMUM 80.0
 //!MAXIMUM 480.0

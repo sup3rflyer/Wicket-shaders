@@ -118,63 +118,63 @@
 // heatmap never contaminate their own statistics.
 
 //!PARAM nitmeter_mode
-//!DESC 1 = panel, 2 = heatmap + panel, 3 = heatmap (gamma-2.2 SDR export) + panel
+//!DESC Display mode. 1 = panel · 2 = heatmap + panel · 3 = heatmap (gamma-2.2 SDR export) + panel.
 //!TYPE DEFINE
 //!MINIMUM 1
 //!MAXIMUM 3
 1
 
 //!PARAM nitmeter_target
-//!DESC display peak nits for the P-row ceiling indicator + graph target line (match target-peak)
+//!DESC Display peak (nits) for the P-row ceiling indicator + graph target line. Match your target-peak.
 //!TYPE DYNAMIC float
 //!MINIMUM 100.0
 //!MAXIMUM 10000.0
 1000.0
 
 //!PARAM nitmeter_corner
-//!DESC panel corner: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right
+//!DESC Panel corner. 0 = top-left · 1 = top-right · 2 = bottom-left · 3 = bottom-right.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 3
 1
 
 //!PARAM nitmeter_scale
-//!DESC panel size multiplier (1.0 = ~136 px wide at 1080p)
+//!DESC Panel size multiplier. ↑ = bigger · ↓ = smaller. 1 = ~136 px wide at 1080p.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.5
 //!MAXIMUM 3.0
 1.0
 
 //!PARAM nitmeter_graph
-//!DESC 1 = append the P/9/A time-series strip (last ~5 s, log2 nit axis) under the histogram
+//!DESC Time-series strip (toggle). 1 = append the P/9/A graph (last ~5 s, log2 nit axis) under the histogram · 0 = off.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1
 0
 
 //!PARAM nitmeter_heat_nits
-//!DESC display brightness (nits) of the heatmap bands and histogram bars in PQ mode
+//!DESC Display brightness (nits) of the heatmap bands + histogram bars in PQ mode. ↑ = brighter overlay.
 //!TYPE DYNAMIC float
 //!MINIMUM 40.0
 //!MAXIMUM 1000.0
 180.0
 
 //!PARAM nitmeter_pct
-//!DESC 9-row percentile as the frame fraction allowed above it (0.0001 = 99.99th percentile; 0 = strict max)
+//!DESC 9-row percentile = frame fraction allowed above the 9 value. ↑ = more tolerant, 9 reads lower · 0 = strict max. 0.0001 = 99.99th pct.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 0.01
 0.0001
 
 //!PARAM nitmeter_reset
-//!DESC session reset edge: session maxima + hold + graph ring zero whenever this value CHANGES (cycle script bumps it per toggle-on)
+//!DESC Session reset edge — session maxima + hold + graph ring zero whenever this value CHANGES. Magnitude is meaningless (cycle script bumps it per toggle-on).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 16777216.0
 0.0
 
 //!PARAM nitmeter_sdr_guard
-//!DESC SDR-input tripwire: blank the panel + quarantine state when input looks like SDR gamma misread as PQ (0 only if feeding legit 8000+ nit material)
+//!DESC SDR-input tripwire (toggle). 1 = blank panel + quarantine state when input looks like SDR misread as PQ · 0 = off (only if feeding real 8000+ nit material).
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1

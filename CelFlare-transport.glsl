@@ -133,10 +133,10 @@
 1
 
 //!PARAM cf_debug
-//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars.
+//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars, 9 = motion flow (grey = still, R/G = +x/+y image motion, B = magnitude).
 //!TYPE DEFINE
 //!MINIMUM 0
-//!MAXIMUM 8
+//!MAXIMUM 9
 0
 
 //!BUFFER SCENE_STATE
@@ -153,12 +153,18 @@
 //!VAR float pump_env
 //!VAR float pump_cover_gate
 //!VAR float prev_illum[144]
+//!VAR float prev_illum_v[144]
 //!VAR float pump_fast_cell[144]
 //!VAR float pump_slow_cell[144]
 //!VAR float pump_env_cell[144]
 //!VAR float pump_mask_cell[144]
 //!VAR float pump_seed_cell[144]
 //!VAR float bar_run[8]
+//!STORAGE
+
+//!TEXTURE MOTION_PREV
+//!SIZE 128 72
+//!FORMAT rgba16f
 //!STORAGE
 
 //!HOOK MAIN
@@ -526,6 +532,121 @@ vec4 hook() {
 }
 
 // =============================================================================
+// PASS 4b-4d: PROPER MOTION SENSE (retained-prev-frame block-match) - EXPERIMENTAL
+// =============================================================================
+// A dedicated optical-flow front end (transport build) so the pump's motion
+// guards can key on a TRUE image-motion field instead of the sigma80 band-pass
+// proxy - which structurally cannot reach a broad lamp pan (the establishment
+// guards need a feature to hold still; a persistently-moving lamp establishes
+// nowhere). Three passes:
+//   (1) MOTION_CUR  - 128x72 edge-preserving luma downsample of MAIN
+//                     (8x8 px per 16x9 pump cell).
+//   (2) MOTION_FLOW - 16x9 per-cell block-match of MOTION_CUR against the
+//                     persistent MOTION_PREV (last frame), +-MOT_R px search,
+//                     truncated SAD. Output rg = best (dx,dy) px.
+//   (3) history     - MOTION_CUR -> MOTION_PREV for next frame, AFTER (2) has
+//                     read the old prev (file order == execution order).
+// PASS 5 consumes MOTION_FLOW: the motion-compensated brightness residual
+// |V_now - warp(V_prev, flow)| replaces the per-cell MASK freshness (established-
+// level + dipole + LK) with ONE test - small residual = transport (suppress),
+// large = emission (pump). SCOPE (paired audit): this governs the mask only; the
+// SCALAR onset (loc_on_sum) still uses the legacy established gate. Safe under
+// this build's SUBTRACTIVE apply (pump_local = pump_env x mask -> the MC mask
+// gates the product), NOT yet additive-safe - a reveal's garbage flow fails OPEN
+// with no scalar backstop under additive; needs a flow-confidence gate first.
+// Frame-0 safety: loop 2 (the MC consumer) is skipped while transient_reset is
+// set, so uninitialized MOTION_PREV / garbage flow never reaches persistent SSBO
+// state - do NOT move the MC block or loop 2 out of that guard.
+// Offline 16x9 cell-replica: pan mask-debit 0.87 (vs the affine gate's 0.50),
+// growth 0.09 (event pumps). A WRONG flow fails SAFE - the residual comes out
+// large -> no debit -> the event is protected, so no flow-confidence gate needed.
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!SAVE MOTION_CUR
+//!WIDTH 128
+//!HEIGHT 72
+//!DESC CelFlare: Motion analysis downsample
+vec4 hook() {
+    // Edge-preserving luma at 128x72 (8x8 px per 16x9 pump cell). 4 bilinear
+    // taps at the output-texel corners = modest box AA so a moving edge matches
+    // frame-to-frame without alias shimmer poisoning the block-match search.
+    const vec3 lc = vec3(0.2126, 0.7152, 0.0722);
+    vec2 o = vec2(0.5 / 128.0, 0.5 / 72.0);
+    float y = dot(HOOKED_tex(HOOKED_pos + vec2(-o.x, -o.y)).rgb, lc)
+            + dot(HOOKED_tex(HOOKED_pos + vec2( o.x, -o.y)).rgb, lc)
+            + dot(HOOKED_tex(HOOKED_pos + vec2(-o.x,  o.y)).rgb, lc)
+            + dot(HOOKED_tex(HOOKED_pos + vec2( o.x,  o.y)).rgb, lc);
+    return vec4(y * 0.25, 0.0, 0.0, 1.0);
+}
+
+//!HOOK MAIN
+//!BIND MOTION_CUR
+//!BIND MOTION_PREV
+//!SAVE MOTION_FLOW
+//!WIDTH 16
+//!HEIGHT 9
+//!COMPUTE 16 9
+//!DESC CelFlare: Motion block-match
+// One thread per 16x9 pump cell: search its 8x8 MOTION_CUR tile for the best
+// truncated-SAD shift in MOTION_PREV over +-MOT_R px. Output rg = best (dx,dy)
+// px (the PREV offset - where the content came from); ba = best/second cost
+// (advisory uniqueness; PASS 5 keys on the residual, which self-gates). Tile
+// subsampled 2x for cost. MOTION_PREV is a STORAGE image (imageLoad, integer
+// coords); MOTION_CUR is a normal texture (normalized sample).
+#define MOT_R       5      // search radius px (@128x72 ~ +-42 px/frame at 1080p)
+#define MOT_TILE    8
+#define MOT_SADCAP  0.10   // per-sample truncated SAD (robust to a lone outlier texel)
+#define MOT_BIAS    0.0005 // zero-motion prior: tiny per-shift penalty so a FLAT tile (all shifts equal cost) resolves to (0,0), not the search's first corner (paired audit) — far below any real match difference, so genuine motion is unaffected
+void hook() {
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    if (cell.x >= 16 || cell.y >= 9) return;
+    ivec2 org = cell * ivec2(MOT_TILE, MOT_TILE);
+    const ivec2 dims = ivec2(128, 72);
+    float best = 1e9, second = 1e9;
+    ivec2 bestd = ivec2(0);
+    for (int dy = -MOT_R; dy <= MOT_R; dy++) {
+        for (int dx = -MOT_R; dx <= MOT_R; dx++) {
+            float cost = 0.0;
+            for (int j = 0; j < MOT_TILE; j += 2) {
+                for (int i = 0; i < MOT_TILE; i += 2) {
+                    ivec2 c = org + ivec2(i, j);
+                    ivec2 p = c + ivec2(dx, dy);
+                    float cv = MOTION_CUR_tex((vec2(c) + 0.5) * MOTION_CUR_pt).r;
+                    float pv = (p.x >= 0 && p.y >= 0 && p.x < dims.x && p.y < dims.y)
+                             ? imageLoad(MOTION_PREV, p).r : (cv + MOT_SADCAP);
+                    cost += min(abs(cv - pv), MOT_SADCAP);
+                }
+            }
+            cost += MOT_BIAS * float(abs(dx) + abs(dy));   // zero-motion prior (tie-break)
+            if (cost < best)        { second = best; best = cost; bestd = ivec2(dx, dy); }
+            else if (cost < second) { second = cost; }
+        }
+    }
+    imageStore(out_image, cell, vec4(float(bestd.x), float(bestd.y), best, second));
+}
+
+//!HOOK MAIN
+//!BIND MOTION_CUR
+//!BIND MOTION_PREV
+//!SAVE MOTION_HIST
+//!WIDTH 128
+//!HEIGHT 72
+//!COMPUTE 16 16
+//!DESC CelFlare: Motion history store
+// Copy this frame's MOTION_CUR into the persistent MOTION_PREV for next frame.
+// Runs AFTER the block-match above has read the previous MOTION_PREV (file order
+// == execution order). The SAVE (MOTION_HIST) is a required dummy dispatch
+// target; the real product is the imageStore into MOTION_PREV.
+void hook() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= 128 || p.y >= 72) return;
+    float y = MOTION_CUR_tex((vec2(p) + 0.5) * MOTION_CUR_pt).r;
+    imageStore(MOTION_PREV, p, vec4(y, 0.0, 0.0, 1.0));
+    imageStore(out_image, p, vec4(y, 0.0, 0.0, 1.0));
+}
+
+// =============================================================================
 // PASS 5: FRAME STATS (compute, 144-thread parallel reduction)
 // =============================================================================
 // Samples illumination field on a 16×9 grid. Computes frame-level metrics that
@@ -553,6 +674,7 @@ vec4 hook() {
 //!BIND HOOKED
 //!BIND SCENE_STATE
 //!BIND CELFLARE_ILLUM
+//!BIND MOTION_FLOW
 //!SAVE CELFLARE_STATS
 //!WIDTH 1
 //!HEIGHT 1
@@ -949,6 +1071,22 @@ vec4 hook() {
 #define PUMP_TRANSPORT_RIDGE      0.05   // Tikhonov ridge as a fraction of gradient energy — aperture-problem stabilizer (collinear ∇I → rank-1 normal matrix)
 #define PUMP_TRANSPORT_ROBUST     1      // IRLS reweight iterations (0 = single gradient-weighted fit; 1 = one emission-outlier rejection pass so an event can't bias the global v)
 #define PUMP_TRANSPORT_ROBUST_C   4.0    // robust residual scale² = C·mean(di²); larger = softer outlier rejection
+// === UNIFIED MOTION-COMPENSATED RESIDUAL GATE (approach A, 2026-07-12) ===
+// Replaces the mask freshness — the established-level gate + ring-1 dipole + LK
+// transport fit (all still computed above but their fresh_ease is OVERRIDDEN in
+// loop 2) — with ONE test on the real block-match flow (MOTION_FLOW, PASS 4b-d):
+// the mask opens only where the current cell V exceeds the PREVIOUS frame warped
+// by the flow, i.e. NEW light the motion cannot explain. A panning lamp warps
+// its own prior level into the cell -> residual ~0 -> stays shut (this IS the
+// motion-compensated established level — the level travels WITH the lamp). An
+// off-frame warp (content entering from beyond the border) presumes influx ->
+// shut (subsumes edge-establish). Offline block-match cell-replica: pan mask-
+// debit 0.87, growth 0.09 (event pumps). A WRONG flow yields a LARGE residual ->
+// mask opens (fails SAFE, event protected — no flow-confidence gate needed).
+// 0 = legacy freshness path (established-level + dipole + LK), for A/B.
+#define MC_RESIDUAL_GATE  1
+#define MC_RES_LO         0.02   // motion-compensated residual (new light) below this: transport -> mask shut
+#define MC_RES_HI         0.08   // above: clearly new light -> mask opens
 // Accepted residuals (all CONSERVATIVE — they UNDER-suppress; never over-pump/artifact):
 //  · ~50% pan-debit ceiling — band-pass di is an imperfect dI/dt AND a single
 //    global translation misfits a curved σ80 profile (mean texp≈0.5 on a rigid
@@ -1112,6 +1250,13 @@ shared uint  s_change[144];
 shared float s_intensity[144];      // spec/highlight tier source: V or Y per ENABLE_SATURATED_SPEC
 shared float s_sat[144];            // near-white fence input for the bright-scene recovery counter
 shared float s_illum_v[144];        // max(R,G,B) of the illum field — V-aware pump driver/guard
+#if MC_RESIDUAL_GATE
+// Motion-compensated residual gate (approach A): last frame's per-cell V and the
+// block-match flow at each cell, both written per-lane in loop 1, consumed by
+// thread 0 in loop 2 (warp + residual). Own-slot writes → race-free pre-barrier.
+shared float s_prev_v[144];
+shared vec2  s_flow[144];
+#endif
 #if ENABLE_SPATIAL_PUMP
 // Thread-0-only scratch (written and read after the barrier by thread 0
 // exclusively — no synchronization needed): full pre-update snapshot of the
@@ -1127,7 +1272,7 @@ shared float s_pump_snap_s[144];
 // would yield a phantom fall. This stays frozen (written in loop 1 only).
 shared float s_pump_snap_di[144];
 #endif
-#if PUMP_TRANSPORT_RESIDUAL
+#if PUMP_TRANSPORT_RESIDUAL && !MC_RESIDUAL_GATE
 // Per-cell global-flow prediction (flow_pred = ∇I·v_global) for the transport-
 // residual mask gate. Thread-0 write/read only (like the snaps) — no barrier.
 // di is recomputed from snap_f/snap_s, so this decl does NOT depend on
@@ -1181,6 +1326,15 @@ void hook() {
     s_valid[lid]     = valid ? 1u : 0u;
     s_intensity[lid] = intensity_src;
     s_sat[lid]       = sat_src;
+#if MC_RESIDUAL_GATE
+    // Motion gate inputs (own-slot, race-free): stash last frame's cell V BEFORE
+    // overwriting it, and sample the block-match flow at this cell for the
+    // thread-0 MC-residual warp in loop 2. spos is this cell's center; MOTION_FLOW
+    // is 16×9 so the sample is the cell's own (dx,dy) px vector.
+    s_prev_v[lid]     = prev_illum_v[lid];
+    prev_illum_v[lid] = s_illum_v[lid];
+    s_flow[lid]       = MOTION_FLOW_tex(spos).xy;
+#endif
 
     // Scene-cut delta. Each lane reads + writes its own prev_illum slot —
     // no cross-lane SSBO traffic, so race-free even though the buffer is
@@ -1590,7 +1744,7 @@ void hook() {
             float global_gate = smoothstep(PUMP_EDGE_GLOBAL_FRAC_LO, PUMP_EDGE_GLOBAL_FRAC_HI,
                                            edge_interior_n * (1.0 / 50.0));
             #endif
-            #if PUMP_TRANSPORT_RESIDUAL
+            #if PUMP_TRANSPORT_RESIDUAL && !MC_RESIDUAL_GATE
             // ---- Global image-motion fit (Lucas–Kanade on the σ80 cell field) ----
             // Fit the single global image velocity v that best explains the whole
             // field's temporal change by brightness constancy di = ∇I·v (see the
@@ -1831,7 +1985,7 @@ void hook() {
                         fresh_ease *= 1.0 - trans * match_w;
                     }
                     #endif
-                    #if PUMP_TRANSPORT_RESIDUAL
+                    #if PUMP_TRANSPORT_RESIDUAL && !MC_RESIDUAL_GATE
                     // GLOBAL-motion debit (see the knob block): fraction of THIS
                     // cell's rise that the single global image velocity explains.
                     // s_flow_pred[i] = ∇I·v (same di-basis as this loop's di), so
@@ -1881,6 +2035,44 @@ void hook() {
                 // maps to exactly 0 (the former dead-zone shift is folded into
                 // PUMP_CELL_DRIVE_LOW/HIGH — see the knob block).
                 float a = smoothstep(PUMP_CELL_DRIVE_LOW, PUMP_CELL_DRIVE_HIGH, d);
+#if MC_RESIDUAL_GATE
+                // === UNIFIED MOTION-COMPENSATED RESIDUAL GATE (approach A) ===
+                // Override fresh_ease: the mask opens only where the current cell
+                // V exceeds the PREVIOUS frame warped by the block-match flow —
+                // new light the motion can't explain. Transport (a panning lamp)
+                // warps its own prior level into the cell → residual ~0 → shut.
+                // This single test replaces the established-level gate, the ring-1
+                // dipole and the LK transport fit (all computed above; their
+                // fresh_ease is discarded here). Off-frame warps = influx → shut.
+                {
+                    int cxm = int(i) & 15, cym = int(i) >> 4;
+                    vec2 warpc = vec2(float(cxm), float(cym)) + s_flow[i] * (1.0 / 8.0);
+                    bool inb = warpc.x > -0.5 && warpc.x < 15.5
+                            && warpc.y > -0.5 && warpc.y < 8.5;
+                    vec2 cc = clamp(warpc, vec2(0.0), vec2(15.0, 8.0));
+                    int wx0 = int(floor(cc.x)), wy0 = int(floor(cc.y));
+                    int wx1 = min(wx0 + 1, 15), wy1 = min(wy0 + 1, 8);
+                    float wfx = cc.x - float(wx0), wfy = cc.y - float(wy0);
+                    float mc_prev =
+                        mix(mix(s_prev_v[wy0 * 16 + wx0], s_prev_v[wy0 * 16 + wx1], wfx),
+                            mix(s_prev_v[wy1 * 16 + wx0], s_prev_v[wy1 * 16 + wx1], wfx), wfy);
+                    float mc_res = s_illum_v[i] - mc_prev;   // >0 = light beyond what motion explains
+                    float mc_fresh = inb ? smoothstep(MC_RES_LO, MC_RES_HI, max(mc_res, 0.0)) : 0.0;
+                    // CONSERVATION FLOOR (paired design audit 2026-07-12, cardinal fix):
+                    // a UNIFORM-brightness advancing front (a flat cel-shaded spell
+                    // sweep / light wipe / energy wave) is a translating bright edge,
+                    // so it warps its own body into the cell -> mc_res~0 -> the MC
+                    // test ALONE would suppress it (local brightness-constancy is
+                    // blind to front-vs-transport). Re-admit it via the global
+                    // conservation signal: net signed drive > 0 means bright-mass is
+                    // GROWING (emission), not a conserved pan (loc_sum~0). Floors the
+                    // mask open for growing events the residual can't see, while a
+                    // conserved lamp pan (dl_pos~0) still rides mc_fresh -> stays shut.
+                    float dl_pos = (loc_sum > 0.0) ? pow(loc_sum / N_SAMPLES, 1.0 / PUMP_DRIVE_P) : 0.0;
+                    float emit_floor = smoothstep(PUMP_TRANSPORT_EMIT_LO, PUMP_TRANSPORT_EMIT_HI, dl_pos);
+                    fresh_ease = max(mc_fresh, emit_floor);
+                }
+#endif
                 #if PUMP_MASK_ESTABLISH
                 // Mask half of the gate: only a FRESH rise may OPEN the mask,
                 // eased over [MARGIN, 2·MARGIN] above the neighbour ceiling
@@ -2069,6 +2261,7 @@ void hook() {
 //!BIND SCENE_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
+//!BIND MOTION_FLOW
 //!DESC CelFlare v5.9
 
 // =============================================
@@ -2810,6 +3003,16 @@ vec3 upsample_illum_rgb() {
 // =============================================================================
 
 vec4 hook() {
+#if cf_debug == 9
+    // Motion-flow debug view: the block-match field (MOTION_FLOW, 16x9)
+    // bilinear-upsampled. Grey (0.5,0.5) = still; red = +x image motion, green =
+    // +y, blue = |flow| / MOT_R. A coherent pan shows a uniform tint; garbage
+    // (broken block-match) shows speckle. Early-out before the pump/expansion.
+    vec2 mf = MOTION_FLOW_tex(HOOKED_pos).xy;
+    return vec4(clamp(0.5 + mf.x * 0.1, 0.0, 1.0),
+                clamp(0.5 + mf.y * 0.1, 0.0, 1.0),
+                clamp(length(mf) * (1.0 / 5.0), 0.0, 1.0), 1.0);
+#endif
     vec4 color = HOOKED_texOff(0);
     vec3 rgb_gamma = color.rgb;
 

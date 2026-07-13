@@ -1003,10 +1003,11 @@ void hook() {
 // local event never moves the global lanes, so without a local release its
 // env would linger ~29s behind closed masks and any later mask opening
 // (incl. an occluder wake) would inherit stale amplitude. When drive_loc<0
-// (net local fall) the env releases at the FALLING CELLS' OWN velocity
-// ratio (fast_cell/slow_cell, |d|^p-weighted) — the same fractional-drop
-// semantics as the global rel and the mask's r, dimensionally on the LOCAL
-// axis. (Do NOT divide drive_loc by the frame level instead: a cell-delta
+// (net local fall) the env releases at the FALLING CELLS' OWN frame-to-frame
+// fast-lane ratio (fast_new/fast_prev, |d|^p-weighted) — the same frame-to-
+// frame, non-recompounding source-change semantics as the global rel and the
+// mask's r, dimensionally on the LOCAL axis. (Do NOT divide drive_loc by the
+// frame level instead: a cell-delta
 // over an absolute frame level guillotines the env in one frame on dark
 // frames — audited Rule-2 violation.) A held light has d≈0 → no release;
 // a balanced crossing has drive_loc≈0 → no release (conservative hold).
@@ -1929,11 +1930,20 @@ void hook() {
         } else {
             // Locals: the SSBO is coherent, so re-reading a lane just written
             // is a real memory round-trip — compute once, store once.
-            float pf = mix(pump_fast, pnorm_illum_v, PUMP_ALPHA_FAST);
+            float pf_prev = pump_fast;
+            float pf = mix(pf_prev, pnorm_illum_v, PUMP_ALPHA_FAST);
             float ps = mix(pump_slow, pnorm_illum_v, PUMP_ALPHA_SLOW);
             pump_fast = pf;
             pump_slow = ps;
             float drive      = pf - ps;                                  // SIGNED velocity
+            // True frame-to-frame source fall. The old pf/ps ratio measured the
+            // SAME fast-vs-slow band-pass deficit on every frame, so a brief
+            // flicker compounded repeatedly (0.8^N) and irreversibly erased a
+            // held pump. pf/pf_prev telescopes to the actual fast-lane level
+            // change across the fall. A rebound while still below ps no longer
+            // keeps charging the old dip.
+            float global_fall_ratio = (drive < 0.0 && pf < pf_prev && pf_prev > 1e-3)
+                ? clamp(pf / pf_prev, 0.0, 1.0) : 1.0;
             // Onset candidate — no max(0,·) clamp: smoothstep's onset edge
             // (PUMP_DRIVE_LOW > 0) already maps any x <= 0 to exactly 0.
             float drive_eff  = drive;
@@ -1989,12 +1999,6 @@ void hook() {
                 float m  = max(abs(di) - PUMP_CELL_DEADZONE, 0.0);
                 float w  = pow(m, PUMP_DRIVE_P);
                 loc_sum += sign(di) * w;
-                // Falling cells also publish their own velocity ratio (the same
-                // fractional drop the mask's release uses) for the local release.
-                if (di < 0.0 && cs > 1e-3) {
-                    fall_w     += w;
-                    fall_ratio += w * (cf / cs);
-                }
                 #if PUMP_EDGE_ESTABLISH
                 // Border-seed global gate: the FRACTION of the deep interior
                 // (cols 3-12 x rows 2-6, 50 cells clear of the outer ring AND the
@@ -2281,6 +2285,13 @@ void hook() {
                 float v = s_illum_v[i];
                 float f = mix(cf, v, PUMP_ALPHA_FAST);
                 float s = mix(cs, v, PUMP_ALPHA_SLOW);
+                // Weight only cells whose fast lane is actually falling THIS
+                // frame. di<0 alone merely says fast remains below slow; using
+                // cf/cs there re-applied one old dip on every subsequent frame.
+                if (di < 0.0 && f < cf && cf > 1e-3) {
+                    fall_w     += w;
+                    fall_ratio += w * clamp(f / cf, 0.0, 1.0);
+                }
                 #if PUMP_EDGE_ESTABLISH
                 // Fast-establish, SCOPED TO INFLUX (2026-07-07 rework, after the
                 // design audit): a rising cell settles its slow lane to its fast
@@ -2361,11 +2372,14 @@ void hook() {
                 // by the border mirror in the publish loop.
                 a *= (1.0 - edge_seed);
                 #endif
-                // Velocity-matched release: the negative half of the band-pass
-                // is the region's own fall, so the mask eases out in lockstep
-                // (a suppressor that re-engages as a region stops brightening).
-                // Max-held + adapt floor.
-                float r = (d < 0.0 && s > 1e-3) ? (f / s) : 1.0;
+                // Velocity-matched release: when the negative band-pass region
+                // is still falling THIS frame, follow its frame-to-frame fast
+                // level. The ratios telescope across a real fade instead of
+                // repeatedly compounding the same fast-vs-slow deficit. A
+                // rebound below the slow lane holds rather than continuing to
+                // erase the mask. Max-held + adapt floor.
+                float r = (d < 0.0 && f < cf && cf > 1e-3)
+                    ? clamp(f / cf, 0.0, 1.0) : 1.0;
                 float e = max(pump_env_cell[i] * r * PUMP_ADAPT_FLOOR, a);
                 pump_env_cell[i] = e;
                 // Post-update env stash for the softening pass below. Reusing
@@ -2444,20 +2458,21 @@ void hook() {
             // in PASS 6 — the same enveloped value the scalar bakes into
             // pump_env (a genuine event holds contrast, so it never bites one).
             pump_cover_gate = cover_gate;
-            // Velocity-matched release. The NEGATIVE half of the band-pass is
-            // the source itself falling: while drive<0, pump_fast/pump_slow is
-            // <1 by exactly the source's recent fractional drop, so pump_env
-            // eases out in lockstep with the source (fast on a cut, gentle on a
-            // bloom-fade). A steady source gives drive≈0 → ratio 1 → NO release
-            // (this is what made a held light's old timed release look like an
-            // animated dim). PUMP_ADAPT_FLOOR is the only clock left: it relaxes
-            // an indefinitely-held light imperceptibly slowly (eye-adapting).
-            float rel = (drive < 0.0 && ps > 1e-3) ? (pf / ps) : 1.0;
+            // Velocity-matched release. The NEGATIVE half of the band-pass arms
+            // release, but amplitude follows the source's TRUE frame-to-frame
+            // fast-lane change (global_fall_ratio), not fast/slow separation.
+            // These ratios telescope across a fade; they cannot charge the same
+            // flicker deficit repeatedly. A steady source or rebound gives 1 →
+            // no release. PUMP_ADAPT_FLOOR is the only clock left: it relaxes an
+            // indefinitely-held light imperceptibly slowly (eye-adapting).
+            float rel = global_fall_ratio;
             #if ENABLE_SPATIAL_PUMP
             // Local release — velocity-matched on the LOCAL axis. When the net
             // local drive is a fall (a dying fire), release at the falling
-            // cells' own fast/slow ratio, |d|^p-weighted — the identical
-            // fractional-drop semantics as the global rel and the mask's r.
+            // cells' own frame-to-frame fast ratio, |d|^p-weighted — the same
+            // non-recompounding semantics as the global rel and mask r. (The
+            // aggregate itself is not strictly telescoping because its faller
+            // population and weights can change from frame to frame.)
             // Closes the linger hole (a purely-local event's env otherwise
             // persisted ~29s behind closed masks; any mask opening in that
             // window — incl. a large-occluder wake — inherited stale

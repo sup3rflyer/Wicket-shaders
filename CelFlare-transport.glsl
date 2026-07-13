@@ -133,10 +133,10 @@
 1
 
 //!PARAM cf_debug
-//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars, 9 = motion flow (grey = still, R/G = +x/+y image motion, B = magnitude).
+//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars, 9 = motion prev-offset (R/G = +x/+y source offset; right/down image motion is negative), 10 = motion evidence (R = match cost, G = tile RMS contrast, B = prospective trust), 11 = motion residual (R = local-flow emit, G = dominant-borrow emit, B = prospective trust).
 //!TYPE DEFINE
 //!MINIMUM 0
-//!MAXIMUM 9
+//!MAXIMUM 11
 0
 
 //!BUFFER SCENE_STATE
@@ -160,6 +160,15 @@
 //!VAR float pump_mask_cell[144]
 //!VAR float pump_seed_cell[144]
 //!VAR float bar_run[8]
+//!VAR float motion_state_magic
+//!VAR float motion_dom_x
+//!VAR float motion_dom_y
+//!VAR float motion_dom_support
+//!VAR float motion_bad_match_frac
+//!VAR float motion_match_coverage
+//!VAR float motion_trust_cell[144]
+//!VAR float motion_mc_local_cell[144]
+//!VAR float motion_mc_effective_cell[144]
 //!STORAGE
 
 //!TEXTURE MOTION_PREV
@@ -543,7 +552,8 @@ vec4 hook() {
 //                     (8x8 px per 16x9 pump cell).
 //   (2) MOTION_FLOW - 16x9 per-cell block-match of MOTION_CUR against the
 //                     persistent MOTION_PREV (last frame), +-MOT_R px search,
-//                     truncated SAD. Output rg = best (dx,dy) px.
+//                     truncated SAD. Output rg = previous-frame source offset
+//                     in px, b = mean best SAD, a = current-tile RMS contrast.
 //   (3) history     - MOTION_CUR -> MOTION_PREV for next frame, AFTER (2) has
 //                     read the old prev (file order == execution order).
 // PASS 5 consumes MOTION_FLOW: the motion-compensated brightness residual
@@ -553,13 +563,14 @@ vec4 hook() {
 // SCALAR onset (loc_on_sum) still uses the legacy established gate. Safe under
 // this build's SUBTRACTIVE apply (pump_local = pump_env x mask -> the MC mask
 // gates the product), NOT yet additive-safe - a reveal's garbage flow fails OPEN
-// with no scalar backstop under additive; needs a flow-confidence gate first.
+// with no scalar backstop. Additive stays deferred: a sustained bright-island
+// reveal remains ignition-equivalent, and no currently-proven opener resolves it.
 // Frame-0 safety: loop 2 (the MC consumer) is skipped while transient_reset is
 // set, so uninitialized MOTION_PREV / garbage flow never reaches persistent SSBO
 // state - do NOT move the MC block or loop 2 out of that guard.
 // Offline 16x9 cell-replica: pan mask-debit 0.87 (vs the affine gate's 0.50),
-// growth 0.09 (event pumps). A WRONG flow fails SAFE - the residual comes out
-// large -> no debit -> the event is protected, so no flow-confidence gate needed.
+// growth 0.09 (event pumps). A wrong flow protects emission but also opens on a
+// reveal; that asymmetry is harmless only while the apply remains subtractive.
 
 //!HOOK MAIN
 //!BIND HOOKED
@@ -590,40 +601,80 @@ vec4 hook() {
 //!DESC CelFlare: Motion block-match
 // One thread per 16x9 pump cell: search its 8x8 MOTION_CUR tile for the best
 // truncated-SAD shift in MOTION_PREV over +-MOT_R px. Output rg = best (dx,dy)
-// px (the PREV offset - where the content came from); ba = best/second cost
-// (advisory uniqueness; PASS 5 keys on the residual, which self-gates). Tile
-// subsampled 2x for cost. MOTION_PREV is a STORAGE image (imageLoad, integer
-// coords); MOTION_CUR is a normal texture (normalized sample).
+// px (the PREV offset - where the content came from), b = winning photometric
+// SAD / 16 (MOT_BIAS excluded), a = RMS contrast of the current 4x4 subsample.
+// The old adjacent second-best was not valid uniqueness: adjacent candidates
+// belong to the same SAD basin, and the final best can move after second is
+// recorded. Tile subsampled 2x for cost. MOTION_PREV is a STORAGE image
+// (imageLoad, integer coords); MOTION_CUR is a normal texture.
 #define MOT_R       5      // search radius px (@128x72 ~ +-42 px/frame at 1080p)
 #define MOT_TILE    8
 #define MOT_SADCAP  0.10   // per-sample truncated SAD (robust to a lone outlier texel)
 #define MOT_BIAS    0.0005 // zero-motion prior: tiny per-shift penalty so a FLAT tile (all shifts equal cost) resolves to (0,0), not the search's first corner (paired audit) — far below any real match difference, so genuine motion is unaffected
+#define MOT_TAPS    16
+#define MOT_CELLS   144
+// One workgroup covers the complete 16x9 flow output. Each lane owns one cell
+// and publishes its 16 current-frame taps once; all 121 candidates reuse them.
+// Sample-major layout keeps adjacent lanes contiguous for every tap
+// (tap*MOT_CELLS + lane), avoiding the strided access of lane-major
+// [lane][tap]. Footprint = 2304 floats = 9 KiB.
+shared float s_motion_cur[MOT_TAPS * MOT_CELLS];
+
 void hook() {
-    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
-    if (cell.x >= 16 || cell.y >= 9) return;
+    // WIDTH/HEIGHT exactly match COMPUTE, so the dispatch is one 16x9 group and
+    // every lane must reach the barrier below. Do not add an early-return guard.
+    ivec2 cell = ivec2(gl_LocalInvocationID.xy);
+    int lane = int(gl_LocalInvocationIndex);
     ivec2 org = cell * ivec2(MOT_TILE, MOT_TILE);
     const ivec2 dims = ivec2(128, 72);
-    float best = 1e9, second = 1e9;
+
+    // Explicit MOTION_CUR texture fetches fall from 121*16 + 16 metadata fetches
+    // per cell to 16 total. Hardware texture caching means this count is not a
+    // direct DRAM-bandwidth estimate. The search still performs the same
+    // previous-frame imageLoads and arithmetic in the same order; only
+    // current-tile reuse moves to workgroup memory.
+    for (int t = 0; t < MOT_TAPS; t++) {
+        ivec2 o = ivec2((t & 3) << 1, (t >> 2) << 1);
+        ivec2 c = org + o;
+        s_motion_cur[t * MOT_CELLS + lane] =
+            MOTION_CUR_tex((vec2(c) + 0.5) * MOTION_CUR_pt).r;
+    }
+    barrier();
+
+    float best_rank = 1e9, best_sad = 1e9;
     ivec2 bestd = ivec2(0);
     for (int dy = -MOT_R; dy <= MOT_R; dy++) {
         for (int dx = -MOT_R; dx <= MOT_R; dx++) {
-            float cost = 0.0;
-            for (int j = 0; j < MOT_TILE; j += 2) {
-                for (int i = 0; i < MOT_TILE; i += 2) {
-                    ivec2 c = org + ivec2(i, j);
-                    ivec2 p = c + ivec2(dx, dy);
-                    float cv = MOTION_CUR_tex((vec2(c) + 0.5) * MOTION_CUR_pt).r;
-                    float pv = (p.x >= 0 && p.y >= 0 && p.x < dims.x && p.y < dims.y)
-                             ? imageLoad(MOTION_PREV, p).r : (cv + MOT_SADCAP);
-                    cost += min(abs(cv - pv), MOT_SADCAP);
-                }
+            float sad = 0.0;
+            for (int t = 0; t < MOT_TAPS; t++) {
+                ivec2 o = ivec2((t & 3) << 1, (t >> 2) << 1);
+                ivec2 p = org + o + ivec2(dx, dy);
+                float cv = s_motion_cur[t * MOT_CELLS + lane];
+                float pv = (p.x >= 0 && p.y >= 0 && p.x < dims.x && p.y < dims.y)
+                         ? imageLoad(MOTION_PREV, p).r : (cv + MOT_SADCAP);
+                sad += min(abs(cv - pv), MOT_SADCAP);
             }
-            cost += MOT_BIAS * float(abs(dx) + abs(dy));   // zero-motion prior (tie-break)
-            if (cost < best)        { second = best; best = cost; bestd = ivec2(dx, dy); }
-            else if (cost < second) { second = cost; }
+            float rank_cost = sad + MOT_BIAS * float(abs(dx) + abs(dy));
+            if (rank_cost < best_rank) {
+                best_rank = rank_cost;
+                best_sad = sad;
+                bestd = ivec2(dx, dy);
+            }
         }
     }
-    imageStore(out_image, cell, vec4(float(bestd.x), float(bestd.y), best, second));
+    // Keep these metadata accumulators OUT of the large unrolled search's live
+    // range. That matters on FXC, where carrying them across 1936 iterations can
+    // create register pressure even though the work itself is only 16 samples.
+    float tsum = 0.0, tsum2 = 0.0;
+    for (int t = 0; t < MOT_TAPS; t++) {
+        float cv = s_motion_cur[t * MOT_CELLS + lane];
+        tsum += cv;
+        tsum2 += cv * cv;
+    }
+    float tmean = tsum * (1.0 / 16.0);
+    float texture_rms = sqrt(max(tsum2 * (1.0 / 16.0) - tmean * tmean, 0.0));
+    imageStore(out_image, cell,
+               vec4(float(bestd.x), float(bestd.y), best_sad * (1.0 / 16.0), texture_rms));
 }
 
 //!HOOK MAIN
@@ -1081,13 +1132,39 @@ void hook() {
 // motion-compensated established level — the level travels WITH the lamp). An
 // off-frame warp (content entering from beyond the border) presumes influx ->
 // shut (subsumes edge-establish). Offline block-match cell-replica: pan mask-
-// debit 0.87, growth 0.09 (event pumps). A WRONG flow yields a LARGE residual ->
-// mask opens (fails SAFE, event protected — no flow-confidence gate needed).
+// debit 0.87, growth 0.09 (event pumps). A wrong flow yields a large residual:
+// that protects emission but also opens on a reveal, so it is safe only under
+// the current subtractive apply. No additive-safe opener is proven yet.
 // 0 = legacy freshness path (established-level + dipole + LK), for A/B.
 #define MC_RESIDUAL_GATE  1
 #define MC_RES_LO         0.02   // motion-compensated residual (new light) below this: transport -> mask shut
 #define MC_RES_HI         0.08   // above: clearly new light -> mask opens
-// Accepted residuals (all CONSERVATIVE — they UNDER-suppress; never over-pump/artifact):
+// Motion observability / reset candidates. The cost and texture thresholds are
+// deliberately diagnostic-first: cf_debug=10/11 expose their result before the
+// bad-match reset is allowed to change output. MOTION_COST_RESET stays 0 until
+// the real-content cost histograms and D3D11 pass support a threshold tune.
+// MOTION_STATE_EPOCH is an exactly-representable schema token, not a reload or
+// seek detector. Bump it whenever MOTION_FLOW format/resolution/sign semantics
+// change. Same-schema reload/seek continuity is not guaranteed; cost reset is
+// still disabled and neither cost nor the existing cut detector is universal.
+#define MOTION_STATE_EPOCH       51701.0
+#define MOTION_COST_RESET        0
+#define MOTION_COST_GOOD         0.025   // mean winning SAD: confidently matched below
+#define MOTION_COST_BAD          0.075   // mean winning SAD: suspect above
+#define MOTION_TEXTURE_LO        0.004   // tile RMS contrast: flat below
+#define MOTION_TEXTURE_HI        0.025   // tile RMS contrast: reliable evidence above
+#define MOTION_BAD_FRAC_RESET    0.65    // texture-qualified bad-match fraction
+#define MOTION_BAD_COVER_MIN     0.10    // qualified evidence mass / 144 required to reset
+#define MOTION_DOM_COVER_LO      0.05    // reliable evidence coverage: trust stays off below
+#define MOTION_DOM_COVER_HI      0.20    // enough frame support for full coherent trust
+#define MOTION_DOM_SPREAD_LO     0.10    // min normalized x/y evidence stddev: clustered below
+#define MOTION_DOM_SPREAD_HI     0.22    // evidence distributed across the frame above
+#define MOTION_DOM_MAG_LO        0.35    // dominant prev-offset px/frame: static below
+#define MOTION_DOM_MAG_HI        1.25    // coherent motion fully armed above
+#define MOTION_DOM_AGREE_LO      0.75    // local-vs-dominant distance px: agrees below
+#define MOTION_DOM_AGREE_HI      1.75    // disagrees above
+#define MOTION_DEBUG_VIEWS       (cf_debug == 10 || cf_debug == 11)
+// Legacy LK residual notes (MC_RESIDUAL_GATE=0 only; not additive safety claims):
 //  · ~50% pan-debit ceiling — band-pass di is an imperfect dI/dt AND a single
 //    global translation misfits a curved σ80 profile (mean texp≈0.5 on a rigid
 //    pan). A stored 1-frame V history (cleaner dI/dt) or a local flow fit lifts
@@ -1255,7 +1332,13 @@ shared float s_illum_v[144];        // max(R,G,B) of the illum field — V-aware
 // block-match flow at each cell, both written per-lane in loop 1, consumed by
 // thread 0 in loop 2 (warp + residual). Own-slot writes → race-free pre-barrier.
 shared float s_prev_v[144];
-shared vec2  s_flow[144];
+#endif
+#if MC_RESIDUAL_GATE || MOTION_COST_RESET || MOTION_DEBUG_VIEWS
+shared vec2 s_flow[144];
+#endif
+#if MOTION_COST_RESET || MOTION_DEBUG_VIEWS
+shared float s_flow_cost[144];
+shared float s_flow_texture[144];
 #endif
 #if ENABLE_SPATIAL_PUMP
 // Thread-0-only scratch (written and read after the barrier by thread 0
@@ -1326,14 +1409,21 @@ void hook() {
     s_valid[lid]     = valid ? 1u : 0u;
     s_intensity[lid] = intensity_src;
     s_sat[lid]       = sat_src;
-#if MC_RESIDUAL_GATE
+#if MC_RESIDUAL_GATE || MOTION_COST_RESET || MOTION_DEBUG_VIEWS
     // Motion gate inputs (own-slot, race-free): stash last frame's cell V BEFORE
     // overwriting it, and sample the block-match flow at this cell for the
     // thread-0 MC-residual warp in loop 2. spos is this cell's center; MOTION_FLOW
     // is 16×9 so the sample is the cell's own (dx,dy) px vector.
+    vec4 motion_sample = MOTION_FLOW_tex(spos);
+    #if MC_RESIDUAL_GATE
     s_prev_v[lid]     = prev_illum_v[lid];
     prev_illum_v[lid] = s_illum_v[lid];
-    s_flow[lid]       = MOTION_FLOW_tex(spos).xy;
+    #endif
+    s_flow[lid]       = motion_sample.xy;
+    #if MOTION_COST_RESET || MOTION_DEBUG_VIEWS
+    s_flow_cost[lid]    = motion_sample.z;
+    s_flow_texture[lid] = motion_sample.w;
+    #endif
 #endif
 
     // Scene-cut delta. Each lane reads + writes its own prev_illum slot —
@@ -1352,6 +1442,131 @@ void hook() {
     // 144 texture fetches we just parallelized away. Could be replaced with
     // a subgroupAdd ladder for sub-microsecond savings if profiling demands.
     if (lid == 0u) {
+        // Schema prime only: this catches fresh/reformatted persistent state,
+        // not a same-schema reload or every seek. The block-match has already
+        // read MOTION_PREV this frame; transient_reset below discards that
+        // result while the history-store pass has primed next frame's image.
+        bool motion_uninit = motion_state_magic != MOTION_STATE_EPOCH;
+
+        #if MOTION_COST_RESET || MOTION_DEBUG_VIEWS
+        // Texture-qualified match validity. Flat tiles are deliberately absent
+        // from the denominator: MOT_BIAS resolves them to zero flow but they
+        // contain no evidence that zero is correct. Cost reset is default-off;
+        // this first ships as an observable threshold candidate.
+        float motion_tex_w = 0.0, motion_bad_w = 0.0;
+        for (uint i = 0u; i < 144u; i++) {
+            float tc = smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI,
+                                  s_flow_texture[i]);
+            motion_tex_w += tc;
+            motion_bad_w += tc * ((s_flow_cost[i] >= MOTION_COST_BAD) ? 1.0 : 0.0);
+        }
+        motion_match_coverage = motion_tex_w * (1.0 / 144.0);
+        motion_bad_match_frac = (motion_match_coverage >= MOTION_BAD_COVER_MIN
+                              && motion_tex_w > 1e-5)
+            ? motion_bad_w / motion_tex_w : 0.0;
+
+        #if MOTION_DEBUG_VIEWS
+        // Robust dominant PREV-OFFSET from the block-match vectors themselves.
+        // The retired LK vector is in a different (sigma80 band-pass) domain and
+        // cannot be used for this warp. Two agreement-reweighted mean iterations
+        // are conservative on split/multiplane fields (support collapses instead
+        // of choosing an arbitrary mode) and avoid a 121-bin FXC-unroll hazard.
+        float motion_wsum = 0.0;
+        vec2 dom_sum = vec2(0.0);
+        vec2 evidence_pos_sum = vec2(0.0), evidence_pos2_sum = vec2(0.0);
+        for (uint i = 0u; i < 144u; i++) {
+            float cost_c = 1.0 - smoothstep(MOTION_COST_GOOD, MOTION_COST_BAD,
+                                            s_flow_cost[i]);
+            float tex_c = smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI,
+                                     s_flow_texture[i]);
+            float w = cost_c * tex_c;
+            s_flow_cost[i] = w;   // debug scratch: precompute once, not inside consensus loops
+            motion_wsum += w;
+            dom_sum += w * s_flow[i];
+            vec2 ep = vec2((float(int(i) & 15) + 0.5) * (1.0 / 16.0),
+                           (float(int(i) >> 4) + 0.5) * (1.0 / 9.0));
+            evidence_pos_sum += w * ep;
+            evidence_pos2_sum += w * ep * ep;
+        }
+        vec2 dom = vec2(0.0);
+        float consensus_w = 0.0;
+        if (!motion_uninit && motion_wsum > 1e-5) {
+            dom = dom_sum / motion_wsum;
+            for (int it = 0; it < 2; it++) {
+                vec2 refine_sum = vec2(0.0);
+                float refine_w = 0.0;
+                for (uint i = 0u; i < 144u; i++) {
+                    float agree = 1.0 - smoothstep(MOTION_DOM_AGREE_LO,
+                                                   MOTION_DOM_AGREE_HI,
+                                                   length(s_flow[i] - dom));
+                    float w = s_flow_cost[i] * agree;
+                    refine_sum += w * s_flow[i];
+                    refine_w += w;
+                }
+                if (refine_w > 1e-5)
+                    dom = refine_sum / refine_w;
+                consensus_w = refine_w;
+            }
+        }
+        float consensus_purity = (motion_wsum > 1e-5)
+            ? clamp(consensus_w / motion_wsum, 0.0, 1.0) : 0.0;
+        float evidence_cover = smoothstep(MOTION_DOM_COVER_LO, MOTION_DOM_COVER_HI,
+                                          motion_wsum * (1.0 / 144.0));
+        vec2 evidence_std = vec2(0.0);
+        if (motion_wsum > 1e-5) {
+            vec2 evidence_mean = evidence_pos_sum / motion_wsum;
+            evidence_std = sqrt(max(evidence_pos2_sum / motion_wsum
+                                  - evidence_mean * evidence_mean, vec2(0.0)));
+        }
+        // Absolute mass is not enough: a large moving character can own 20% of
+        // cells while remaining a local object. Require evidence to span both
+        // frame axes before flat cells elsewhere may borrow the dominant flow.
+        float evidence_spread = smoothstep(MOTION_DOM_SPREAD_LO, MOTION_DOM_SPREAD_HI,
+                                           min(evidence_std.x, evidence_std.y));
+        float dom_support = consensus_purity * evidence_cover * evidence_spread;
+        float dom_motion = smoothstep(MOTION_DOM_MAG_LO, MOTION_DOM_MAG_HI,
+                                      length(dom));
+        motion_dom_x = dom.x;
+        motion_dom_y = dom.y;
+        motion_dom_support = dom_support;
+        for (uint i = 0u; i < 144u; i++) {
+            float local_reliable = s_flow_cost[i];
+            vec2 effective_flow = mix(dom, s_flow[i], local_reliable);
+            float agree = 1.0 - smoothstep(MOTION_DOM_AGREE_LO,
+                                           MOTION_DOM_AGREE_HI,
+                                           length(effective_flow - dom));
+            // A locally-flat tile borrows the supported dominant flow. Agreement
+            // becomes mandatory only as the local match becomes trustworthy.
+            motion_trust_cell[i] = motion_uninit ? 0.0
+                : dom_support * dom_motion * agree;
+            #if MC_RESIDUAL_GATE
+            for (int k = 0; k < 2; k++) {
+                vec2 warp_flow = (k == 0) ? s_flow[i] : effective_flow;
+                int cxm = int(i) & 15, cym = int(i) >> 4;
+                vec2 warpc = vec2(float(cxm), float(cym)) + warp_flow * (1.0 / 8.0);
+                bool inb = warpc.x > -0.5 && warpc.x < 15.5
+                        && warpc.y > -0.5 && warpc.y < 8.5;
+                vec2 cc = clamp(warpc, vec2(0.0), vec2(15.0, 8.0));
+                int wx0 = int(floor(cc.x)), wy0 = int(floor(cc.y));
+                int wx1 = min(wx0 + 1, 15), wy1 = min(wy0 + 1, 8);
+                float wfx = cc.x - float(wx0), wfy = cc.y - float(wy0);
+                float mc_prev =
+                    mix(mix(s_prev_v[wy0 * 16 + wx0], s_prev_v[wy0 * 16 + wx1], wfx),
+                        mix(s_prev_v[wy1 * 16 + wx0], s_prev_v[wy1 * 16 + wx1], wfx), wfy);
+                float mc_res = s_illum_v[i] - mc_prev;
+                float mc_emit = inb
+                    ? smoothstep(MC_RES_LO, MC_RES_HI, max(mc_res, 0.0)) : 0.0;
+                if (k == 0) motion_mc_local_cell[i] = mc_emit;
+                else        motion_mc_effective_cell[i] = mc_emit;
+            }
+            #else
+            motion_mc_local_cell[i] = 0.0;
+            motion_mc_effective_cell[i] = 0.0;
+            #endif
+        }
+        #endif
+        #endif
+
         float illum_sum         = 0.0;
         float log_luma_sum      = 0.0;
         uint  valid_luma        = 0u;
@@ -1613,7 +1828,14 @@ void hook() {
         // (the cut frame included — it just set lockout to its max). ONE bool
         // serves growth-mode, the scalar pump, and the per-cell pump: they
         // must reset on the SAME frames or their baselines desync.
-        bool transient_reset = (frame == 0) || (scene_cut_lockout > 0.0);
+        #if MOTION_COST_RESET
+        bool motion_match_reset = motion_bad_match_frac >= MOTION_BAD_FRAC_RESET;
+        #else
+        bool motion_match_reset = false;
+        #endif
+        bool transient_reset = (frame == 0) || (scene_cut_lockout > 0.0)
+                            || motion_uninit || motion_match_reset;
+        motion_state_magic = MOTION_STATE_EPOCH;
         smoothed_growth_mode = transient_reset
             ? 0.0
             : mix(smoothed_growth_mode, growth_mode_instant, alpha);
@@ -3005,13 +3227,41 @@ vec3 upsample_illum_rgb() {
 vec4 hook() {
 #if cf_debug == 9
     // Motion-flow debug view: the block-match field (MOTION_FLOW, 16x9)
-    // bilinear-upsampled. Grey (0.5,0.5) = still; red = +x image motion, green =
-    // +y, blue = |flow| / MOT_R. A coherent pan shows a uniform tint; garbage
-    // (broken block-match) shows speckle. Early-out before the pump/expansion.
+    // bilinear-upsampled. Grey (0.5,0.5) = still; red/green encode +x/+y
+    // PREVIOUS-FRAME SOURCE OFFSET (where current content came from), so a
+    // right/down image move is negative. Blue = |offset| / MOT_R. A coherent
+    // pan shows a uniform tint; a broken block-match shows speckle.
     vec2 mf = MOTION_FLOW_tex(HOOKED_pos).xy;
     return vec4(clamp(0.5 + mf.x * 0.1, 0.0, 1.0),
                 clamp(0.5 + mf.y * 0.1, 0.0, 1.0),
                 clamp(length(mf) * (1.0 / 5.0), 0.0, 1.0), 1.0);
+#endif
+#if cf_debug == 10
+    // Motion evidence view. Red = mean winning SAD (0.10 reaches full red),
+    // green = current-tile RMS contrast (0.05 reaches full green), blue = the
+    // prospective coherent-veto trust. Blue is diagnostic only: PASS 5 derives
+    // it from robust block-flow consensus, but the live subtractive router does
+    // not consume it yet.
+    ivec2 mc = clamp(ivec2(HOOKED_pos * vec2(16.0, 9.0)),
+                      ivec2(0), ivec2(15, 8));
+    vec2 mpos = (vec2(mc) + 0.5) / vec2(16.0, 9.0);
+    vec4 md = MOTION_FLOW_tex(mpos);
+    float trust = motion_trust_cell[mc.y * 16 + mc.x];
+    return vec4(clamp(md.z * 10.0, 0.0, 1.0),
+                clamp(md.w * 20.0, 0.0, 1.0),
+                clamp(trust, 0.0, 1.0), 1.0);
+#endif
+#if cf_debug == 11
+    // Residual-contract view, nearest-cell throughout: red is the mc_emit used
+    // by today's local block-flow warp; green is the same residual after an
+    // unreliable local tile borrows the supported dominant prev-offset; blue
+    // is that prospective flow's trust. This is still instrumentation only.
+    ivec2 mc = clamp(ivec2(HOOKED_pos * vec2(16.0, 9.0)),
+                      ivec2(0), ivec2(15, 8));
+    int mi = mc.y * 16 + mc.x;
+    return vec4(clamp(motion_mc_local_cell[mi], 0.0, 1.0),
+                clamp(motion_mc_effective_cell[mi], 0.0, 1.0),
+                clamp(motion_trust_cell[mi], 0.0, 1.0), 1.0);
 #endif
     vec4 color = HOOKED_texOff(0);
     vec3 rgb_gamma = color.rgb;

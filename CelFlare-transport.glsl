@@ -1142,9 +1142,12 @@ void hook() {
 // Motion observability / history guards. The cost and texture thresholds let
 // evidence-bearing tiles vote a discontinuity without flat tiles declaring a
 // false zero-flow match. cf_debug=10/11 expose the underlying evidence/trust.
-// The reset is deliberately frame-global and conservative: a broad bad match
-// re-pins all pump lanes rather than letting stale motion history manufacture a
-// transient. Real pan/reveal/fireball checks leave it shut; hard cuts open it.
+// The reset is deliberately frame-global and conservative: an evidence-majority
+// bad match with at least 10% qualified coverage re-pins all pump lanes rather
+// than letting stale motion history manufacture a transient. Sampled pan/reveal/
+// fireball checks leave it shut; mismatched cuts open it. A false reset cannot
+// add gain, but can discard a held event's onset by re-pinning at its new level,
+// so the high bad-fraction knee and debug monitoring are load-bearing.
 // MOTION_STATE_EPOCH is an exactly-representable schema token, not a reload or
 // seek detector. Bump it whenever MOTION_FLOW format/resolution/sign semantics
 // change. Same-schema reload/seek continuity is still not guaranteed: the cost
@@ -1412,20 +1415,25 @@ void hook() {
     s_intensity[lid] = intensity_src;
     s_sat[lid]       = sat_src;
 #if MC_RESIDUAL_GATE || MOTION_COST_RESET || MOTION_DEBUG_VIEWS
-    // Motion gate inputs (own-slot, race-free): stash last frame's cell V BEFORE
-    // overwriting it, and sample the block-match flow at this cell for the
-    // thread-0 MC-residual warp in loop 2. spos is this cell's center; MOTION_FLOW
-    // is 16×9 so the sample is the cell's own (dx,dy) px vector.
+    // Motion gate inputs (own-slot, race-free): stash last frame's cell V when
+    // the MC consumer is compiled, keep history advancing in the legacy A/B so
+    // a state-preserving re-enable cannot see a stale frame, and sample the
+    // block-match flow at this cell. spos is this cell's center; MOTION_FLOW is
+    // 16×9 so the sample is the cell's own (dx,dy) px vector.
     vec4 motion_sample = MOTION_FLOW_tex(spos);
     #if MC_RESIDUAL_GATE
     s_prev_v[lid]     = prev_illum_v[lid];
-    prev_illum_v[lid] = s_illum_v[lid];
     #endif
+    prev_illum_v[lid] = s_illum_v[lid];
     s_flow[lid]       = motion_sample.xy;
     #if MOTION_COST_RESET || MOTION_DEBUG_VIEWS
     s_flow_cost[lid]    = motion_sample.z;
     s_flow_texture[lid] = motion_sample.w;
     #endif
+#else
+    // Even a fully-disabled motion A/B keeps the history contract warm so a
+    // state-preserving re-enable cannot consume an arbitrarily old cell field.
+    prev_illum_v[lid] = s_illum_v[lid];
 #endif
 
     // Scene-cut delta. Each lane reads + writes its own prev_illum slot —
@@ -1453,8 +1461,9 @@ void hook() {
         #if MOTION_COST_RESET || MOTION_DEBUG_VIEWS
         // Texture-qualified match validity. Flat tiles are deliberately absent
         // from the denominator: MOT_BIAS resolves them to zero flow but they
-        // contain no evidence that zero is correct. Cost reset is default-off;
-        // this first ships as an observable threshold candidate.
+        // contain no evidence that zero is correct. Cost reset is default-on
+        // after real-content threshold validation; the debug views keep the
+        // evidence and threshold behavior observable.
         float motion_tex_w = 0.0, motion_bad_w = 0.0;
         for (uint i = 0u; i < 144u; i++) {
             float tc = smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI,

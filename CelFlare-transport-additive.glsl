@@ -1,13 +1,14 @@
-// CelFlare Transport Additive A0 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare Transport Additive A1 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // ADDITIVE DEVELOPMENT TRACK, forked from the verified subtractive checkpoint
 // 412f1b8. This file owns separate persistent state; never load it alongside
 // CelFlare.glsl or CelFlare-transport.glsl (that double-processes the image and
 // collides with the shared transient intermediate namespaces).
-// A0 is deliberately behavior-equivalent to the subtractive reference. The
-// additive apply stays off until its opening-side reveal/persistence guard is
-// implemented and validated.
+// A1 carries the additive-safe opening prototype behind cf_additive_pump. The
+// default remains the verified subtractive apply while its local flow refinement,
+// reveal memory, pump-domain motion veto and persistence contract are validated
+// on real sources.
 //
 // Design goal: emulate a professional HDR grade of the source — midtones hold
 // the SDR grade, highlights expand with natural gradation, speculars get
@@ -126,6 +127,13 @@
 //!MAXIMUM 1
 1
 
+//!PARAM cf_additive_pump
+//!DESC Additive pump development mode. 1 = independent per-region pump amplitude with hardened opening proof · 0 = verified subtractive reference.
+//!TYPE DEFINE
+//!MINIMUM 0
+//!MAXIMUM 1
+0
+
 //!PARAM cf_warm_shift
 //!DESC Warm-hue correction (toggle). 1 = stop fire, sunsets and skin drifting green as they brighten · 0 = off.
 //!TYPE DEFINE
@@ -141,10 +149,10 @@
 1
 
 //!PARAM cf_debug
-//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars, 9 = motion prev-offset (R/G = +x/+y source offset; right/down image motion is negative), 10 = motion evidence (R = match cost, G = tile RMS contrast, B = research trust), 11 = motion residual (R = local-flow emit, G = dominant-borrow emit, B = research trust).
+//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars, 9 = motion prev-offset, 10 = motion evidence, 11 = motion residual, 12 = additive proof (R established, G emission ratio, B persistence).
 //!TYPE DEFINE
 //!MINIMUM 0
-//!MAXIMUM 11
+//!MAXIMUM 12
 0
 
 //!BUFFER CELFLARE_ADD_STATE
@@ -164,6 +172,8 @@
 //!VAR float prev_illum_v[144]
 //!VAR float pump_fast_cell[144]
 //!VAR float pump_slow_cell[144]
+//!VAR float pump_very_slow_cell[144]
+//!VAR float pump_open_persist_cell[144]
 //!VAR float pump_env_cell[144]
 //!VAR float pump_mask_cell[144]
 //!VAR float pump_seed_cell[144]
@@ -174,6 +184,7 @@
 //!VAR float motion_dom_support
 //!VAR float motion_bad_match_frac
 //!VAR float motion_match_coverage
+//!VAR float additive_mode_magic
 //!VAR float motion_trust_cell[144]
 //!VAR float motion_mc_local_cell[144]
 //!VAR float motion_mc_effective_cell[144]
@@ -556,7 +567,7 @@ vec4 hook() {
 // proxy - which structurally cannot reach a broad lamp pan (the establishment
 // guards need a feature to hold still; a persistently-moving lamp establishes
 // nowhere). Three passes:
-//   (1) MOTION_CUR  - 128x72 edge-preserving luma downsample of MAIN
+//   (1) MOTION_CUR  - 128x72 edge-preserving max-channel downsample of MAIN
 //                     (8x8 px per 16x9 pump cell).
 //   (2) MOTION_FLOW - 16x9 per-cell block-match of MOTION_CUR against the
 //                     persistent CELFLARE_ADD_MOTION_PREV (last frame), +-MOT_R px search,
@@ -568,17 +579,17 @@ vec4 hook() {
 // |V_now - warp(V_prev, flow)| replaces the per-cell MASK freshness (established-
 // level + dipole + LK) with ONE test - small residual = transport (suppress),
 // large = emission (pump). SCOPE (paired audit): this governs the mask only; the
-// SCALAR onset (loc_on_sum) still uses the legacy established gate. Safe under
-// this build's SUBTRACTIVE apply (pump_local = pump_env x mask -> the MC mask
-// gates the product), NOT yet additive-safe - a reveal's garbage flow fails OPEN
-// with no scalar backstop. Additive stays deferred: a sustained bright-island
-// reveal remains ignition-equivalent, and no currently-proven opener resolves it.
+// SCALAR onset (loc_on_sum) still uses the legacy established gate. The A0
+// subtractive apply uses this as a permissive suppressor. A1 additive adds a
+// seven-frame local opening proof, transported persistence, and a second local
+// flow route in the pump's own illumination field before the mask may create
+// amplitude.
 // Frame-0 safety: loop 2 (the MC consumer) is skipped while transient_reset is
 // set, so uninitialized CELFLARE_ADD_MOTION_PREV / garbage flow never reaches persistent SSBO
 // state - do NOT move the MC block or loop 2 out of that guard.
 // Offline 16x9 cell-replica: pan mask-debit 0.87 (vs the affine gate's 0.50),
-// growth 0.09 (event pumps). A wrong flow protects emission but also opens on a
-// reveal; that asymmetry is harmless only while the apply remains subtractive.
+// growth 0.09 (event pumps). That single-flow result is only the A0 baseline;
+// A1's pump-domain route and persistence contract own reveal safety.
 
 //!HOOK MAIN
 //!BIND HOOKED
@@ -587,16 +598,26 @@ vec4 hook() {
 //!HEIGHT 72
 //!DESC CelFlare: Motion analysis downsample
 vec4 hook() {
-    // Edge-preserving luma at 128x72 (8x8 px per 16x9 pump cell). 4 bilinear
-    // taps at the output-texel corners = modest box AA so a moving edge matches
-    // frame-to-frame without alias shimmer poisoning the block-match search.
-    const vec3 lc = vec3(0.2126, 0.7152, 0.0722);
+    // Pump-aligned max-channel signature at 128x72 (8x8 px per 16x9 pump cell).
+    // The pump driver is V-aware; Rec.709 luma can nearly hide a saturated blue
+    // or red light that still drives the pump, making its motion guard blind to
+    // the exact feature it must classify. Four corner taps retain modest box AA
+    // so a moving edge matches without alias shimmer.
     vec2 o = vec2(0.5 / 128.0, 0.5 / 72.0);
-    float y = dot(HOOKED_tex(HOOKED_pos + vec2(-o.x, -o.y)).rgb, lc)
-            + dot(HOOKED_tex(HOOKED_pos + vec2( o.x, -o.y)).rgb, lc)
-            + dot(HOOKED_tex(HOOKED_pos + vec2(-o.x,  o.y)).rgb, lc)
-            + dot(HOOKED_tex(HOOKED_pos + vec2( o.x,  o.y)).rgb, lc);
+    vec3 c0 = HOOKED_tex(HOOKED_pos + vec2(-o.x, -o.y)).rgb;
+    vec3 c1 = HOOKED_tex(HOOKED_pos + vec2( o.x, -o.y)).rgb;
+    vec3 c2 = HOOKED_tex(HOOKED_pos + vec2(-o.x,  o.y)).rgb;
+    vec3 c3 = HOOKED_tex(HOOKED_pos + vec2( o.x,  o.y)).rgb;
+#if cf_additive_pump && cf_spatial_pump
+    float v = max(max(c0.r, c0.g), c0.b) + max(max(c1.r, c1.g), c1.b)
+            + max(max(c2.r, c2.g), c2.b) + max(max(c3.r, c3.g), c3.b);
+    return vec4(v * 0.25, 0.0, 0.0, 1.0);
+#else
+    // Preserve the A0 subtractive reference bit-for-bit when additive is off.
+    const vec3 lc = vec3(0.2126, 0.7152, 0.0722);
+    float y = dot(c0, lc) + dot(c1, lc) + dot(c2, lc) + dot(c3, lc);
     return vec4(y * 0.25, 0.0, 0.0, 1.0);
+#endif
 }
 
 //!HOOK MAIN
@@ -619,6 +640,9 @@ vec4 hook() {
 #define MOT_R       5      // search radius px (@128x72 ~ +-42 px/frame at 1080p); keep the hard-coded coarse lattice below in sync
 #define MOT_TILE    8
 #define MOT_SADCAP  0.10   // per-sample truncated SAD (robust to a lone outlier texel)
+#define MOT_SADCAP_BRIGHT 0.30 // bright max-channel features are pump evidence, not outliers
+#define MOT_SAD_BRIGHT_LO 0.35
+#define MOT_SAD_BRIGHT_HI 0.70
 #define MOT_BIAS    0.0005 // zero-motion prior: tiny per-shift penalty so a FLAT tile (all shifts equal cost) resolves to (0,0), not the search's first corner (paired audit) — far below any real match difference, so genuine motion is unaffected
 #define MOT_TAPS    16
 #define MOT_CELLS   144
@@ -630,16 +654,36 @@ vec4 hook() {
 // [lane][tap]. Footprint = 2304 floats = 9 KiB.
 shared float s_motion_cur[MOT_TAPS * MOT_CELLS];
 
+ivec2 motion_tap_offset(int t) {
+    int tx = t & 3, ty = t >> 2;
+#if cf_additive_pump && cf_spatial_pump
+    // Same 16 samples and same tile coverage as the old even/even lattice, but
+    // alternate parity by row/column. This removes period-4 sampling nulls
+    // without adding a fetch.
+    return ivec2((tx << 1) + (ty & 1), (ty << 1) + (tx & 1));
+#else
+    return ivec2(tx << 1, ty << 1);
+#endif
+}
+
 float motion_sad(ivec2 org, ivec2 d, int lane) {
     const ivec2 dims = ivec2(128, 72);
     float sad = 0.0;
     for (int t = 0; t < MOT_TAPS; t++) {
-        ivec2 o = ivec2((t & 3) << 1, (t >> 2) << 1);
+        ivec2 o = motion_tap_offset(t);
         ivec2 p = org + o + d;
         float cv = s_motion_cur[t * MOT_CELLS + lane];
-        float pv = (p.x >= 0 && p.y >= 0 && p.x < dims.x && p.y < dims.y)
-                 ? imageLoad(CELFLARE_ADD_MOTION_PREV, p).r : (cv + MOT_SADCAP);
-        sad += min(abs(cv - pv), MOT_SADCAP);
+        bool inb = p.x >= 0 && p.y >= 0 && p.x < dims.x && p.y < dims.y;
+        float pv = inb ? imageLoad(CELFLARE_ADD_MOTION_PREV, p).r : cv;
+#if cf_additive_pump && cf_spatial_pump
+        float bright = smoothstep(MOT_SAD_BRIGHT_LO, MOT_SAD_BRIGHT_HI,
+                                  max(cv, pv));
+        float cap = mix(MOT_SADCAP, MOT_SADCAP_BRIGHT, bright);
+#else
+        float cap = MOT_SADCAP;
+#endif
+        float delta = inb ? abs(cv - pv) : cap;
+        sad += min(delta, cap);
     }
     return sad;
 }
@@ -656,7 +700,7 @@ void hook() {
     // hardware texture caching means neither count is a direct DRAM estimate.
     // The exhaustive fallback retains the original 121-candidate search.
     for (int t = 0; t < MOT_TAPS; t++) {
-        ivec2 o = ivec2((t & 3) << 1, (t >> 2) << 1);
+        ivec2 o = motion_tap_offset(t);
         ivec2 c = org + o;
         s_motion_cur[t * MOT_CELLS + lane] =
             MOTION_CUR_tex((vec2(c) + 0.5) * MOTION_CUR_pt).r;
@@ -711,6 +755,27 @@ void hook() {
         }
     }
 #endif
+    vec2 best_flow = vec2(bestd);
+#if cf_additive_pump && cf_spatial_pump
+    // Additive A1 needs subpixel flow because the 16x9 V history is sensitive
+    // to integer-vector quantization at slow pans. Four cardinal SAD probes fit
+    // a bounded quadratic inside the winning basin. This adds 64 previous-frame
+    // reads per cell only in additive mode (<=592 vs <=528 on the A0 path).
+    if (best_sad > 1e-7 && abs(bestd.x) < MOT_R) {
+        float cm = motion_sad(org, bestd + ivec2(-1, 0), lane);
+        float cp = motion_sad(org, bestd + ivec2( 1, 0), lane);
+        float den = cm - 2.0 * best_sad + cp;
+        if (den > 1e-6)
+            best_flow.x += clamp(0.5 * (cm - cp) / den, -0.5, 0.5);
+    }
+    if (best_sad > 1e-7 && abs(bestd.y) < MOT_R) {
+        float cm = motion_sad(org, bestd + ivec2(0, -1), lane);
+        float cp = motion_sad(org, bestd + ivec2(0,  1), lane);
+        float den = cm - 2.0 * best_sad + cp;
+        if (den > 1e-6)
+            best_flow.y += clamp(0.5 * (cm - cp) / den, -0.5, 0.5);
+    }
+#endif
     // Keep these metadata accumulators OUT of the large unrolled search's live
     // range. That matters on FXC, especially under the 1936-sample exhaustive
     // fallback; the coarse path evaluates at most 528 samples.
@@ -722,8 +787,8 @@ void hook() {
     }
     float tmean = tsum * (1.0 / 16.0);
     float texture_rms = sqrt(max(tsum2 * (1.0 / 16.0) - tmean * tmean, 0.0));
-    imageStore(out_image, cell,
-               vec4(float(bestd.x), float(bestd.y), best_sad * (1.0 / 16.0), texture_rms));
+    float best_mean = best_sad * (1.0 / 16.0);
+    imageStore(out_image, cell, vec4(best_flow, best_mean, texture_rms));
 }
 
 //!HOOK MAIN
@@ -1182,13 +1247,44 @@ void hook() {
 // motion-compensated established level — the level travels WITH the lamp). An
 // off-frame warp (content entering from beyond the border) presumes influx ->
 // shut (subsumes edge-establish). Offline block-match cell-replica: pan mask-
-// debit 0.87, growth 0.09 (event pumps). A wrong flow yields a large residual:
-// that protects emission but also opens on a reveal, so it is safe only under
-// the current subtractive apply. No additive-safe opener is proven yet.
+// debit 0.87, growth 0.09 (event pumps). A wrong flow yields a large residual,
+// which is permissive in A0; the additive branch below therefore does not use
+// this one-frame residual as opening authority.
 // 0 = legacy freshness path (established-level + dipole + LK), for A/B.
 #define MC_RESIDUAL_GATE  1
 #define MC_RES_LO         0.02   // motion-compensated residual (new light) below this: transport -> mask shut
 #define MC_RES_HI         0.08   // above: clearly new light -> mask opens
+#define SPATIAL_PUMP_ADDITIVE cf_additive_pump
+#define ADDITIVE_OPEN_GUARD  (SPATIAL_PUMP_ADDITIVE * MC_RESIDUAL_GATE * ENABLE_SPATIAL_PUMP)
+#if cf_additive_pump && !MC_RESIDUAL_GATE
+#error Additive apply requires the hardened motion-residual opener
+#endif
+// Additive A1 opening proof. Established fast-vs-neighbour memory still owns
+// WHERE an opening may happen. Motion then asks what fraction of the same-cell
+// rise survives a cubic sample at the refined previous offset: transport loses
+// most of its fast-lane rise; emission retains it. Using the pump's fast lane
+// instead of one-frame raw V lets a slow/held source keep proving itself while
+// its EMA catches up. The proof is deliberately seven
+// COMPLETE routed frames (2-6-frame flow-error bursts stay shut) and its credit
+// follows a moving event through the grid. No frame-global fast lane exists.
+#define ADD_VSLOW_ALPHA          0.01
+#define ADD_RATIO_RAW_FLOOR      0.001
+#define ADD_RATIO_LO             0.20
+#define ADD_RATIO_HI             0.55
+#define ADD_PERSIST_BASE         7.0
+#define ADD_PERSIST_ROUTE_MIN    0.50
+#define ADD_VFLOW_COST_MAX       0.03
+#define ADD_VFLOW_SAD_CAP        0.10
+#define ADD_VFLOW_BIAS           0.0001
+// Raw 128x72 flow owns the primary route. A second additive-only matcher works
+// directly on the already-resident 16x9 illumination-V history: the raw source
+// can live in one compact analysis tile while its sigma80 pump tail opens the
+// next cell, so no amount of same-tile ambiguity bookkeeping recovers that
+// identity. A demeaned 3x3 shape SAD selects local translation without treating
+// a level change as texture; the selected warp is still applied to ABSOLUTE
+// frozen fast history, leaving actual amplitude growth as the opening residual.
+// Proof credit follows ONLY the raw primary trajectory. Both motion routes are
+// veto-only and cannot lend mature state or frame-global event permission.
 // Research A/B for coherent-motion hardening of the SUBTRACTIVE MC mask. The
 // permissive local residual remains the opening authority; supported frame
 // motion may only DEBIT it by re-testing at the dominant prev-offset. Disabled:
@@ -1210,7 +1306,7 @@ void hook() {
 // seek detector. Bump it whenever MOTION_FLOW format/resolution/sign semantics
 // change. Same-schema reload/seek continuity is still not guaranteed: the cost
 // reset catches broad textured discontinuities, but no cut detector is universal.
-#define MOTION_STATE_EPOCH       51701.0
+#define MOTION_STATE_EPOCH       51705.0
 #define MOTION_COST_RESET        1
 #define MOTION_COST_GOOD         0.025   // mean winning SAD: confidently matched below
 #define MOTION_COST_BAD          0.075   // mean winning SAD: suspect above
@@ -1228,6 +1324,7 @@ void hook() {
 #define MOTION_DOM_AGREE_HI      1.75    // disagrees above
 #define MOTION_DEBUG_VIEWS       (cf_debug == 10 || cf_debug == 11)
 #define MOTION_COHERENT_ROUTE     (MOTION_COHERENT_VETO && MC_RESIDUAL_GATE && ENABLE_SPATIAL_PUMP)
+#define MOTION_FRAME_ANALYSIS     (MOTION_COHERENT_ROUTE || MOTION_DEBUG_VIEWS)
 // Legacy LK residual notes (MC_RESIDUAL_GATE=0 only; not additive safety claims):
 //  · ~50% pan-debit ceiling — band-pass di is an imperfect dI/dt AND a single
 //    global translation misfits a curved σ80 profile (mean texp≈0.5 on a rigid
@@ -1400,6 +1497,10 @@ shared float s_prev_v[144];
 #if MC_RESIDUAL_GATE || MOTION_COST_RESET || MOTION_COHERENT_ROUTE || MOTION_DEBUG_VIEWS
 shared vec2 s_flow[144];
 #endif
+#if ADDITIVE_OPEN_GUARD
+shared vec2 s_add_vflow[144];
+shared float s_add_vflow_cost[144];
+#endif
 #if MOTION_COST_RESET || MOTION_COHERENT_ROUTE || MOTION_DEBUG_VIEWS
 shared float s_flow_cost[144];
 shared float s_flow_texture[144];
@@ -1411,6 +1512,14 @@ shared float s_flow_texture[144];
 // cell's PRE-update state while the fused loop updates them in place.
 shared float s_pump_snap_f[144];
 shared float s_pump_snap_s[144];
+#if ADDITIVE_OPEN_GUARD
+// Frozen very-slow reveal memory. It must not be read directly from the SSBO
+// while loop 2 updates cells serially or later indices would see this frame's
+// writes from earlier neighbours.
+shared float s_pump_snap_vs[144];
+shared float s_pump_snap_persist[144];
+shared float s_pump_snap_fast_mc[144];
+#endif
 #if PUMP_TRANS_SUPPRESS && !MC_RESIDUAL_GATE
 // Frozen PRE-update per-cell velocity (di = fast−slow) for the translation
 // suppressor's trailing-fall scan. MUST be its own array, NOT recomputed from
@@ -1448,6 +1557,85 @@ float sample_prev_v(vec2 warpc) {
     return mix(mix(s_prev_v[wy0 * 16 + wx0], s_prev_v[wy0 * 16 + wx1], wfx),
                mix(s_prev_v[wy1 * 16 + wx0], s_prev_v[wy1 * 16 + wx1], wfx), wfy);
 }
+
+#if ADDITIVE_OPEN_GUARD
+float additive_v_shape_cost(ivec2 cell, ivec2 d,
+                            vec3 c0, vec3 c1, vec3 c2) {
+    vec2 p = vec2(cell) + vec2(d) * (1.0 / 8.0);
+    vec3 p0 = vec3(sample_prev_v(p + vec2(-1.0, -1.0)),
+                   sample_prev_v(p + vec2( 0.0, -1.0)),
+                   sample_prev_v(p + vec2( 1.0, -1.0)));
+    vec3 p1 = vec3(sample_prev_v(p + vec2(-1.0,  0.0)),
+                   sample_prev_v(p),
+                   sample_prev_v(p + vec2( 1.0,  0.0)));
+    vec3 p2 = vec3(sample_prev_v(p + vec2(-1.0,  1.0)),
+                   sample_prev_v(p + vec2( 0.0,  1.0)),
+                   sample_prev_v(p + vec2( 1.0,  1.0)));
+    float pm = (dot(p0, vec3(1.0)) + dot(p1, vec3(1.0))
+              + dot(p2, vec3(1.0))) * (1.0 / 9.0);
+    p0 -= pm; p1 -= pm; p2 -= pm;
+    vec3 e0 = min(abs(c0 - p0), vec3(ADD_VFLOW_SAD_CAP));
+    vec3 e1 = min(abs(c1 - p1), vec3(ADD_VFLOW_SAD_CAP));
+    vec3 e2 = min(abs(c2 - p2), vec3(ADD_VFLOW_SAD_CAP));
+    return (dot(e0, vec3(1.0)) + dot(e1, vec3(1.0))
+          + dot(e2, vec3(1.0))) * (1.0 / 9.0);
+}
+
+float cubic_prev_v(float p0, float p1, float p2, float p3, float t) {
+    return p1 + 0.5 * t * (p2 - p0
+         + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
+         + t * (3.0 * (p1 - p2) + p3 - p0)));
+}
+
+// Catmull-Rom reconstruction of the frozen previous fast-lane field. Integer
+// motion plus bilinear reconstruction left a curvature residual on slow broad
+// lamps; the cubic + subpixel pair removes that false "emission" without a new
+// texture or pass. Clamp only the dangerous downward overshoot: an upward one
+// conservatively vetoes a real opening, while a downward one could manufacture
+// positive residual and is therefore forbidden.
+float sample_prev_fast_cubic(vec2 warpc) {
+    vec2 cc = clamp(warpc, vec2(0.0), vec2(15.0, 8.0));
+    int bx = int(floor(cc.x)), by = int(floor(cc.y));
+    int xm = max(bx - 1, 0), x0 = bx, x1 = min(bx + 1, 15), x2 = min(bx + 2, 15);
+    int ym = max(by - 1, 0), y0 = by, y1 = min(by + 1, 8), y2 = min(by + 2, 8);
+    float fx = cc.x - float(bx), fy = cc.y - float(by);
+    float r0 = cubic_prev_v(s_pump_snap_fast_mc[ym * 16 + xm], s_pump_snap_fast_mc[ym * 16 + x0],
+                            s_pump_snap_fast_mc[ym * 16 + x1], s_pump_snap_fast_mc[ym * 16 + x2], fx);
+    float r1 = cubic_prev_v(s_pump_snap_fast_mc[y0 * 16 + xm], s_pump_snap_fast_mc[y0 * 16 + x0],
+                            s_pump_snap_fast_mc[y0 * 16 + x1], s_pump_snap_fast_mc[y0 * 16 + x2], fx);
+    float r2 = cubic_prev_v(s_pump_snap_fast_mc[y1 * 16 + xm], s_pump_snap_fast_mc[y1 * 16 + x0],
+                            s_pump_snap_fast_mc[y1 * 16 + x1], s_pump_snap_fast_mc[y1 * 16 + x2], fx);
+    float r3 = cubic_prev_v(s_pump_snap_fast_mc[y2 * 16 + xm], s_pump_snap_fast_mc[y2 * 16 + x0],
+                            s_pump_snap_fast_mc[y2 * 16 + x1], s_pump_snap_fast_mc[y2 * 16 + x2], fx);
+    float v = cubic_prev_v(r0, r1, r2, r3, fy);
+    float c00 = s_pump_snap_fast_mc[y0 * 16 + x0], c10 = s_pump_snap_fast_mc[y0 * 16 + x1];
+    float c01 = s_pump_snap_fast_mc[y1 * 16 + x0], c11 = s_pump_snap_fast_mc[y1 * 16 + x1];
+    float vlo = min(min(c00, c10), min(c01, c11));
+    return max(v, vlo);
+}
+
+float sample_prev_fast_linear(vec2 warpc) {
+    vec2 cc = clamp(warpc, vec2(0.0), vec2(15.0, 8.0));
+    int x0 = int(floor(cc.x)), y0 = int(floor(cc.y));
+    int x1 = min(x0 + 1, 15), y1 = min(y0 + 1, 8);
+    float fx = cc.x - float(x0), fy = cc.y - float(y0);
+    return mix(mix(s_pump_snap_fast_mc[y0 * 16 + x0],
+                   s_pump_snap_fast_mc[y0 * 16 + x1], fx),
+               mix(s_pump_snap_fast_mc[y1 * 16 + x0],
+                   s_pump_snap_fast_mc[y1 * 16 + x1], fx), fy);
+}
+
+float sample_prev_persist(vec2 warpc) {
+    vec2 cc = clamp(warpc, vec2(0.0), vec2(15.0, 8.0));
+    int wx0 = int(floor(cc.x)), wy0 = int(floor(cc.y));
+    int wx1 = min(wx0 + 1, 15), wy1 = min(wy0 + 1, 8);
+    float wfx = cc.x - float(wx0), wfy = cc.y - float(wy0);
+    return mix(mix(s_pump_snap_persist[wy0 * 16 + wx0],
+                   s_pump_snap_persist[wy0 * 16 + wx1], wfx),
+               mix(s_pump_snap_persist[wy1 * 16 + wx0],
+                   s_pump_snap_persist[wy1 * 16 + wx1], wfx), wfy);
+}
+#endif
 #endif
 
 void hook() {
@@ -1520,6 +1708,70 @@ void hook() {
 
     barrier();
 
+#if ADDITIVE_OPEN_GUARD
+    // Parallel local matcher in the pump's own sigma80/V domain. Gate the work
+    // with the same post-update band-pass test that will reach loop 2; idle
+    // cells publish an implausible cost but every lane still reaches the second
+    // barrier. All samples are shared-memory reads.
+    ivec2 vcell = ivec2(int(ix), int(iy));
+    float vf0 = mix(pump_fast_cell[lid], s_illum_v[lid], PUMP_ALPHA_FAST);
+    float vs0 = mix(pump_slow_cell[lid], s_illum_v[lid], PUMP_ALPHA_SLOW);
+    bool vwork = smoothstep(PUMP_CELL_DRIVE_LOW, PUMP_CELL_DRIVE_HIGH,
+                            vf0 - vs0) > 0.0;
+    vec2 vbest_flow = vec2(0.0);
+    float vbest_cost = 1.0;
+    if (vwork) {
+        int xm = max(vcell.x - 1, 0), xp = min(vcell.x + 1, 15);
+        int ym = max(vcell.y - 1, 0), yp = min(vcell.y + 1, 8);
+        vec3 vc0 = vec3(s_illum_v[ym * 16 + xm],
+                        s_illum_v[ym * 16 + vcell.x],
+                        s_illum_v[ym * 16 + xp]);
+        vec3 vc1 = vec3(s_illum_v[vcell.y * 16 + xm],
+                        s_illum_v[vcell.y * 16 + vcell.x],
+                        s_illum_v[vcell.y * 16 + xp]);
+        vec3 vc2 = vec3(s_illum_v[yp * 16 + xm],
+                        s_illum_v[yp * 16 + vcell.x],
+                        s_illum_v[yp * 16 + xp]);
+        float cur_mean = (dot(vc0, vec3(1.0)) + dot(vc1, vec3(1.0))
+                        + dot(vc2, vec3(1.0))) * (1.0 / 9.0);
+        vc0 -= cur_mean; vc1 -= cur_mean; vc2 -= cur_mean;
+        float best_rank = 1e9;
+        ivec2 bestd = ivec2(0);
+        for (int dy = -4; dy <= 4; dy += 2) {
+            for (int dx = -4; dx <= 4; dx += 2) {
+                ivec2 d = ivec2(dx, dy);
+                float cost = additive_v_shape_cost(vcell, d, vc0, vc1, vc2);
+                float rank = cost + ADD_VFLOW_BIAS * float(abs(dx) + abs(dy));
+                if (rank < best_rank) {
+                    best_rank = rank;
+                    vbest_cost = cost;
+                    bestd = d;
+                }
+            }
+        }
+        ivec2 coarse_best = bestd;
+        for (int ry = -1; ry <= 1; ry++) {
+            for (int rx = -1; rx <= 1; rx++) {
+                if (rx == 0 && ry == 0) continue;
+                ivec2 d = coarse_best + ivec2(rx, ry);
+                if (abs(d.x) > 5 || abs(d.y) > 5) continue;
+                float cost = additive_v_shape_cost(vcell, d, vc0, vc1, vc2);
+                float rank = cost + ADD_VFLOW_BIAS
+                           * float(abs(d.x) + abs(d.y));
+                if (rank < best_rank) {
+                    best_rank = rank;
+                    vbest_cost = cost;
+                    bestd = d;
+                }
+            }
+        }
+        vbest_flow = vec2(bestd);
+    }
+    s_add_vflow[lid] = vbest_flow;
+    s_add_vflow_cost[lid] = vbest_cost;
+    barrier();
+#endif
+
     // -------- thread-0 reduction + SSBO update --------
     // 144 serial adds on ALU registers is trivially cheap compared to the
     // 144 texture fetches we just parallelized away. Could be replaced with
@@ -1542,14 +1794,14 @@ void hook() {
             float tc = smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI,
                                   s_flow_texture[i]);
             motion_tex_w += tc;
-            motion_bad_w += tc * ((s_flow_cost[i] >= MOTION_COST_BAD) ? 1.0 : 0.0);
+            motion_bad_w += tc * ((abs(s_flow_cost[i]) >= MOTION_COST_BAD) ? 1.0 : 0.0);
         }
         motion_match_coverage = motion_tex_w * (1.0 / 144.0);
         motion_bad_match_frac = (motion_match_coverage >= MOTION_BAD_COVER_MIN
                               && motion_tex_w > 1e-5)
             ? motion_bad_w / motion_tex_w : 0.0;
 
-        #if MOTION_COHERENT_ROUTE || MOTION_DEBUG_VIEWS
+        #if MOTION_FRAME_ANALYSIS
         // Robust dominant PREV-OFFSET from the block-match vectors themselves.
         // The retired LK vector is in a different (sigma80 band-pass) domain and
         // cannot be used for this warp. A uniform 4x9 evidence lattice (every
@@ -1566,7 +1818,7 @@ void hook() {
         for (uint ex = 0u; ex < 4u; ex++) {
             uint i = ey * 16u + ex * 4u + (ey & 3u);
             float cost_c = 1.0 - smoothstep(MOTION_COST_GOOD, MOTION_COST_BAD,
-                                            s_flow_cost[i]);
+                                            abs(s_flow_cost[i]));
             float tex_c = smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI,
                                      s_flow_texture[i]);
             float w = cost_c * tex_c;
@@ -1588,7 +1840,7 @@ void hook() {
                 for (uint ex = 0u; ex < 4u; ex++) {
                     uint i = ey * 16u + ex * 4u + (ey & 3u);
                     float cost_c = 1.0 - smoothstep(MOTION_COST_GOOD, MOTION_COST_BAD,
-                                                    s_flow_cost[i]);
+                                                    abs(s_flow_cost[i]));
                     float tex_c = smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI,
                                              s_flow_texture[i]);
                     float agree = 1.0 - smoothstep(MOTION_DOM_AGREE_LO,
@@ -1633,7 +1885,7 @@ void hook() {
             // authority: it may be an independently-moving/growing event, and
             // under-pumping that is worse than leaving a rare sharp alias open.
             float local_reliable =
-                (1.0 - smoothstep(MOTION_COST_GOOD, MOTION_COST_BAD, s_flow_cost[i]))
+                (1.0 - smoothstep(MOTION_COST_GOOD, MOTION_COST_BAD, abs(s_flow_cost[i])))
                 * smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI, s_flow_texture[i]);
             float local_agree = 1.0 - smoothstep(MOTION_DOM_AGREE_LO,
                                                  MOTION_DOM_AGREE_HI,
@@ -1941,9 +2193,11 @@ void hook() {
         #else
         bool motion_match_reset = false;
         #endif
+        bool additive_mode_reset = additive_mode_magic != float(ADDITIVE_OPEN_GUARD);
         bool transient_reset = (frame == 0) || (scene_cut_lockout > 0.0)
-                            || motion_uninit || motion_match_reset;
+                            || motion_uninit || motion_match_reset || additive_mode_reset;
         motion_state_magic = MOTION_STATE_EPOCH;
+        additive_mode_magic = float(ADDITIVE_OPEN_GUARD);
         smoothed_growth_mode = transient_reset
             ? 0.0
             : mix(smoothed_growth_mode, growth_mode_instant, alpha);
@@ -1971,6 +2225,8 @@ void hook() {
                 float v = s_illum_v[i];
                 pump_fast_cell[i] = v;
                 pump_slow_cell[i] = v;
+                pump_very_slow_cell[i] = v;
+                pump_open_persist_cell[i] = 0.0;
                 pump_env_cell[i]  = 0.0;
                 pump_mask_cell[i] = 0.0;
                 #if PUMP_EDGE_ESTABLISH
@@ -2044,6 +2300,11 @@ void hook() {
                 float cs = pump_slow_cell[i];
                 s_pump_snap_f[i] = cf;
                 s_pump_snap_s[i] = cs;
+                #if ADDITIVE_OPEN_GUARD
+                s_pump_snap_vs[i] = pump_very_slow_cell[i];
+                s_pump_snap_persist[i] = pump_open_persist_cell[i];
+                s_pump_snap_fast_mc[i] = cf;
+                #endif
                 #if PUMP_EDGE_ESTABLISH
                 s_pump_snap_seed[i] = pump_seed_cell[i];   // prev-frame influx-origin marker
                 #endif
@@ -2185,6 +2446,15 @@ void hook() {
                 flow_conf   = coh * mgate * emit * PUMP_TRANSPORT_STRENGTH;
             }
             #endif
+            #if MC_RESIDUAL_GATE
+            // Frame-invariant conservation signal for the subtractive A0 floor.
+            // Hoisted out of loop 2: pow() is paid once, never per active cell.
+            float motion_dl_pos = (loc_sum > 0.0)
+                ? pow(loc_sum / N_SAMPLES, 1.0 / PUMP_DRIVE_P) : 0.0;
+            float motion_emit_signal = smoothstep(PUMP_TRANSPORT_EMIT_LO,
+                                                   PUMP_TRANSPORT_EMIT_HI,
+                                                   motion_dl_pos);
+            #endif
             // Loop 2: established-level gate → gated ONSET aggregate, then the
             // cell EMA update + mask env. A rise is FRESH only if the cell's
             // pre-update fast exceeds every ring-2 neighbour's pre-update slow
@@ -2200,6 +2470,14 @@ void hook() {
                 float w  = pow(m, PUMP_DRIVE_P);
                 bool fresh = false;
                 float fresh_ease = 0.0;
+                #if cf_debug == 12
+                motion_trust_cell[i] = 0.0;
+                motion_mc_local_cell[i] = 0.0;
+                motion_mc_effective_cell[i] = 0.0;
+                #endif
+                #if ADDITIVE_OPEN_GUARD
+                float add_established = 0.0;
+                #endif
                 int cy = int(i) / 16, cx = int(i) % 16;
                 #if PUMP_EDGE_ESTABLISH
                 // Border seed (off-screen establishment): a rising outer-ring
@@ -2246,11 +2524,18 @@ void hook() {
                     int ny0 = clamp(cy - 2, 0, 4);
                     int nx0 = clamp(cx - 2, 0, 11);
                     float nb_est = 0.0;
+                    #if ADDITIVE_OPEN_GUARD
+                    float nb_est_add = 0.0;
+                    #endif
                     for (int ny = ny0; ny < ny0 + 5; ny++)
                         for (int nx = nx0; nx < nx0 + 5; nx++)
                             if (ny != cy || nx != cx) {
                                 float snb = s_pump_snap_s[ny * 16 + nx];
                                 nb_est = max(nb_est, snb);
+                                #if ADDITIVE_OPEN_GUARD
+                                nb_est_add = max(nb_est_add,
+                                    max(snb, s_pump_snap_vs[ny * 16 + nx]));
+                                #endif
                                 #if PUMP_EDGE_ESTABLISH
                                 // Carry the max INFLUX marker among neighbours
                                 // established a STEP above this cell's fast
@@ -2271,6 +2556,11 @@ void hook() {
                                 #endif
                             }
                     fresh = cf - PUMP_ESTABLISH_MARGIN > nb_est;
+                    #if ADDITIVE_OPEN_GUARD
+                    add_established = smoothstep(PUMP_ESTABLISH_MARGIN,
+                                                 2.0 * PUMP_ESTABLISH_MARGIN,
+                                                 cf - nb_est_add);
+                    #endif
                     #if PUMP_EDGE_ESTABLISH
                     // Influx-seeded edge cells contribute a debited onset so an
                     // object entering off-frame cannot fire the global scalar
@@ -2372,6 +2662,9 @@ void hook() {
                 #endif
                 pump_fast_cell[i] = f;
                 pump_slow_cell[i] = s;
+                #if ADDITIVE_OPEN_GUARD
+                pump_very_slow_cell[i] = mix(s_pump_snap_vs[i], v, ADD_VSLOW_ALPHA);
+                #endif
                 float d = f - s;
                 // Idle-wobble cells read true zero: any d below the onset edge
                 // maps to exactly 0 (the former dead-zone shift is folded into
@@ -2391,6 +2684,80 @@ void hook() {
                         vec2 warpc = vec2(float(cxm), float(cym)) + local_flow * (1.0 / 8.0);
                         bool inb = warpc.x > -0.5 && warpc.x < 15.5
                                 && warpc.y > -0.5 && warpc.y < 8.5;
+                        #if ADDITIVE_OPEN_GUARD
+                        // Additive A1: opening authority stays local. Compare the
+                        // motion-compensated fast-lane rise with its same-cell
+                        // rise so the decision is about EXPLAINED FRACTION, not
+                        // an absolute one-frame delta: a slow grow keeps ratio~1,
+                        // a carried lamp~0, and a held source retains evidence
+                        // while the fast lane is still catching up.
+                        // Cubic history and subpixel flow remove the coarse-grid
+                        // curvature residual that otherwise poisons slow pans.
+                        float mc_prev = f;
+                        if (inb)
+                            mc_prev = sample_prev_fast_cubic(warpc);
+                        float mc_rise = inb ? max(f - mc_prev, 0.0) : 0.0;
+                        float raw_rise = max(f - cf, 0.0);
+                        float emit_ratio = clamp(mc_rise
+                            / max(raw_rise, ADD_RATIO_RAW_FLOOR), 0.0, 1.0);
+                        float ratio_route = smoothstep(ADD_RATIO_LO, ADD_RATIO_HI,
+                                                       emit_ratio)
+                                          * ((raw_rise > 1e-6) ? 1.0 : 0.0);
+                        float effective_ratio_route = ratio_route;
+                        // A compact source can sit in one raw-analysis tile
+                        // while its broad illumination tail opens this one. The
+                        // local V-flow route supplies that missing transport
+                        // explanation. Selection used demeaned shape; the warp
+                        // below uses absolute fast history, so real amplitude
+                        // growth survives as residual instead of becoming flow.
+                        if (s_add_vflow_cost[i] <= ADD_VFLOW_COST_MAX) {
+                            vec2 vwarpc = vec2(float(cxm), float(cym))
+                                        + s_add_vflow[i] * (1.0 / 8.0);
+                            bool vin = vwarpc.x > -0.5 && vwarpc.x < 15.5
+                                    && vwarpc.y > -0.5 && vwarpc.y < 8.5;
+                            if (vin) {
+                                float vprev = sample_prev_fast_linear(vwarpc);
+                                float vrise = max(f - vprev, 0.0);
+                                float vratio = clamp(vrise
+                                    / max(raw_rise, ADD_RATIO_RAW_FLOOR), 0.0, 1.0);
+                                float vroute = smoothstep(ADD_RATIO_LO, ADD_RATIO_HI,
+                                                          vratio)
+                                             * ((raw_rise > 1e-6) ? 1.0 : 0.0);
+                                effective_ratio_route = min(effective_ratio_route,
+                                                            vroute);
+                            }
+                        }
+                        float routed_open = inb
+                            ? add_established * effective_ratio_route : 0.0;
+                        #if PUMP_EDGE_ESTABLISH
+                        // Edge/influx authority is part of the persisted route,
+                        // not a later output debit. Hidden edge credit therefore
+                        // cannot mature while final amplitude is held at zero.
+                        routed_open *= 1.0 - edge_seed;
+                        #endif
+                        // Credit follows one selected physical trajectory only:
+                        // current + raw primary. The pump-domain route is an
+                        // opening veto, never a persistence donor; lending its
+                        // state could bypass the seven-frame proof beside an
+                        // unrelated established event. A transported lamp has
+                        // routed_open=0 and resets both sources.
+                        float prior_credit = s_pump_snap_persist[i];
+                        if (inb)
+                            prior_credit = max(prior_credit,
+                                sample_prev_persist(warpc));
+                        float persist = (routed_open >= ADD_PERSIST_ROUTE_MIN)
+                            ? min(prior_credit + 1.0,
+                                  ADD_PERSIST_BASE + 1.0) : 0.0;
+                        pump_open_persist_cell[i] = persist;
+                        float persist_gate = smoothstep(ADD_PERSIST_BASE - 1.0,
+                                                        ADD_PERSIST_BASE, persist);
+                        fresh_ease = routed_open * persist_gate;
+                        #if cf_debug == 12
+                        motion_trust_cell[i] = add_established;
+                        motion_mc_local_cell[i] = effective_ratio_route;
+                        motion_mc_effective_cell[i] = persist_gate;
+                        #endif
+                        #else
                         float mc_prev = sample_prev_v(warpc);
                         float mc_res = s_illum_v[i] - mc_prev;
                         float mc_fresh = inb
@@ -2401,7 +2768,7 @@ void hook() {
                         // credible disagreement protects an independent event.
                         float local_reliable =
                             (1.0 - smoothstep(MOTION_COST_GOOD, MOTION_COST_BAD,
-                                              s_flow_cost[i]))
+                                              abs(s_flow_cost[i])))
                             * smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI,
                                          s_flow_texture[i]);
                         float local_agree = 1.0 - smoothstep(
@@ -2429,23 +2796,20 @@ void hook() {
                             mc_fresh *= mix(1.0, mc_effective, motion_trust);
                         }
                         #endif
-                    // CONSERVATION FLOOR (paired design audit 2026-07-12, cardinal fix):
-                    // a UNIFORM-brightness advancing front (a flat cel-shaded spell
-                    // sweep / light wipe / energy wave) is a translating bright edge,
-                    // so it warps its own body into the cell -> mc_res~0 -> the MC
-                    // test ALONE would suppress it (local brightness-constancy is
-                    // blind to front-vs-transport). Re-admit it via the global
-                    // conservation signal: net signed drive > 0 means bright-mass is
-                    // GROWING (emission), not a conserved pan (loc_sum~0). Floors the
-                    // mask open for growing events the residual can't see, while a
-                    // conserved lamp pan (dl_pos~0) still rides mc_fresh -> stays shut.
-                    float dl_pos = (loc_sum > 0.0) ? pow(loc_sum / N_SAMPLES, 1.0 / PUMP_DRIVE_P) : 0.0;
-                    float emit_floor = smoothstep(PUMP_TRANSPORT_EMIT_LO, PUMP_TRANSPORT_EMIT_HI, dl_pos);
-                    // Post-veto by design: the frame-global floor may restore a
-                    // broad generating event, but coherent motion never gets to
-                    // erase that advancing-front protection.
-                    fresh_ease = max(mc_fresh, emit_floor);
+                        // A0 subtractive conservation floor: broad generation may
+                        // restore the permissive mask because scalar pump_env still
+                        // owns amplitude. The additive branch above deliberately
+                        // does not inherit this frame-global opening floor.
+                        fresh_ease = max(mc_fresh, motion_emit_signal);
+                        #endif
                     }
+                    #if ADDITIVE_OPEN_GUARD
+                    else {
+                        // Persistence proves consecutive complete openings. An
+                        // idle/closed cell cannot retain partial credit.
+                        pump_open_persist_cell[i] = 0.0;
+                    }
+                    #endif
                 }
 #endif
                 #if PUMP_MASK_ESTABLISH
@@ -2455,7 +2819,7 @@ void hook() {
                 // releases exactly as before — closing is never gated.
                 a *= fresh_ease;
                 #endif
-                #if PUMP_EDGE_ESTABLISH
+                #if PUMP_EDGE_ESTABLISH && !ADDITIVE_OPEN_GUARD
                 // Edge cells open only on a coherent (global) rise; a pure
                 // influx (edge_seed->1, so 1-edge_seed->0) is held shut. A
                 // genuine event that reaches the edge is restored at full rate
@@ -2641,7 +3005,7 @@ void hook() {
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
 //!BIND MOTION_FLOW
-//!DESC CelFlare Additive A0 (subtractive baseline)
+//!DESC CelFlare Additive A1 (guarded prototype; subtractive default)
 
 // =============================================
 //  MAIN TUNING — deep anchors. The supported user surface is the cf_* block
@@ -2853,9 +3217,9 @@ void hook() {
 // pump_cover_gate — the bilinear per-cell env IS the local pump amplitude, so
 // each region pumps at its own strength and rhythm and a localized event no
 // longer needs the frame statistics to fire (small-event amplitude back).
-// Safe to open only because PASS 5 gates every mask OPENING on the
-// established-level test + frame-edge rule — the reveal/ghost/trail class
-// that sank the pre-v5.2 additive mask cannot open a cell.
+// In this A1 track PASS 5 additionally requires a seven-frame local emission
+// proof across both the raw-source and pump-domain motion routes. The
+// established-level and frame-edge rules remain the first opening authority.
 // 0 = SUBTRACTIVE (v5.2–v5.4 shipping behavior): pump_local = pump_env × mask
 // — the mask only suppresses the scalar; instant fallback if the experiment
 // misbehaves in the field.
@@ -2864,8 +3228,9 @@ void hook() {
 // run a touch hotter than v5.4 — that PASS 5 knob is the amplitude-reserve
 // lever. Mask fractional coords are smoothstep-eased (C1) to kill bilinear
 // seams.
-// v5.17 (2026-07-12): DEFAULT REVERTED TO SUBTRACTIVE after field reports on
-// camera motion (Judas Overlord E05: a spot lit up on a talking face during a
+// v5.17 (2026-07-12): the first transport experiment reverted to subtractive
+// after field reports on camera motion (Judas Overlord E05: a spot lit up on a
+// talking face during a
 // tilt-up; the bar-lamp scene flickered on a pan). The additive door removed
 // the scalar's two motion-safety properties — (a) requiring net-new GLOBAL
 // light, (b) temporal smoothing via pump_env — and a bright feature (facial
@@ -2875,10 +3240,11 @@ void hook() {
 // restores both properties: an in-frame highlight self-cancels the scalar
 // (pump_env≈0 → no pump), and the revealed-lamp pump is temporally smoothed
 // (measured: p999 peak +145→+45 nits over base, frame-to-frame flicker ~halved).
-// The cost is the per-cell additive amplitude on genuine localized dark-scene
-// events (multi-fire); reclaiming it needs a motion discriminator, not this
-// door. Set to 1 to A/B the additive apply.
-#define SPATIAL_PUMP_ADDITIVE 0  // A0 scaffold: enable only after the additive opening guard lands
+// The cost was the per-cell additive amplitude on genuine localized dark-scene
+// events (multi-fire). A1 is the separate response: pump-domain motion veto,
+// longer-baseline establishment, and persisted multi-frame proof. Default stays 0
+// until those additions pass synthetic, D3D11, performance, and source checks.
+#define SPATIAL_PUMP_ADDITIVE cf_additive_pump
 
 // =============================================
 //  SPECULAR BONUS — scene-detected, per-pixel bloom
@@ -3402,7 +3768,7 @@ vec4 hook() {
     vec2 mpos = (vec2(mc) + 0.5) / vec2(16.0, 9.0);
     vec4 md = MOTION_FLOW_tex(mpos);
     float trust = motion_trust_cell[mc.y * 16 + mc.x];
-    return vec4(clamp(md.z * 10.0, 0.0, 1.0),
+    return vec4(clamp(abs(md.z) * 10.0, 0.0, 1.0),
                 clamp(md.w * 20.0, 0.0, 1.0),
                 clamp(trust, 0.0, 1.0), 1.0);
 #endif
@@ -3417,6 +3783,17 @@ vec4 hook() {
     return vec4(clamp(motion_mc_local_cell[mi], 0.0, 1.0),
                 clamp(motion_mc_effective_cell[mi], 0.0, 1.0),
                 clamp(motion_trust_cell[mi], 0.0, 1.0), 1.0);
+#endif
+#if cf_debug == 12
+    // Additive opening proof, nearest-cell: red = established fast level above
+    // slow+very-slow ring memory; green = motion-unexplained fast-rise ratio;
+    // blue = seven-frame carried persistence. White is eligible to open.
+    ivec2 mc = clamp(ivec2(HOOKED_pos * vec2(16.0, 9.0)),
+                      ivec2(0), ivec2(15, 8));
+    int mi = mc.y * 16 + mc.x;
+    return vec4(clamp(motion_trust_cell[mi], 0.0, 1.0),
+                clamp(motion_mc_local_cell[mi], 0.0, 1.0),
+                clamp(motion_mc_effective_cell[mi], 0.0, 1.0), 1.0);
 #endif
     vec4 color = HOOKED_texOff(0);
     vec3 rgb_gamma = color.rgb;

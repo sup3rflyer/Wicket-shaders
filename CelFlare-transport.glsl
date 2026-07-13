@@ -133,7 +133,7 @@
 1
 
 //!PARAM cf_debug
-//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars, 9 = motion prev-offset (R/G = +x/+y source offset; right/down image motion is negative), 10 = motion evidence (R = match cost, G = tile RMS contrast, B = prospective trust), 11 = motion residual (R = local-flow emit, G = dominant-borrow emit, B = prospective trust).
+//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars, 9 = motion prev-offset (R/G = +x/+y source offset; right/down image motion is negative), 10 = motion evidence (R = match cost, G = tile RMS contrast, B = research trust), 11 = motion residual (R = local-flow emit, G = dominant-borrow emit, B = research trust).
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 11
@@ -1181,6 +1181,14 @@ void hook() {
 #define MC_RESIDUAL_GATE  1
 #define MC_RES_LO         0.02   // motion-compensated residual (new light) below this: transport -> mask shut
 #define MC_RES_HI         0.08   // above: clearly new light -> mask opens
+// Research A/B for coherent-motion hardening of the SUBTRACTIVE MC mask. The
+// permissive local residual remains the opening authority; supported frame
+// motion may only DEBIT it by re-testing at the dominant prev-offset. Disabled:
+// a deterministic pan + independent ignition control found no further debit on
+// the already-correct transported lamp, but did debit the real ignition. Debug
+// 10/11 retain the evidence/borrowed-residual views for future experiments.
+// No pass, texture, or persistent bandwidth is added while this stays 0.
+#define MOTION_COHERENT_VETO     0
 // Motion observability / history guards. The cost and texture thresholds let
 // evidence-bearing tiles vote a discontinuity without flat tiles declaring a
 // false zero-flow match. cf_debug=10/11 expose the underlying evidence/trust.
@@ -1211,6 +1219,7 @@ void hook() {
 #define MOTION_DOM_AGREE_LO      0.75    // local-vs-dominant distance px: agrees below
 #define MOTION_DOM_AGREE_HI      1.75    // disagrees above
 #define MOTION_DEBUG_VIEWS       (cf_debug == 10 || cf_debug == 11)
+#define MOTION_COHERENT_ROUTE     (MOTION_COHERENT_VETO && MC_RESIDUAL_GATE && ENABLE_SPATIAL_PUMP)
 // Legacy LK residual notes (MC_RESIDUAL_GATE=0 only; not additive safety claims):
 //  · ~50% pan-debit ceiling — band-pass di is an imperfect dI/dt AND a single
 //    global translation misfits a curved σ80 profile (mean texp≈0.5 on a rigid
@@ -1380,10 +1389,10 @@ shared float s_illum_v[144];        // max(R,G,B) of the illum field — V-aware
 // thread 0 in loop 2 (warp + residual). Own-slot writes → race-free pre-barrier.
 shared float s_prev_v[144];
 #endif
-#if MC_RESIDUAL_GATE || MOTION_COST_RESET || MOTION_DEBUG_VIEWS
+#if MC_RESIDUAL_GATE || MOTION_COST_RESET || MOTION_COHERENT_ROUTE || MOTION_DEBUG_VIEWS
 shared vec2 s_flow[144];
 #endif
-#if MOTION_COST_RESET || MOTION_DEBUG_VIEWS
+#if MOTION_COST_RESET || MOTION_COHERENT_ROUTE || MOTION_DEBUG_VIEWS
 shared float s_flow_cost[144];
 shared float s_flow_texture[144];
 #endif
@@ -1394,7 +1403,7 @@ shared float s_flow_texture[144];
 // cell's PRE-update state while the fused loop updates them in place.
 shared float s_pump_snap_f[144];
 shared float s_pump_snap_s[144];
-#if PUMP_TRANS_SUPPRESS
+#if PUMP_TRANS_SUPPRESS && !MC_RESIDUAL_GATE
 // Frozen PRE-update per-cell velocity (di = fast−slow) for the translation
 // suppressor's trailing-fall scan. MUST be its own array, NOT recomputed from
 // s_pump_snap_f/_s in the neighbour scan: loop 2 CLOBBERS s_pump_snap_f[i] in
@@ -1417,6 +1426,20 @@ shared float s_flow_pred[144];
 // that stops the gate from chain-eating a fire under a brighter sky.
 shared float s_pump_snap_seed[144];
 #endif
+#endif
+
+#if MC_RESIDUAL_GATE
+// Exact bilinear sample of the frozen previous 16x9 V field. Callers own the
+// half-cell in-bounds verdict; clamping here matches the established local-MC
+// edge contract while keeping all four shared reads valid.
+float sample_prev_v(vec2 warpc) {
+    vec2 cc = clamp(warpc, vec2(0.0), vec2(15.0, 8.0));
+    int wx0 = int(floor(cc.x)), wy0 = int(floor(cc.y));
+    int wx1 = min(wx0 + 1, 15), wy1 = min(wy0 + 1, 8);
+    float wfx = cc.x - float(wx0), wfy = cc.y - float(wy0);
+    return mix(mix(s_prev_v[wy0 * 16 + wx0], s_prev_v[wy0 * 16 + wx1], wfx),
+               mix(s_prev_v[wy1 * 16 + wx0], s_prev_v[wy1 * 16 + wx1], wfx), wfy);
+}
 #endif
 
 void hook() {
@@ -1456,7 +1479,7 @@ void hook() {
     s_valid[lid]     = valid ? 1u : 0u;
     s_intensity[lid] = intensity_src;
     s_sat[lid]       = sat_src;
-#if MC_RESIDUAL_GATE || MOTION_COST_RESET || MOTION_DEBUG_VIEWS
+#if MC_RESIDUAL_GATE || MOTION_COST_RESET || MOTION_COHERENT_ROUTE || MOTION_DEBUG_VIEWS
     // Motion gate inputs (own-slot, race-free): stash last frame's cell V when
     // the MC consumer is compiled, keep history advancing in the legacy A/B so
     // a state-preserving re-enable cannot see a stale frame, and sample the
@@ -1468,7 +1491,7 @@ void hook() {
     #endif
     prev_illum_v[lid] = s_illum_v[lid];
     s_flow[lid]       = motion_sample.xy;
-    #if MOTION_COST_RESET || MOTION_DEBUG_VIEWS
+    #if MOTION_COST_RESET || MOTION_COHERENT_ROUTE || MOTION_DEBUG_VIEWS
     s_flow_cost[lid]    = motion_sample.z;
     s_flow_texture[lid] = motion_sample.w;
     #endif
@@ -1500,7 +1523,7 @@ void hook() {
         // result while the history-store pass has primed next frame's image.
         bool motion_uninit = motion_state_magic != MOTION_STATE_EPOCH;
 
-        #if MOTION_COST_RESET || MOTION_DEBUG_VIEWS
+        #if MOTION_COST_RESET || MOTION_COHERENT_ROUTE || MOTION_DEBUG_VIEWS
         // Texture-qualified match validity. Flat tiles are deliberately absent
         // from the denominator: MOT_BIAS resolves them to zero flow but they
         // contain no evidence that zero is correct. Cost reset is default-on
@@ -1518,22 +1541,27 @@ void hook() {
                               && motion_tex_w > 1e-5)
             ? motion_bad_w / motion_tex_w : 0.0;
 
-        #if MOTION_DEBUG_VIEWS
+        #if MOTION_COHERENT_ROUTE || MOTION_DEBUG_VIEWS
         // Robust dominant PREV-OFFSET from the block-match vectors themselves.
         // The retired LK vector is in a different (sigma80 band-pass) domain and
-        // cannot be used for this warp. Two agreement-reweighted mean iterations
-        // are conservative on split/multiplane fields (support collapses instead
-        // of choosing an arbitrary mode) and avoid a 121-bin FXC-unroll hazard.
+        // cannot be used for this warp. A uniform 4x9 evidence lattice (every
+        // fourth column, phase shifted by row) keeps both-axis coverage without
+        // locking to one vertical stripe phase, while avoiding a second 144-cell
+        // serial analysis inside the already-large stats pass.
+        // One agreement-reweighted mean iteration is conservative on split/
+        // multiplane fields (support collapses instead of choosing an arbitrary
+        // mode) and avoids a 121-bin FXC-unroll hazard.
         float motion_wsum = 0.0;
         vec2 dom_sum = vec2(0.0);
         vec2 evidence_pos_sum = vec2(0.0), evidence_pos2_sum = vec2(0.0);
-        for (uint i = 0u; i < 144u; i++) {
+        for (uint ey = 0u; ey < 9u; ey++)
+        for (uint ex = 0u; ex < 4u; ex++) {
+            uint i = ey * 16u + ex * 4u + (ey & 3u);
             float cost_c = 1.0 - smoothstep(MOTION_COST_GOOD, MOTION_COST_BAD,
                                             s_flow_cost[i]);
             float tex_c = smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI,
                                      s_flow_texture[i]);
             float w = cost_c * tex_c;
-            s_flow_cost[i] = w;   // debug scratch: precompute once, not inside consensus loops
             motion_wsum += w;
             dom_sum += w * s_flow[i];
             vec2 ep = vec2((float(int(i) & 15) + 0.5) * (1.0 / 16.0),
@@ -1545,14 +1573,20 @@ void hook() {
         float consensus_w = 0.0;
         if (!motion_uninit && motion_wsum > 1e-5) {
             dom = dom_sum / motion_wsum;
-            for (int it = 0; it < 2; it++) {
+            for (int it = 0; it < 1; it++) {
                 vec2 refine_sum = vec2(0.0);
                 float refine_w = 0.0;
-                for (uint i = 0u; i < 144u; i++) {
+                for (uint ey = 0u; ey < 9u; ey++)
+                for (uint ex = 0u; ex < 4u; ex++) {
+                    uint i = ey * 16u + ex * 4u + (ey & 3u);
+                    float cost_c = 1.0 - smoothstep(MOTION_COST_GOOD, MOTION_COST_BAD,
+                                                    s_flow_cost[i]);
+                    float tex_c = smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI,
+                                             s_flow_texture[i]);
                     float agree = 1.0 - smoothstep(MOTION_DOM_AGREE_LO,
                                                    MOTION_DOM_AGREE_HI,
                                                    length(s_flow[i] - dom));
-                    float w = s_flow_cost[i] * agree;
+                    float w = cost_c * tex_c * agree;
                     refine_sum += w * s_flow[i];
                     refine_w += w;
                 }
@@ -1564,7 +1598,7 @@ void hook() {
         float consensus_purity = (motion_wsum > 1e-5)
             ? clamp(consensus_w / motion_wsum, 0.0, 1.0) : 0.0;
         float evidence_cover = smoothstep(MOTION_DOM_COVER_LO, MOTION_DOM_COVER_HI,
-                                          motion_wsum * (1.0 / 144.0));
+                                          motion_wsum * (1.0 / 36.0));
         vec2 evidence_std = vec2(0.0);
         if (motion_wsum > 1e-5) {
             vec2 evidence_mean = evidence_pos_sum / motion_wsum;
@@ -1579,44 +1613,57 @@ void hook() {
         float dom_support = consensus_purity * evidence_cover * evidence_spread;
         float dom_motion = smoothstep(MOTION_DOM_MAG_LO, MOTION_DOM_MAG_HI,
                                       length(dom));
+        #if MOTION_DEBUG_VIEWS
         motion_dom_x = dom.x;
         motion_dom_y = dom.y;
         motion_dom_support = dom_support;
+        #endif
+        #if MOTION_DEBUG_VIEWS
         for (uint i = 0u; i < 144u; i++) {
-            float local_reliable = s_flow_cost[i];
+            // Borrow the dominant vector only to the extent that the local
+            // block match lacks evidence. A credible local disagreement keeps
+            // authority: it may be an independently-moving/growing event, and
+            // under-pumping that is worse than leaving a rare sharp alias open.
+            float local_reliable =
+                (1.0 - smoothstep(MOTION_COST_GOOD, MOTION_COST_BAD, s_flow_cost[i]))
+                * smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI, s_flow_texture[i]);
+            float local_agree = 1.0 - smoothstep(MOTION_DOM_AGREE_LO,
+                                                 MOTION_DOM_AGREE_HI,
+                                                 length(s_flow[i] - dom));
             vec2 effective_flow = mix(dom, s_flow[i], local_reliable);
-            float agree = 1.0 - smoothstep(MOTION_DOM_AGREE_LO,
-                                           MOTION_DOM_AGREE_HI,
-                                           length(effective_flow - dom));
-            // A locally-flat tile borrows the supported dominant flow. Agreement
-            // becomes mandatory only as the local match becomes trustworthy.
-            motion_trust_cell[i] = motion_uninit ? 0.0
-                : dom_support * dom_motion * agree;
+            // Flat/weak tiles inherit frame coherence; as local evidence becomes
+            // trustworthy, local-vs-dominant agreement becomes mandatory.
+            float trust_agree = mix(1.0, local_agree, local_reliable);
+            float motion_trust = motion_uninit ? 0.0
+                : dom_support * dom_motion * trust_agree;
             #if MC_RESIDUAL_GATE
-            for (int k = 0; k < 2; k++) {
-                vec2 warp_flow = (k == 0) ? s_flow[i] : effective_flow;
-                int cxm = int(i) & 15, cym = int(i) >> 4;
-                vec2 warpc = vec2(float(cxm), float(cym)) + warp_flow * (1.0 / 8.0);
-                bool inb = warpc.x > -0.5 && warpc.x < 15.5
-                        && warpc.y > -0.5 && warpc.y < 8.5;
-                vec2 cc = clamp(warpc, vec2(0.0), vec2(15.0, 8.0));
-                int wx0 = int(floor(cc.x)), wy0 = int(floor(cc.y));
-                int wx1 = min(wx0 + 1, 15), wy1 = min(wy0 + 1, 8);
-                float wfx = cc.x - float(wx0), wfy = cc.y - float(wy0);
-                float mc_prev =
-                    mix(mix(s_prev_v[wy0 * 16 + wx0], s_prev_v[wy0 * 16 + wx1], wfx),
-                        mix(s_prev_v[wy1 * 16 + wx0], s_prev_v[wy1 * 16 + wx1], wfx), wfy);
-                float mc_res = s_illum_v[i] - mc_prev;
-                float mc_emit = inb
-                    ? smoothstep(MC_RES_LO, MC_RES_HI, max(mc_res, 0.0)) : 0.0;
-                if (k == 0) motion_mc_local_cell[i] = mc_emit;
-                else        motion_mc_effective_cell[i] = mc_emit;
-            }
+            // Diagnostic path mirrors production: exact local and effective
+            // bilinear samples of the frozen previous V field.
+            int cxm = int(i) & 15, cym = int(i) >> 4;
+            vec2 local_warpc = vec2(float(cxm), float(cym)) + s_flow[i] * (1.0 / 8.0);
+            vec2 effective_warpc = vec2(float(cxm), float(cym)) + effective_flow * (1.0 / 8.0);
+            bool local_inb = local_warpc.x > -0.5 && local_warpc.x < 15.5
+                          && local_warpc.y > -0.5 && local_warpc.y < 8.5;
+            bool effective_inb = effective_warpc.x > -0.5 && effective_warpc.x < 15.5
+                              && effective_warpc.y > -0.5 && effective_warpc.y < 8.5;
+            float mc_prev = sample_prev_v(local_warpc);
+            float mc_prev_effective = sample_prev_v(effective_warpc);
+            float mc_local = local_inb
+                ? smoothstep(MC_RES_LO, MC_RES_HI,
+                             max(s_illum_v[i] - mc_prev, 0.0)) : 0.0;
+            float mc_effective = effective_inb
+                ? smoothstep(MC_RES_LO, MC_RES_HI,
+                             max(s_illum_v[i] - mc_prev_effective, 0.0)) : 0.0;
+            motion_mc_local_cell[i] = mc_local;
+            motion_mc_effective_cell[i] = mc_effective;
+            motion_trust_cell[i] = motion_trust;
             #else
             motion_mc_local_cell[i] = 0.0;
             motion_mc_effective_cell[i] = 0.0;
+            motion_trust_cell[i] = motion_trust;
             #endif
         }
+        #endif
         #endif
         #endif
 
@@ -1993,7 +2040,7 @@ void hook() {
                 s_pump_snap_seed[i] = pump_seed_cell[i];   // prev-frame influx-origin marker
                 #endif
                 float di = cf - cs;
-                #if PUMP_TRANS_SUPPRESS
+                #if PUMP_TRANS_SUPPRESS && !MC_RESIDUAL_GATE
                 s_pump_snap_di[i] = di;   // frozen neighbour velocity for the trailing-fall scan
                 #endif
                 float m  = max(abs(di) - PUMP_CELL_DEADZONE, 0.0);
@@ -2230,6 +2277,7 @@ void hook() {
                     // neighbour by ~0.01 still cannot open) — the ease only
                     // softens the snap-open of a qualifying rise (the §13
                     // mask-hole seam, which additive amplitude would expose).
+                    #if !MC_RESIDUAL_GATE
                     fresh_ease = smoothstep(PUMP_ESTABLISH_MARGIN,
                                             2.0 * PUMP_ESTABLISH_MARGIN,
                                             cf - nb_est);
@@ -2263,7 +2311,7 @@ void hook() {
                         fresh_ease *= 1.0 - trans * match_w;
                     }
                     #endif
-                    #if PUMP_TRANSPORT_RESIDUAL && !MC_RESIDUAL_GATE
+                    #if PUMP_TRANSPORT_RESIDUAL
                     // GLOBAL-motion debit (see the knob block): fraction of THIS
                     // cell's rise that the single global image velocity explains.
                     // s_flow_pred[i] = ∇I·v (same di-basis as this loop's di), so
@@ -2277,6 +2325,7 @@ void hook() {
                         float texp = clamp(s_flow_pred[i] / max(di, 1e-4), 0.0, 1.0);
                         fresh_ease *= 1.0 - texp * flow_conf;
                     }
+                    #endif
                     #endif
                 } else {
                     loc_on_sum -= w;    // sign(di)*w with di <= 0
@@ -2321,28 +2370,57 @@ void hook() {
                 // PUMP_CELL_DRIVE_LOW/HIGH — see the knob block).
                 float a = smoothstep(PUMP_CELL_DRIVE_LOW, PUMP_CELL_DRIVE_HIGH, d);
 #if MC_RESIDUAL_GATE
-                // === UNIFIED MOTION-COMPENSATED RESIDUAL GATE (approach A) ===
-                // Override fresh_ease: the mask opens only where the current cell
-                // V exceeds the PREVIOUS frame warped by the block-match flow —
-                // new light the motion can't explain. Transport (a panning lamp)
-                // warps its own prior level into the cell → residual ~0 → shut.
-                // This single test replaces the established-level gate, the ring-1
-                // dipole and the LK transport fit (all computed above; their
-                // fresh_ease is discarded here). Off-frame warps = influx → shut.
+                // === MOTION-COMPENSATED RESIDUAL GATE (subtractive) ===
+                // The mask opens only where current V exceeds the previous field
+                // warped by motion: light the flow cannot explain. Evaluate only
+                // for an actually-opening cell (a>0): fresh_ease is multiplied
+                // into a immediately below, so idle-cell warps were dead work.
                 {
-                    int cxm = int(i) & 15, cym = int(i) >> 4;
-                    vec2 warpc = vec2(float(cxm), float(cym)) + s_flow[i] * (1.0 / 8.0);
-                    bool inb = warpc.x > -0.5 && warpc.x < 15.5
-                            && warpc.y > -0.5 && warpc.y < 8.5;
-                    vec2 cc = clamp(warpc, vec2(0.0), vec2(15.0, 8.0));
-                    int wx0 = int(floor(cc.x)), wy0 = int(floor(cc.y));
-                    int wx1 = min(wx0 + 1, 15), wy1 = min(wy0 + 1, 8);
-                    float wfx = cc.x - float(wx0), wfy = cc.y - float(wy0);
-                    float mc_prev =
-                        mix(mix(s_prev_v[wy0 * 16 + wx0], s_prev_v[wy0 * 16 + wx1], wfx),
-                            mix(s_prev_v[wy1 * 16 + wx0], s_prev_v[wy1 * 16 + wx1], wfx), wfy);
-                    float mc_res = s_illum_v[i] - mc_prev;   // >0 = light beyond what motion explains
-                    float mc_fresh = inb ? smoothstep(MC_RES_LO, MC_RES_HI, max(mc_res, 0.0)) : 0.0;
+                    fresh_ease = 0.0;
+                    if (a > 0.0) {
+                        int cxm = int(i) & 15, cym = int(i) >> 4;
+                        vec2 local_flow = s_flow[i];
+                        vec2 warpc = vec2(float(cxm), float(cym)) + local_flow * (1.0 / 8.0);
+                        bool inb = warpc.x > -0.5 && warpc.x < 15.5
+                                && warpc.y > -0.5 && warpc.y < 8.5;
+                        float mc_prev = sample_prev_v(warpc);
+                        float mc_res = s_illum_v[i] - mc_prev;
+                        float mc_fresh = inb
+                            ? smoothstep(MC_RES_LO, MC_RES_HI, max(mc_res, 0.0)) : 0.0;
+                        #if MOTION_COHERENT_ROUTE
+                        // Supported dominant motion gets a one-way veto only on
+                        // this live opening. Weak local matches borrow dom; a
+                        // credible disagreement protects an independent event.
+                        float local_reliable =
+                            (1.0 - smoothstep(MOTION_COST_GOOD, MOTION_COST_BAD,
+                                              s_flow_cost[i]))
+                            * smoothstep(MOTION_TEXTURE_LO, MOTION_TEXTURE_HI,
+                                         s_flow_texture[i]);
+                        float local_agree = 1.0 - smoothstep(
+                            MOTION_DOM_AGREE_LO, MOTION_DOM_AGREE_HI,
+                            length(local_flow - dom));
+                        float trust_agree = mix(1.0, local_agree, local_reliable);
+                        float motion_trust = motion_uninit ? 0.0
+                            : dom_support * dom_motion * trust_agree;
+                        if (mc_fresh > 0.0 && motion_trust > 0.0) {
+                            vec2 effective_flow = mix(dom, local_flow, local_reliable);
+                            vec2 effective_warpc = vec2(float(cxm), float(cym))
+                                                 + effective_flow * (1.0 / 8.0);
+                            bool effective_inb = effective_warpc.x > -0.5
+                                              && effective_warpc.x < 15.5
+                                              && effective_warpc.y > -0.5
+                                              && effective_warpc.y < 8.5;
+                            // Exact second bilinear sample. Shared history keeps
+                            // this bandwidth on-chip; the active/trusted-opening
+                            // guards above keep it off the idle-cell path.
+                            float mc_prev_effective = sample_prev_v(effective_warpc);
+                            float mc_effective = effective_inb
+                                ? smoothstep(MC_RES_LO, MC_RES_HI,
+                                    max(s_illum_v[i] - mc_prev_effective, 0.0))
+                                : 0.0;
+                            mc_fresh *= mix(1.0, mc_effective, motion_trust);
+                        }
+                        #endif
                     // CONSERVATION FLOOR (paired design audit 2026-07-12, cardinal fix):
                     // a UNIFORM-brightness advancing front (a flat cel-shaded spell
                     // sweep / light wipe / energy wave) is a translating bright edge,
@@ -2355,7 +2433,11 @@ void hook() {
                     // conserved lamp pan (dl_pos~0) still rides mc_fresh -> stays shut.
                     float dl_pos = (loc_sum > 0.0) ? pow(loc_sum / N_SAMPLES, 1.0 / PUMP_DRIVE_P) : 0.0;
                     float emit_floor = smoothstep(PUMP_TRANSPORT_EMIT_LO, PUMP_TRANSPORT_EMIT_HI, dl_pos);
+                    // Post-veto by design: the frame-global floor may restore a
+                    // broad generating event, but coherent motion never gets to
+                    // erase that advancing-front protection.
                     fresh_ease = max(mc_fresh, emit_floor);
+                    }
                 }
 #endif
                 #if PUMP_MASK_ESTABLISH
@@ -3306,9 +3388,7 @@ vec4 hook() {
 #if cf_debug == 10
     // Motion evidence view. Red = mean winning SAD (0.10 reaches full red),
     // green = current-tile RMS contrast (0.05 reaches full green), blue = the
-    // prospective coherent-veto trust. Blue is diagnostic only: PASS 5 derives
-    // it from robust block-flow consensus, but the live subtractive router does
-    // not consume it yet.
+    // research coherent-veto trust derived from robust block-flow consensus.
     ivec2 mc = clamp(ivec2(HOOKED_pos * vec2(16.0, 9.0)),
                       ivec2(0), ivec2(15, 8));
     vec2 mpos = (vec2(mc) + 0.5) / vec2(16.0, 9.0);
@@ -3322,7 +3402,7 @@ vec4 hook() {
     // Residual-contract view, nearest-cell throughout: red is the mc_emit used
     // by today's local block-flow warp; green is the same residual after an
     // unreliable local tile borrows the supported dominant prev-offset; blue
-    // is that prospective flow's trust. This is still instrumentation only.
+    // is the research router's prospective coherent-flow trust.
     ivec2 mc = clamp(ivec2(HOOKED_pos * vec2(16.0, 9.0)),
                       ivec2(0), ivec2(15, 8));
     int mi = mc.y * 16 + mc.x;

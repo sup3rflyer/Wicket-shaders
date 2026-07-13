@@ -1,5 +1,5 @@
 {
-  "_note": "Metal (MoltenVK) gpu-next reference signatures, captured via metal_ref.sh on a static smptehdbars 1280x720 source with the same capture.lua + frame_metrics.py that CI runs on WARP. Compare REGIME, not exact magnitude: fp16-RTZ vs fp32 and per-tick grain RNG make absolute values differ across platforms. A STORAGE/SSBO break shows as WARP leaving the regime (a grain shader going frozen tMAD~0 or exploding; CelFlare failing to converge).",
+  "_note": "Metal (MoltenVK) gpu-next reference signatures, captured via metal_ref.sh (deterministic paused frame-step) on a static smptehdbars 1280x720 source with the same capture.lua + frame_metrics.py that CI runs on WARP. The tMAD column is ADVISORY only: fp16-RTZ vs fp32 and per-tick grain RNG make magnitudes differ, and a per-present reseed cadence (e.g. filmgrain-match TPL jitter) is not fully exercised by paused frame-step — so a WARP tMAD divergence is a lead to eyeball on real hardware, NOT a build-failing verdict. The hard gate is non-degeneracy (frame_metrics.py exit 2). sstd (spatial structure) is deterministic and self-consistent across platforms.",
   "src": "av://lavfi:smptehdbars=rate=24:duration=6:size=1280x720",
   "shaders": {
     "filmgrain-match":    {"sstd": 0.2981, "tMAD": 0.00287},

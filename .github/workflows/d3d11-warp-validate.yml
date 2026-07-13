@@ -120,28 +120,32 @@ jobs:
       - name: WARP vs Metal regime comparison
         if: always() && steps.probe.outcome == 'success'
         shell: bash
+        env:
+          PYTHONIOENCODING: utf-8   # Windows Python defaults to cp1252 -> can't encode emoji
         run: |
           python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json
           ref = json.load(open('.github/d3d11-ci/metal_ref.json'))['shaders']
           rows = [json.loads(l) for l in open('warp_metrics.jsonl') if l.strip()]
-          print("### D3D11/WARP vs Metal coherency\n")
-          print("| shader | WARP sstd | Metal sstd | WARP tMAD | Metal tMAD | regime |")
-          print("|---|---|---|---|---|---|")
+          print("### D3D11/WARP coherency\n")
+          print("Hard gate = non-degeneracy (finite / not-black / structured). "
+                "The temporal column is **advisory**: cross-platform magnitudes differ "
+                "(fp16-RTZ vs fp32) and a per-present reseed cadence isn't fully exercised "
+                "by paused frame-step — a temporal mismatch is a lead to eyeball, not a fail.\n")
+          print("| shader | WARP sstd | Metal sstd | WARP tMAD | Metal tMAD | non-degen | temporal |")
+          print("|---|---|---|---|---|---|---|")
           for r in rows:
               m = ref.get(r['label'], {})
               wt, mt = r['temporal_mad'], m.get('tMAD')
-              flag = "n/a"
-              if r['degenerate']:
-                  flag = "❌ DEGENERATE"
-              elif mt is not None:
-                  # regime check: frozen-vs-active and order-of-magnitude drift
+              hard = "DEGENERATE" if r['degenerate'] else "ok"
+              temporal = "-"
+              if not r['degenerate'] and mt is not None:
                   if (mt < 1e-4 and wt < 5e-4) or (mt >= 1e-4 and 0.2*mt <= wt <= 5*mt):
-                      flag = "✅ match"
+                      temporal = "match"
                   else:
-                      flag = "⚠️ drift"
+                      temporal = "drift?"
               print(f"| {r['label']} | {r['spatial_std']:.4f} | {m.get('sstd','?')} "
-                    f"| {wt:.5f} | {mt if mt is not None else '?'} | {flag} |")
+                    f"| {wt:.5f} | {mt if mt is not None else '?'} | {hard} | {temporal} |")
           PY
 
       - name: Upload mpv logs + captures

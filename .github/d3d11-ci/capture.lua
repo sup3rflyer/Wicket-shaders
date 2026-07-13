@@ -1,8 +1,11 @@
--- Deterministic frame capture for cross-platform coherency checks.
--- Starts paused, warms the chain (so STORAGE/EMA leave cold-start), then
--- steps one source frame per tick and screenshots the PRESENTED window
--- (redraw path — the analog of macOS screencapture; focus-independent, so it
--- works on a headless WARP runner). Env: CAP_FRAMES, CAP_WARM, CAP_DIR.
+-- Deterministic frame capture for cross-platform coherency checks. Starts paused,
+-- warms the chain (so STORAGE/EMA leave cold-start), then steps one source frame
+-- per tick and screenshots the PRESENTED window (redraw path — focus-independent,
+-- so it works on a headless WARP runner). Deterministic / byte-reproducible, which
+-- is why it's preferred over playing-mode timer capture for the SPATIAL metrics.
+-- Caveat: a per-present reseed cadence (e.g. filmgrain-match's TPL jitter) is not
+-- necessarily exercised by paused frame-step, so treat the TEMPORAL metric as
+-- advisory, not a verdict. Env: CAP_FRAMES, CAP_WARM, CAP_DIR.
 local N    = tonumber(os.getenv('CAP_FRAMES') or '24')
 local WARM = tonumber(os.getenv('CAP_WARM')   or '8')
 local DIR  = os.getenv('CAP_DIR') or 'cap'
@@ -26,6 +29,5 @@ local function tick()
 end
 
 mp.register_event('file-loaded', function()
-    -- let the VO create the window / first swapchain frame, then drive
     mp.add_timeout(0.6, function() timer = mp.add_periodic_timer(0.25, tick) end)
 end)

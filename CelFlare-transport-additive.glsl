@@ -1256,6 +1256,7 @@ void hook() {
 #define MC_RES_HI         0.08   // above: clearly new light -> mask opens
 #define SPATIAL_PUMP_ADDITIVE cf_additive_pump
 #define ADDITIVE_OPEN_GUARD  (SPATIAL_PUMP_ADDITIVE * MC_RESIDUAL_GATE * ENABLE_SPATIAL_PUMP)
+#define ADDITIVE_STATE_EPOCH (3 * ADDITIVE_OPEN_GUARD)
 #if cf_additive_pump && !MC_RESIDUAL_GATE
 #error Additive apply requires the hardened motion-residual opener
 #endif
@@ -1273,6 +1274,12 @@ void hook() {
 #define ADD_RATIO_HI             0.55
 #define ADD_PERSIST_BASE         7.0
 #define ADD_PERSIST_ROUTE_MIN    0.50
+#define ADD_MAINT_FULL           8.0
+#define ADD_MAINT_STEP           (1.0 / 48.0)
+#define ADD_MAINT_EXPIRE         (ADD_PERSIST_BASE + 0.5 * ADD_MAINT_STEP)
+#define ADD_MAINT_TRANSPORT_MIN  0.875
+#define ADD_MAINT_ENV_LO         0.02
+#define ADD_MAINT_ENV_HI         0.10
 #define ADD_VFLOW_COST_MAX       0.03
 #define ADD_VFLOW_SAD_CAP        0.10
 #define ADD_VFLOW_BIAS           0.0001
@@ -1625,15 +1632,26 @@ float sample_prev_fast_linear(vec2 warpc) {
                    s_pump_snap_fast_mc[y1 * 16 + x1], fx), fy);
 }
 
-float sample_prev_persist(vec2 warpc) {
+// Split bilinear persistence into three independent quantities:
+//   x = genuine pre-proof credit (mature corners contribute ZERO),
+//   y = mature-corner bilinear support, z = support-weighted mature TTL.
+// Mixing both schemas as one scalar lets a diluted mature token masquerade as
+// 2-6 frames of partial proof in a neighbour. The split preserves the old
+// seven-frame count while still allowing a strongly-supported mature trajectory.
+vec3 sample_prev_persist_split(vec2 warpc) {
     vec2 cc = clamp(warpc, vec2(0.0), vec2(15.0, 8.0));
     int wx0 = int(floor(cc.x)), wy0 = int(floor(cc.y));
     int wx1 = min(wx0 + 1, 15), wy1 = min(wy0 + 1, 8);
     float wfx = cc.x - float(wx0), wfy = cc.y - float(wy0);
-    return mix(mix(s_pump_snap_persist[wy0 * 16 + wx0],
-                   s_pump_snap_persist[wy0 * 16 + wx1], wfx),
-               mix(s_pump_snap_persist[wy1 * 16 + wx0],
-                   s_pump_snap_persist[wy1 * 16 + wx1], wfx), wfy);
+    float v00 = s_pump_snap_persist[wy0 * 16 + wx0];
+    float v10 = s_pump_snap_persist[wy0 * 16 + wx1];
+    float v01 = s_pump_snap_persist[wy1 * 16 + wx0];
+    float v11 = s_pump_snap_persist[wy1 * 16 + wx1];
+    vec3 p00 = (v00 > ADD_PERSIST_BASE) ? vec3(0.0, 1.0, v00) : vec3(v00, 0.0, 0.0);
+    vec3 p10 = (v10 > ADD_PERSIST_BASE) ? vec3(0.0, 1.0, v10) : vec3(v10, 0.0, 0.0);
+    vec3 p01 = (v01 > ADD_PERSIST_BASE) ? vec3(0.0, 1.0, v01) : vec3(v01, 0.0, 0.0);
+    vec3 p11 = (v11 > ADD_PERSIST_BASE) ? vec3(0.0, 1.0, v11) : vec3(v11, 0.0, 0.0);
+    return mix(mix(p00, p10, wfx), mix(p01, p11, wfx), wfy);
 }
 #endif
 #endif
@@ -2193,11 +2211,11 @@ void hook() {
         #else
         bool motion_match_reset = false;
         #endif
-        bool additive_mode_reset = additive_mode_magic != float(ADDITIVE_OPEN_GUARD);
+        bool additive_mode_reset = additive_mode_magic != float(ADDITIVE_STATE_EPOCH);
         bool transient_reset = (frame == 0) || (scene_cut_lockout > 0.0)
                             || motion_uninit || motion_match_reset || additive_mode_reset;
         motion_state_magic = MOTION_STATE_EPOCH;
-        additive_mode_magic = float(ADDITIVE_OPEN_GUARD);
+        additive_mode_magic = float(ADDITIVE_STATE_EPOCH);
         smoothed_growth_mode = transient_reset
             ? 0.0
             : mix(smoothed_growth_mode, growth_mode_instant, alpha);
@@ -2739,19 +2757,63 @@ void hook() {
                         // current + raw primary. The pump-domain route is an
                         // opening veto, never a persistence donor; lending its
                         // state could bypass the seven-frame proof beside an
-                        // unrelated established event. A transported lamp has
-                        // routed_open=0 and resets both sources.
+                        // unrelated established event. An unproved transported
+                        // lamp has routed_open=0 and loses pre-mature credit;
+                        // only a previously-proved source may spend maintenance.
                         float prior_credit = s_pump_snap_persist[i];
-                        if (inb)
-                            prior_credit = max(prior_credit,
-                                sample_prev_persist(warpc));
-                        float persist = (routed_open >= ADD_PERSIST_ROUTE_MIN)
-                            ? min(prior_credit + 1.0,
-                                  ADD_PERSIST_BASE + 1.0) : 0.0;
+                        // Once a cell has completed the seven-frame routed
+                        // proof, that SAME cell/trajectory may maintain its
+                        // opening authority through a short source flicker.
+                        // Before maturity, one failed route still resets the
+                        // count to zero. Maturity is encoded fractionally in
+                        // (7,8]: failed frames spend exactly 1/48, and a valid
+                        // route refreshes 8. Keeping the original 0..8 range is
+                        // load-bearing: bilinear trajectory transport still
+                        // needs >7/8 donor support instead of growing a skirt.
+                        // This fixes the "opened, flickered, never restored"
+                        // failure without granting a scene-global statistic or
+                        // an unproven cell any opening authority. The credit is
+                        // carried only by the already-selected raw trajectory.
+                        float maintenance_env = smoothstep(ADD_MAINT_ENV_LO,
+                                                           ADD_MAINT_ENV_HI,
+                                                           pump_env_cell[i]);
+                        if (inb) {
+                            vec3 carried = sample_prev_persist_split(warpc);
+                            prior_credit = max(prior_credit, carried.x);
+                            if (carried.y > ADD_MAINT_TRANSPORT_MIN
+                                    && maintenance_env > 0.0) {
+                                float carried_ttl = carried.z / carried.y;
+                                prior_credit = max(prior_credit, carried_ttl);
+                            }
+                        }
+                        // A mature token with no surviving local amplitude is
+                        // stale, including one bilinearly arriving at an empty
+                        // neighbour. It must start proof from zero, not refresh.
+                        if (prior_credit > ADD_PERSIST_BASE && maintenance_env <= 0.0)
+                            prior_credit = 0.0;
+                        bool prior_authorized = prior_credit > ADD_PERSIST_BASE;
+                        float persist = 0.0;
+                        if (routed_open >= ADD_PERSIST_ROUTE_MIN) {
+                            persist = prior_authorized
+                                ? ADD_MAINT_FULL
+                                : min(prior_credit + 1.0, ADD_PERSIST_BASE);
+                            if (persist >= ADD_PERSIST_BASE)
+                                persist = ADD_MAINT_FULL;
+                        } else if (prior_authorized) {
+                            float spent = prior_credit - ADD_MAINT_STEP;
+                            persist = (spent > ADD_MAINT_EXPIRE) ? spent : 0.0;
+                        }
                         pump_open_persist_cell[i] = persist;
                         float persist_gate = smoothstep(ADD_PERSIST_BASE - 1.0,
                                                         ADD_PERSIST_BASE, persist);
-                        fresh_ease = routed_open * persist_gate;
+                        float proved_open = routed_open * persist_gate;
+                        // Maintenance preserves a still-live established mask;
+                        // spent credit cannot resurrect a cell whose amplitude
+                        // already released to zero, even if another object rises
+                        // through the same grid position within the hold window.
+                        float maintained_open = prior_authorized
+                            ? maintenance_env : 0.0;
+                        fresh_ease = max(proved_open, maintained_open);
                         #if cf_debug == 12
                         motion_trust_cell[i] = add_established;
                         motion_mc_local_cell[i] = effective_ratio_route;
@@ -2805,9 +2867,24 @@ void hook() {
                     }
                     #if ADDITIVE_OPEN_GUARD
                     else {
-                        // Persistence proves consecutive complete openings. An
-                        // idle/closed cell cannot retain partial credit.
-                        pump_open_persist_cell[i] = 0.0;
+                        // A zero-opening frame used to erase even mature credit,
+                        // reproducing the reported flicker dropout before the
+                        // next rebound could use it. Pre-mature partial proof
+                        // still resets immediately. A mature, still-live env
+                        // spends the same bounded fractional credit while idle;
+                        // once the local amplitude is gone, stale authority is
+                        // discarded rather than lent to a later object.
+                        float idle_credit = s_pump_snap_persist[i];
+                        float idle_live = smoothstep(ADD_MAINT_ENV_LO,
+                                                     ADD_MAINT_ENV_HI,
+                                                     pump_env_cell[i]);
+                        if (idle_credit > ADD_PERSIST_BASE && idle_live > 0.0) {
+                            float spent = idle_credit - ADD_MAINT_STEP;
+                            pump_open_persist_cell[i] =
+                                (spent > ADD_MAINT_EXPIRE) ? spent : 0.0;
+                        } else {
+                            pump_open_persist_cell[i] = 0.0;
+                        }
                     }
                     #endif
                 }
@@ -3246,7 +3323,6 @@ void hook() {
 // additive after synthetic and paired design/compute review; 0 remains the
 // verified subtractive fallback.
 #define SPATIAL_PUMP_ADDITIVE cf_additive_pump
-
 // =============================================
 //  SPECULAR BONUS — scene-detected, per-pixel bloom
 // =============================================
@@ -4216,12 +4292,9 @@ vec4 hook() {
         // max(held·rel·floor, gate)·cover, where the held term is a prior
         // pump_env ≤ prior cover ≤ 1 and gate ≤ 1 — note the proof leans on
         // cover_gate ∈ [0,1]; a future >1 boost term there would silently
-        // break it), so mask × cover ≥ pump_env × mask pointwise — additive
-        // never pumps less than subtractive. The APPLIED amplitude is mask ×
-        // cover: the per-cell env holds/releases on the velocity ratio + adapt
-        // floor (held light holds — eye adaptation, not a dim); cover mutes a
-        // fade-to-white over ~12 frames worst case, usually slower because
-        // contrast_v itself collapses gradually during a fade.
+        // break it). The guarded local amplitude is mask × cover. A cell's
+        // bounded post-proof maintenance credit is already folded into mask;
+        // no scene-global signal can bypass local opening authority here.
         float pump_local = pump_mask * pump_cover_gate;
         #else
         // SUBTRACTIVE: the mask (per-cell "is this region brightening" ∈[0,1]) only

@@ -1139,16 +1139,18 @@ void hook() {
 #define MC_RESIDUAL_GATE  1
 #define MC_RES_LO         0.02   // motion-compensated residual (new light) below this: transport -> mask shut
 #define MC_RES_HI         0.08   // above: clearly new light -> mask opens
-// Motion observability / reset candidates. The cost and texture thresholds are
-// deliberately diagnostic-first: cf_debug=10/11 expose their result before the
-// bad-match reset is allowed to change output. MOTION_COST_RESET stays 0 until
-// the real-content cost histograms and D3D11 pass support a threshold tune.
+// Motion observability / history guards. The cost and texture thresholds let
+// evidence-bearing tiles vote a discontinuity without flat tiles declaring a
+// false zero-flow match. cf_debug=10/11 expose the underlying evidence/trust.
+// The reset is deliberately frame-global and conservative: a broad bad match
+// re-pins all pump lanes rather than letting stale motion history manufacture a
+// transient. Real pan/reveal/fireball checks leave it shut; hard cuts open it.
 // MOTION_STATE_EPOCH is an exactly-representable schema token, not a reload or
 // seek detector. Bump it whenever MOTION_FLOW format/resolution/sign semantics
-// change. Same-schema reload/seek continuity is not guaranteed; cost reset is
-// still disabled and neither cost nor the existing cut detector is universal.
+// change. Same-schema reload/seek continuity is still not guaranteed: the cost
+// reset catches broad textured discontinuities, but no cut detector is universal.
 #define MOTION_STATE_EPOCH       51701.0
-#define MOTION_COST_RESET        0
+#define MOTION_COST_RESET        1
 #define MOTION_COST_GOOD         0.025   // mean winning SAD: confidently matched below
 #define MOTION_COST_BAD          0.075   // mean winning SAD: suspect above
 #define MOTION_TEXTURE_LO        0.004   // tile RMS contrast: flat below

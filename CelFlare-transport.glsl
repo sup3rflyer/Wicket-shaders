@@ -599,26 +599,42 @@ vec4 hook() {
 //!HEIGHT 9
 //!COMPUTE 16 9
 //!DESC CelFlare: Motion block-match
-// One thread per 16x9 pump cell: search its 8x8 MOTION_CUR tile for the best
-// truncated-SAD shift in MOTION_PREV over +-MOT_R px. Output rg = best (dx,dy)
-// px (the PREV offset - where the content came from), b = winning photometric
-// SAD / 16 (MOT_BIAS excluded), a = RMS contrast of the current 4x4 subsample.
+// One thread per 16x9 pump cell: select a truncated-SAD shift for its 8x8
+// MOTION_CUR tile from MOTION_PREV over +-MOT_R px. Default is approximate
+// coarse-to-fine; the fallback is exhaustive. Output rg = selected (dx,dy) px
+// (the PREV offset - where the content came from), b = its photometric SAD / 16
+// (MOT_BIAS excluded), a = RMS contrast of the current 4x4 subsample.
 // The old adjacent second-best was not valid uniqueness: adjacent candidates
 // belong to the same SAD basin, and the final best can move after second is
 // recorded. Tile subsampled 2x for cost. MOTION_PREV is a STORAGE image
 // (imageLoad, integer coords); MOTION_CUR is a normal texture.
-#define MOT_R       5      // search radius px (@128x72 ~ +-42 px/frame at 1080p)
+#define MOT_R       5      // search radius px (@128x72 ~ +-42 px/frame at 1080p); keep the hard-coded coarse lattice below in sync
 #define MOT_TILE    8
 #define MOT_SADCAP  0.10   // per-sample truncated SAD (robust to a lone outlier texel)
 #define MOT_BIAS    0.0005 // zero-motion prior: tiny per-shift penalty so a FLAT tile (all shifts equal cost) resolves to (0,0), not the search's first corner (paired audit) — far below any real match difference, so genuine motion is unaffected
 #define MOT_TAPS    16
 #define MOT_CELLS   144
+#define MOT_COARSE_SEARCH 1 // 1 = 5x5 even-offset search + 3x3 refine (<=33 candidates); 0 = exhaustive 11x11 A/B
 // One workgroup covers the complete 16x9 flow output. Each lane owns one cell
-// and publishes its 16 current-frame taps once; all 121 candidates reuse them.
-// Sample-major layout keeps adjacent lanes contiguous for every tap
+// and publishes its 16 current-frame taps once; every candidate reuses them.
+// Sample-major layout keeps adjacent lanes contiguous for each tap
 // (tap*MOT_CELLS + lane), avoiding the strided access of lane-major
 // [lane][tap]. Footprint = 2304 floats = 9 KiB.
 shared float s_motion_cur[MOT_TAPS * MOT_CELLS];
+
+float motion_sad(ivec2 org, ivec2 d, int lane) {
+    const ivec2 dims = ivec2(128, 72);
+    float sad = 0.0;
+    for (int t = 0; t < MOT_TAPS; t++) {
+        ivec2 o = ivec2((t & 3) << 1, (t >> 2) << 1);
+        ivec2 p = org + o + d;
+        float cv = s_motion_cur[t * MOT_CELLS + lane];
+        float pv = (p.x >= 0 && p.y >= 0 && p.x < dims.x && p.y < dims.y)
+                 ? imageLoad(MOTION_PREV, p).r : (cv + MOT_SADCAP);
+        sad += min(abs(cv - pv), MOT_SADCAP);
+    }
+    return sad;
+}
 
 void hook() {
     // WIDTH/HEIGHT exactly match COMPUTE, so the dispatch is one 16x9 group and
@@ -626,13 +642,11 @@ void hook() {
     ivec2 cell = ivec2(gl_LocalInvocationID.xy);
     int lane = int(gl_LocalInvocationIndex);
     ivec2 org = cell * ivec2(MOT_TILE, MOT_TILE);
-    const ivec2 dims = ivec2(128, 72);
 
-    // Explicit MOTION_CUR texture fetches fall from 121*16 + 16 metadata fetches
-    // per cell to 16 total. Hardware texture caching means this count is not a
-    // direct DRAM-bandwidth estimate. The search still performs the same
-    // previous-frame imageLoads and arithmetic in the same order; only
-    // current-tile reuse moves to workgroup memory.
+    // MOTION_CUR stays at 16 explicit fetches per cell. The coarse search cuts
+    // previous-frame imageLoads from 121*16 = 1936 to at most 33*16 = 528;
+    // hardware texture caching means neither count is a direct DRAM estimate.
+    // The exhaustive fallback retains the original 121-candidate search.
     for (int t = 0; t < MOT_TAPS; t++) {
         ivec2 o = ivec2((t & 3) << 1, (t >> 2) << 1);
         ivec2 c = org + o;
@@ -643,17 +657,43 @@ void hook() {
 
     float best_rank = 1e9, best_sad = 1e9;
     ivec2 bestd = ivec2(0);
+#if MOT_COARSE_SEARCH
+    // Span -4..4 with a 5x5 even-offset search, then refine the winning basin
+    // by one pixel. The refine can reach +-5 when an edge basin wins. Periodic
+    // or repeated texture can select the wrong coarse basin; the exhaustive
+    // A/B fallback remains the reference. 25 + at most 8 candidates replaces
+    // 121 while preserving integer-pixel output.
+    for (int cy = -2; cy <= 2; cy++) {
+        for (int cx = -2; cx <= 2; cx++) {
+            ivec2 d = ivec2(cx, cy) * 2;
+            float sad = motion_sad(org, d, lane);
+            float rank_cost = sad + MOT_BIAS * float(abs(d.x) + abs(d.y));
+            if (rank_cost < best_rank) {
+                best_rank = rank_cost;
+                best_sad = sad;
+                bestd = d;
+            }
+        }
+    }
+    ivec2 coarse_best = bestd;
+    for (int ry = -1; ry <= 1; ry++) {
+        for (int rx = -1; rx <= 1; rx++) {
+            if (rx == 0 && ry == 0) continue;
+            ivec2 d = coarse_best + ivec2(rx, ry);
+            if (abs(d.x) > MOT_R || abs(d.y) > MOT_R) continue;
+            float sad = motion_sad(org, d, lane);
+            float rank_cost = sad + MOT_BIAS * float(abs(d.x) + abs(d.y));
+            if (rank_cost < best_rank) {
+                best_rank = rank_cost;
+                best_sad = sad;
+                bestd = d;
+            }
+        }
+    }
+#else
     for (int dy = -MOT_R; dy <= MOT_R; dy++) {
         for (int dx = -MOT_R; dx <= MOT_R; dx++) {
-            float sad = 0.0;
-            for (int t = 0; t < MOT_TAPS; t++) {
-                ivec2 o = ivec2((t & 3) << 1, (t >> 2) << 1);
-                ivec2 p = org + o + ivec2(dx, dy);
-                float cv = s_motion_cur[t * MOT_CELLS + lane];
-                float pv = (p.x >= 0 && p.y >= 0 && p.x < dims.x && p.y < dims.y)
-                         ? imageLoad(MOTION_PREV, p).r : (cv + MOT_SADCAP);
-                sad += min(abs(cv - pv), MOT_SADCAP);
-            }
+            float sad = motion_sad(org, ivec2(dx, dy), lane);
             float rank_cost = sad + MOT_BIAS * float(abs(dx) + abs(dy));
             if (rank_cost < best_rank) {
                 best_rank = rank_cost;
@@ -662,9 +702,10 @@ void hook() {
             }
         }
     }
+#endif
     // Keep these metadata accumulators OUT of the large unrolled search's live
-    // range. That matters on FXC, where carrying them across 1936 iterations can
-    // create register pressure even though the work itself is only 16 samples.
+    // range. That matters on FXC, especially under the 1936-sample exhaustive
+    // fallback; the coarse path evaluates at most 528 samples.
     float tsum = 0.0, tsum2 = 0.0;
     for (int t = 0; t < MOT_TAPS; t++) {
         float cv = s_motion_cur[t * MOT_CELLS + lane];

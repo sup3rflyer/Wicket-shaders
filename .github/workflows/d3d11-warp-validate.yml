@@ -20,6 +20,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # full history so the changed-shader diff against the push base resolves
 
       - name: Fetch pinned mpv (gpu-next + d3d11 build)
         shell: bash
@@ -56,14 +58,42 @@ jobs:
             exit 1
           fi
 
-      - name: Compile-validate every tracked shader on D3D11/WARP
-        if: steps.probe.outcome == 'success'
+      # Only revalidate what changed in this push. Fall back to the full set when
+      # the base is unknown (new branch / manual dispatch) or the CI infra itself
+      # changed (its behaviour affects every shader's result).
+      - name: Determine changed shaders
+        id: changed
         shell: bash
         run: |
           set -uo pipefail
+          BASE="${{ github.event.before }}"
+          all=0
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            all=1
+          elif [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            all=1
+          elif git diff --name-only "$BASE" "$GITHUB_SHA" | grep -qE '^\.github/'; then
+            all=1
+          fi
+          if [ "$all" = "1" ]; then
+            list="$(git ls-files '*.glsl' | tr '\n' ' ')"
+          else
+            list="$(git diff --name-only "$BASE" "$GITHUB_SHA" -- '*.glsl' | tr '\n' ' ')"
+          fi
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          echo "Shader set to validate (all=$all): ${list:-<none>}"
+
+      - name: Compile-validate changed shaders on D3D11/WARP
+        if: steps.probe.outcome == 'success'
+        shell: bash
+        env:
+          CHANGED: ${{ steps.changed.outputs.list }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CHANGED// }" ]; then echo "No shader changes in this push — skipping compile."; exit 0; fi
           mkdir -p logs
           fail=0
-          for f in $(git ls-files '*.glsl'); do
+          for f in $CHANGED; do
             base="$(basename "$f" .glsl)"
             log="logs/${base}.log"
             # 20 frames so cross-frame STORAGE/SSBO state iterates (surfaces runtime
@@ -97,13 +127,21 @@ jobs:
       - name: Capture + coherency-check on WARP
         if: steps.probe.outcome == 'success'
         shell: bash
+        env:
+          CHANGED: ${{ steps.changed.outputs.list }}
         run: |
           set -uo pipefail
+          : > warp_metrics.jsonl
+          # intersect the changed set with the STORAGE/SSBO shaders that carry per-frame state
+          run=""
+          for s in filmgrain-match filmgrain-smooth CelFlare-transport CelFlare Debandit; do
+            case " $CHANGED " in *" $s.glsl "*) run="$run $s";; esac
+          done
+          if [ -z "${run// }" ]; then echo "No coherency-relevant shader changed — skipping capture."; exit 0; fi
           SRC="av://lavfi:smptehdbars=rate=24:duration=6:size=1280x720"
           export CAP_FRAMES=24 CAP_WARM=8
-          : > warp_metrics.jsonl
           fail=0
-          for s in filmgrain-match filmgrain-smooth CelFlare-transport CelFlare Debandit; do
+          for s in $run; do
             dir="cap/$s"; mkdir -p "$dir"
             CAP_DIR="$dir" "$MPV" --no-config --vo=gpu-next --gpu-context=d3d11 --d3d11-warp=yes \
               --pause=yes --force-window=immediate \
@@ -128,6 +166,9 @@ jobs:
           ref = json.load(open('.github/d3d11-ci/metal_ref.json'))['shaders']
           rows = [json.loads(l) for l in open('warp_metrics.jsonl') if l.strip()]
           print("### D3D11/WARP coherency\n")
+          if not rows:
+              print("_No coherency-relevant (STORAGE/SSBO) shader changed in this push._")
+              raise SystemExit(0)
           print("Hard gate = non-degeneracy (finite / not-black / structured). "
                 "The temporal column is **advisory**: cross-platform magnitudes differ "
                 "(fp16-RTZ vs fp32) and a per-present reseed cadence isn't fully exercised "

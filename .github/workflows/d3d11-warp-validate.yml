@@ -1,0 +1,95 @@
+# Validate the shaders on the real runtime target's shader path — Direct3D 11 —
+# without needing physical Windows hardware. libplacebo's D3D11 backend (SPIRV-Cross
+# -> HLSL -> FXC/DXBC) runs on WARP, Microsoft's fully-conformant FL11_1 software
+# rasterizer (compute shaders + UAVs + structured buffers), so a GPU-less GitHub
+# runner exercises both the D3D11 compile path AND the UAV/SSBO coherency semantics.
+# mpv drives the whole libplacebo chain onto WARP via documented options:
+#   --vo=gpu-next --gpu-context=d3d11 --d3d11-warp=yes
+# (mpv creates the WARP device; gpu-next hands it to pl_d3d11_create).
+name: d3d11-warp-validate
+
+on:
+  push:
+    paths:
+      - '**.glsl'
+      - '.github/workflows/d3d11-warp-validate.yml'
+  workflow_dispatch:
+
+jobs:
+  d3d11-warp:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned mpv (gpu-next + d3d11 build)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Pinned zhongfly/mpv-winbuild release (community de-facto Windows mpv build,
+          # bundles libplacebo + d3d11 + shaderc + spirv-cross). Bump deliberately.
+          URL="https://github.com/zhongfly/mpv-winbuild/releases/download/2026-07-12-e5486b96d7/mpv-x86_64-20260712-git-e5486b96d7.7z"
+          curl -fL --retry 3 -o mpv.7z "$URL"
+          7z x mpv.7z -ompv >/dev/null
+          MPV="$(find mpv -iname 'mpv.com' | head -1)"
+          test -n "$MPV"
+          echo "MPV=$MPV" >> "$GITHUB_ENV"
+          "$MPV" --version | head -5
+
+      # Isolates the sole remaining unknown: does a D3D11 device + swapchain come up
+      # inside the GPU-less runner session at all? No user shader here — pure init.
+      - name: Probe — D3D11 + WARP device/swapchain init
+        id: probe
+        shell: bash
+        run: |
+          set -uxo pipefail
+          "$MPV" --no-config --msg-level=all=v --log-file=probe.log \
+            --vo=gpu-next --gpu-context=d3d11 --d3d11-warp=yes \
+            --force-window=immediate --frames=2 --ao=null \
+            --no-input-default-bindings --input-vo-keyboard=no \
+            av://lavfi:testsrc2=duration=1:size=1280x720 || true
+          echo "===== probe.log (tail) ====="; tail -40 probe.log || true
+          if grep -qiE 'VO: \[gpu-next\]|d3d11.*(device|feature level)' probe.log; then
+            echo "D3D11/WARP init: OK"
+          else
+            echo "::error::D3D11/WARP device/swapchain did NOT initialize in the runner session."
+            echo "environmental-fail=1" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Compile-validate every tracked shader on D3D11/WARP
+        if: steps.probe.outcome == 'success'
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p logs
+          fail=0
+          for f in $(git ls-files '*.glsl'); do
+            base="$(basename "$f" .glsl)"
+            log="logs/${base}.log"
+            # 20 frames so cross-frame STORAGE/SSBO state iterates (surfaces runtime
+            # coherency crashes/errors, not just first-frame compile).
+            "$MPV" --no-config --msg-level=all=v --log-file="$log" \
+              --vo=gpu-next --gpu-context=d3d11 --d3d11-warp=yes \
+              --force-window=immediate --frames=20 --ao=null \
+              --no-input-default-bindings --input-vo-keyboard=no \
+              --glsl-shaders="$f" \
+              av://lavfi:testsrc2=duration=1:size=1280x720 >/dev/null 2>&1 || true
+            if grep -qiE 'Missing variable type|Failed parsing|must be a valid hex|error:|failed to (compile|create|link)|libplacebo:.*(fatal|err)' "$log"; then
+              echo "FAIL  $f"
+              grep -iE 'Missing variable type|Failed parsing|must be a valid hex|error:|failed to (compile|create|link)|libplacebo:.*(fatal|err)' "$log" | head -5 | sed 's/^/        /'
+              fail=1
+            else
+              echo "ok    $f"
+            fi
+          done
+          exit $fail
+
+      - name: Upload mpv logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3d11-warp-logs
+          path: |
+            probe.log
+            logs/
+          if-no-files-found: warn

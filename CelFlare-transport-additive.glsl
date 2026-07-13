@@ -1,14 +1,14 @@
-// CelFlare Transport Additive A1 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare Transport Additive A2 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // ADDITIVE DEVELOPMENT TRACK, forked from the verified subtractive checkpoint
 // 412f1b8. This file owns separate persistent state; never load it alongside
 // CelFlare.glsl or CelFlare-transport.glsl (that double-processes the image and
 // collides with the shared transient intermediate namespaces).
-// A1 carries the additive-safe opening prototype behind cf_additive_pump. The
-// default remains the verified subtractive apply while its local flow refinement,
-// reveal memory, pump-domain motion veto and persistence contract are validated
-// on real sources.
+// A2 ships the additive-safe opening contract behind cf_additive_pump. Local
+// flow refinement, reveal memory, a pump-domain motion veto and persisted proof
+// harden every mask opening; cf_additive_pump=0 remains the verified subtractive
+// fallback for field comparison.
 //
 // Design goal: emulate a professional HDR grade of the source — midtones hold
 // the SDR grade, highlights expand with natural gradation, speculars get
@@ -128,11 +128,11 @@
 1
 
 //!PARAM cf_additive_pump
-//!DESC Additive pump development mode. 1 = independent per-region pump amplitude with hardened opening proof · 0 = verified subtractive reference.
+//!DESC Additive regional pump. 1 = independent per-region amplitude with hardened opening proof · 0 = verified subtractive reference.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1
-0
+1
 
 //!PARAM cf_warm_shift
 //!DESC Warm-hue correction (toggle). 1 = stop fire, sunsets and skin drifting green as they brighten · 0 = off.
@@ -580,7 +580,7 @@ vec4 hook() {
 // level + dipole + LK) with ONE test - small residual = transport (suppress),
 // large = emission (pump). SCOPE (paired audit): this governs the mask only; the
 // SCALAR onset (loc_on_sum) still uses the legacy established gate. The A0
-// subtractive apply uses this as a permissive suppressor. A1 additive adds a
+// subtractive apply uses this as a permissive suppressor. A2 additive adds a
 // seven-frame local opening proof, transported persistence, and a second local
 // flow route in the pump's own illumination field before the mask may create
 // amplitude.
@@ -589,7 +589,7 @@ vec4 hook() {
 // state - do NOT move the MC block or loop 2 out of that guard.
 // Offline 16x9 cell-replica: pan mask-debit 0.87 (vs the affine gate's 0.50),
 // growth 0.09 (event pumps). That single-flow result is only the A0 baseline;
-// A1's pump-domain route and persistence contract own reveal safety.
+// A2's pump-domain route and persistence contract own reveal safety.
 
 //!HOOK MAIN
 //!BIND HOOKED
@@ -757,7 +757,7 @@ void hook() {
 #endif
     vec2 best_flow = vec2(bestd);
 #if cf_additive_pump && cf_spatial_pump
-    // Additive A1 needs subpixel flow because the 16x9 V history is sensitive
+    // Additive A2 needs subpixel flow because the 16x9 V history is sensitive
     // to integer-vector quantization at slow pans. Four cardinal SAD probes fit
     // a bounded quadratic inside the winning basin. This adds 64 previous-frame
     // reads per cell only in additive mode (<=592 vs <=528 on the A0 path).
@@ -1161,8 +1161,8 @@ void hook() {
 // artifact machine. Keep it 1 while the additive experiment is on.
 #define PUMP_MASK_ESTABLISH 1
 // TRANSLATION SUPPRESSOR (2026-07-12) — ADDITIVE-MODE motion guard (active when
-// SPATIAL_PUMP_ADDITIVE 1; near-inert under the subtractive default, where the
-// scalar already denies motion pump). The MOTION reveal-safety the
+// SPATIAL_PUMP_ADDITIVE 1; near-inert when the subtractive fallback is selected,
+// where the scalar already denies motion pump). The MOTION reveal-safety the
 // established-level gate lacks. A bright feature TRANSLATING across the grid
 // under a camera pan/tilt (a facial specular, a lamp) reads FRESH in each new
 // cell (out-brightens its stale-established neighbours), so the additive mask
@@ -1259,7 +1259,7 @@ void hook() {
 #if cf_additive_pump && !MC_RESIDUAL_GATE
 #error Additive apply requires the hardened motion-residual opener
 #endif
-// Additive A1 opening proof. Established fast-vs-neighbour memory still owns
+// Additive A2 opening proof. Established fast-vs-neighbour memory still owns
 // WHERE an opening may happen. Motion then asks what fraction of the same-cell
 // rise survives a cubic sample at the refined previous offset: transport loses
 // most of its fast-lane rise; emission retains it. Using the pump's fast lane
@@ -2685,7 +2685,7 @@ void hook() {
                         bool inb = warpc.x > -0.5 && warpc.x < 15.5
                                 && warpc.y > -0.5 && warpc.y < 8.5;
                         #if ADDITIVE_OPEN_GUARD
-                        // Additive A1: opening authority stays local. Compare the
+                        // Additive A2: opening authority stays local. Compare the
                         // motion-compensated fast-lane rise with its same-cell
                         // rise so the decision is about EXPLAINED FRACTION, not
                         // an absolute one-frame delta: a slow grow keeps ratio~1,
@@ -3005,7 +3005,7 @@ void hook() {
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
 //!BIND MOTION_FLOW
-//!DESC CelFlare Additive A1 (guarded prototype; subtractive default)
+//!DESC CelFlare Additive A2 (guarded additive default)
 
 // =============================================
 //  MAIN TUNING — deep anchors. The supported user surface is the cf_* block
@@ -3217,7 +3217,7 @@ void hook() {
 // pump_cover_gate — the bilinear per-cell env IS the local pump amplitude, so
 // each region pumps at its own strength and rhythm and a localized event no
 // longer needs the frame statistics to fire (small-event amplitude back).
-// In this A1 track PASS 5 additionally requires a seven-frame local emission
+// In this A2 track PASS 5 additionally requires a seven-frame local emission
 // proof across both the raw-source and pump-domain motion routes. The
 // established-level and frame-edge rules remain the first opening authority.
 // 0 = SUBTRACTIVE (v5.2–v5.4 shipping behavior): pump_local = pump_env × mask
@@ -3241,9 +3241,10 @@ void hook() {
 // (pump_env≈0 → no pump), and the revealed-lamp pump is temporally smoothed
 // (measured: p999 peak +145→+45 nits over base, frame-to-frame flicker ~halved).
 // The cost was the per-cell additive amplitude on genuine localized dark-scene
-// events (multi-fire). A1 is the separate response: pump-domain motion veto,
-// longer-baseline establishment, and persisted multi-frame proof. Default stays 0
-// until those additions pass synthetic, D3D11, performance, and source checks.
+// events (multi-fire). A2 is the separate response: pump-domain motion veto,
+// longer-baseline establishment, and persisted multi-frame proof. It defaults to
+// additive after synthetic and paired design/compute review; 0 remains the
+// verified subtractive fallback.
 #define SPATIAL_PUMP_ADDITIVE cf_additive_pump
 
 // =============================================

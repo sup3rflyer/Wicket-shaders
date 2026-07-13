@@ -84,7 +84,67 @@ jobs:
           done
           exit $fail
 
-      - name: Upload mpv logs
+      # ---- Stage 2: pixel-coherency of STORAGE/SSBO state on WARP ----------------
+      # Compile-clean proves the shaders don't error; this proves their persistent
+      # per-frame state (grain field, pump SSBO) produces sane cross-frame output on
+      # the real D3D11 redraw path. Metric is structural (non-degeneracy hard gate +
+      # temporal signature vs a Metal reference), NOT bit-exact — see metal_ref.json.
+      - name: Setup Python imaging
+        if: steps.probe.outcome == 'success'
+        shell: bash
+        run: python -m pip install --quiet --disable-pip-version-check pillow numpy
+
+      - name: Capture + coherency-check on WARP
+        if: steps.probe.outcome == 'success'
+        shell: bash
+        run: |
+          set -uo pipefail
+          SRC="av://lavfi:smptehdbars=rate=24:duration=6:size=1280x720"
+          export CAP_FRAMES=24 CAP_WARM=8
+          : > warp_metrics.jsonl
+          fail=0
+          for s in filmgrain-match filmgrain-smooth CelFlare-transport CelFlare Debandit; do
+            dir="cap/$s"; mkdir -p "$dir"
+            CAP_DIR="$dir" "$MPV" --no-config --vo=gpu-next --gpu-context=d3d11 --d3d11-warp=yes \
+              --pause=yes --force-window=immediate \
+              --script=.github/d3d11-ci/capture.lua --screenshot-format=png \
+              --no-input-default-bindings --input-vo-keyboard=no \
+              --glsl-shaders="$s.glsl" "$SRC" >/dev/null 2>&1 || true
+            out="$(python .github/d3d11-ci/frame_metrics.py "$dir" "$s")"; rc=$?
+            echo "$out" | grep -v '^JSON ' || true
+            echo "$out" | grep '^JSON ' | sed 's/^JSON //' >> warp_metrics.jsonl
+            [ $rc -ne 0 ] && fail=1
+          done
+          exit $fail
+
+      - name: WARP vs Metal regime comparison
+        if: always() && steps.probe.outcome == 'success'
+        shell: bash
+        run: |
+          python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          ref = json.load(open('.github/d3d11-ci/metal_ref.json'))['shaders']
+          rows = [json.loads(l) for l in open('warp_metrics.jsonl') if l.strip()]
+          print("### D3D11/WARP vs Metal coherency\n")
+          print("| shader | WARP sstd | Metal sstd | WARP tMAD | Metal tMAD | regime |")
+          print("|---|---|---|---|---|---|")
+          for r in rows:
+              m = ref.get(r['label'], {})
+              wt, mt = r['temporal_mad'], m.get('tMAD')
+              flag = "n/a"
+              if r['degenerate']:
+                  flag = "❌ DEGENERATE"
+              elif mt is not None:
+                  # regime check: frozen-vs-active and order-of-magnitude drift
+                  if (mt < 1e-4 and wt < 5e-4) or (mt >= 1e-4 and 0.2*mt <= wt <= 5*mt):
+                      flag = "✅ match"
+                  else:
+                      flag = "⚠️ drift"
+              print(f"| {r['label']} | {r['spatial_std']:.4f} | {m.get('sstd','?')} "
+                    f"| {wt:.5f} | {mt if mt is not None else '?'} | {flag} |")
+          PY
+
+      - name: Upload mpv logs + captures
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -92,4 +152,6 @@ jobs:
           path: |
             probe.log
             logs/
+            cap/
+            warp_metrics.jsonl
           if-no-files-found: warn

@@ -1,0 +1,11 @@
+{
+  "_note": "Metal (MoltenVK) gpu-next reference signatures, captured via metal_ref.sh on a static smptehdbars 1280x720 source with the same capture.lua + frame_metrics.py that CI runs on WARP. Compare REGIME, not exact magnitude: fp16-RTZ vs fp32 and per-tick grain RNG make absolute values differ across platforms. A STORAGE/SSBO break shows as WARP leaving the regime (a grain shader going frozen tMAD~0 or exploding; CelFlare failing to converge).",
+  "src": "av://lavfi:smptehdbars=rate=24:duration=6:size=1280x720",
+  "shaders": {
+    "filmgrain-match":    {"sstd": 0.2981, "tMAD": 0.00287},
+    "filmgrain-smooth":   {"sstd": 0.2981, "tMAD": 0.00163},
+    "CelFlare-transport": {"sstd": 0.1786, "tMAD": 0.00030},
+    "CelFlare":           {"sstd": 0.1786, "tMAD": 0.00030},
+    "Debandit":           {"sstd": 0.2980, "tMAD": 0.00000}
+  }
+}

@@ -272,6 +272,8 @@ Mode 4 replaces that panel with a color-only scope:
 
 The two gamut percentages are exclusive and include letterbox bars. A 0.01-nit + 0.25% boundary guard suppresses the nearest numerical/quantization fuzz while retaining subtle native-HDR excursions; larger encoded excursions are reported as present in the signal. Mode 4 has no luminance rows, histogram, ceiling indicator, or time graph.
 
+Mode 4 can also warn when the signal exceeds a particular display gamut. Enable `nitmeter_display_clip` and enter the display's six CIE 1931 chromaticity values: `Rx`, `Ry`, `Gx`, `Gy`, `Bx`, and `By`. The white point is fixed at D65. Pixels outside that primary triangle receive bright near-neutral diagonal zebra alternating with the existing mode-4 view. The defaults describe P3-D65, but the warning is off by default. Invalid or degenerate coordinates safely disable the zebra and turn the panel border red. This is a **gamut-exceedance** warning only: downstream color management may compress or remap those colors, so it does not predict physical gamut clipping, peak-luminance clipping, or tone-mapping behavior.
+
 The scope measures the **final decoded signal**, not mastering provenance. Rec.709 material composited or transcoded inside a PQ/BT.2020 video can therefore show small WCG residues from conversion, chroma resampling, scaling, graphics, or compression. These are real pixels in the delivered stream even when the original insert was SDR. The classifier deliberately has no luminance gate: genuine HDR gamut excursions can live in dark saturated regions too.
 
 After CelFlare, the base curve, specular gain, and light pump are chromaticity-preserving scalar expansion. Its enabled warm-hue and pale-skin perceptual corrections—and the fast PQ encoder’s finite error—can produce small boundary excursions; mode 4 reports those as part of CelFlare’s actual encoded output rather than treating CelFlare as a gamut-expansion effect.
@@ -282,6 +284,8 @@ Runtime controls (live via `glsl-shader-opts`):
 |-------|--------|
 | `nitmeter_mode` | `1` = luminance panel, `2` = false-color heatmap + luminance panel, `3` = gamma-2.2 SDR-export heatmap + luminance panel, `4` = Rec.709 gamut mask + color-only scope. Mode 4 grayscales Rec.709 pixels at their original luminance while out-of-Rec.709 pixels retain their real PQ/BT.2020 color and brightness. (Recompiles.) |
 | `nitmeter_target` | Display peak in nits for the luminance panel's `P`-row ceiling indicator — match your `target-peak`. Ignored in mode 4. Live, no recompile. |
+| `nitmeter_display_clip` | Enables the custom display-gamut zebra in mode 4. Live toggle; off by default. |
+| `nitmeter_display_rx` / `ry`, `gx` / `gy`, `bx` / `by` | Display red, green, and blue CIE 1931 xy primaries. D65 white is fixed; defaults are P3-D65. Live via shampv. |
 
 **Requirements / order:** mpv with `vo=gpu-next`. The frame at `MAIN` must already be **PQ-encoded**, so load NitMeter **after CelFlare** (which emits PQ in-shader), or on native PQ HDR content (HDR10/HDR10+/DV) without it. HLG is not supported, and on plain SDR content the numbers are meaningless — a built-in guard blanks the panel when it detects SDR input.
 

@@ -1,5 +1,9 @@
-// NitMeter v1.7 — HDR peak-nit + Rec.709-gamut analysis overlay for mpv (gpu-next)
+// NitMeter v1.8 — HDR peak-nit + display-gamut analysis overlay for mpv (gpu-next)
 // Copyright (C) 2026 Agust Ari · GPL-3.0
+//@shampv input hdr
+//@shampv toggle nitmeter_display_clip
+//@shampv active-if nitmeter_mode 4 nitmeter_display_clip nitmeter_display_rx nitmeter_display_ry nitmeter_display_gx nitmeter_display_gy nitmeter_display_bx nitmeter_display_by
+//@shampv measures MAIN
 //
 // Companion dev tool for CelFlare: decodes the PQ frame and displays
 // absolute-nit statistics as an on-screen panel, plus an optional
@@ -94,6 +98,11 @@
 //       real PQ/BT.2020 color and brightness untouched. The panel contains
 //       only RGB channel maxima + exclusive P3/Rec.2020 gamut shares; no
 //       luminance rows, histogram, ceiling indicator, or graph.
+//       nitmeter_display_clip optionally overlays bright near-neutral zebra on
+//       pixels outside user-entered display primaries. Coordinates are CIE
+//       1931 xy with a fixed D65 white point; P3-D65 defaults are inert until
+//       the live toggle is enabled. Invalid/degenerate coordinates disable
+//       the zebra and mark the panel border red.
 //     "Off" is not a mode: unload the shader (the script does this).
 //   nitmeter_target (DYNAMIC float, default 1000) — display peak in nits
 //     for the P-row ceiling indicator and the graph target line; match
@@ -143,6 +152,55 @@
 //!MINIMUM 1
 //!MAXIMUM 4
 1
+
+//!PARAM nitmeter_display_clip
+//!DESC Display-gamut zebra (toggle, color mode only). 1 = stripe pixels outside the custom display primaries · 0 = off. Live; D65 white assumed.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM nitmeter_display_rx
+//!DESC Display red-primary x (CIE 1931 xy, D65 white). P3-D65 default 0.680.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.001
+//!MAXIMUM 0.900
+0.680
+
+//!PARAM nitmeter_display_ry
+//!DESC Display red-primary y (CIE 1931 xy, D65 white). P3-D65 default 0.320.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.001
+//!MAXIMUM 0.900
+0.320
+
+//!PARAM nitmeter_display_gx
+//!DESC Display green-primary x (CIE 1931 xy, D65 white). P3-D65 default 0.265.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.001
+//!MAXIMUM 0.900
+0.265
+
+//!PARAM nitmeter_display_gy
+//!DESC Display green-primary y (CIE 1931 xy, D65 white). P3-D65 default 0.690.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.001
+//!MAXIMUM 0.900
+0.690
+
+//!PARAM nitmeter_display_bx
+//!DESC Display blue-primary x (CIE 1931 xy, D65 white). P3-D65 default 0.150.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.001
+//!MAXIMUM 0.900
+0.150
+
+//!PARAM nitmeter_display_by
+//!DESC Display blue-primary y (CIE 1931 xy, D65 white). P3-D65 default 0.060.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.001
+//!MAXIMUM 0.900
+0.060
 
 //!PARAM nitmeter_target
 //!DESC Display peak (nits) for the P-row ceiling indicator + graph target line. Match your target-peak.
@@ -232,6 +290,8 @@
 //!VAR float nm_show_2020
 //!VAR float nm_color_show_ctr
 //!VAR uint nm_color_version
+//!VAR float nm_display_m[9]
+//!VAR float nm_display_valid
 //!STORAGE
 
 //!HOOK MAIN
@@ -467,6 +527,49 @@ float pq_eotf_norm(float e) {   // PQ code -> linear, 1.0 = 10000 nits
     return pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
 }
 
+#if nitmeter_mode == 4
+bool nm_xy_valid(vec2 p) {
+    return p.x > 0.0 && p.y > 0.0
+        && p.x < 1.0 && p.y < 1.0
+        && p.x + p.y <= 1.001;
+}
+
+// Build linear BT.2020 -> custom-display RGB from six CIE 1931 xy
+// primaries. The display white point is fixed at D65, matching the decoded
+// BT.2020 signal. Run once in this 1x1 pass; PASS 3 reads the stored rows.
+bool nm_build_display_matrix(out mat3 result) {
+    result = mat3(1.0);
+    vec2 rxy = vec2(nitmeter_display_rx, nitmeter_display_ry);
+    vec2 gxy = vec2(nitmeter_display_gx, nitmeter_display_gy);
+    vec2 bxy = vec2(nitmeter_display_bx, nitmeter_display_by);
+    if (!nm_xy_valid(rxy) || !nm_xy_valid(gxy) || !nm_xy_valid(bxy))
+        return false;
+
+    vec3 r = vec3(rxy.x / rxy.y, 1.0, (1.0 - rxy.x - rxy.y) / rxy.y);
+    vec3 g = vec3(gxy.x / gxy.y, 1.0, (1.0 - gxy.x - gxy.y) / gxy.y);
+    vec3 b = vec3(bxy.x / bxy.y, 1.0, (1.0 - bxy.x - bxy.y) / bxy.y);
+    mat3 primaries = mat3(r, g, b);  // columns, explicit by construction
+    if (abs(determinant(primaries)) < 1e-6) return false;
+
+    const vec3 D65 = vec3(0.9504559271, 1.0, 1.0890577508);
+    vec3 scale = inverse(primaries) * D65;
+    if (any(notEqual(scale, scale)) || any(lessThanEqual(scale, vec3(0.0))))
+        return false;  // D65 must lie inside the entered primary triangle
+
+    mat3 display_to_xyz = mat3(r * scale.r, g * scale.g, b * scale.b);
+    if (abs(determinant(display_to_xyz)) < 1e-6) return false;
+
+    const mat3 bt2020_to_xyz = mat3(
+        vec3(0.6369580483, 0.2627002120, 0.0000000000),
+        vec3(0.1446169036, 0.6779980715, 0.0280726930),
+        vec3(0.1688809752, 0.0593017165, 1.0609850577));
+    result = inverse(display_to_xyz) * bt2020_to_xyz;
+    return !any(notEqual(result[0], result[0]))
+        && !any(notEqual(result[1], result[1]))
+        && !any(notEqual(result[2], result[2]));
+}
+#endif
+
 // hist axis top: log2(10000 nits). Derived (constant-folded), not a magic
 // number — the PASS 3 copy is the identical expression, so the only way to
 // desync is editing the 10000.0 in one pass.
@@ -534,6 +637,20 @@ void hook() {
         bool color_state_valid = nm_color_version == NM_COLOR_VERSION;
         nm_color_version = NM_COLOR_VERSION;
 #if nitmeter_mode == 4
+        mat3 display_matrix = mat3(1.0);
+        bool display_valid = nitmeter_display_clip > 0.5
+                          && nm_build_display_matrix(display_matrix);
+        nm_display_valid = display_valid ? 1.0 : 0.0;
+        // Store rows explicitly; GLSL mat3 indexing is column-major.
+        nm_display_m[0] = display_matrix[0][0];
+        nm_display_m[1] = display_matrix[1][0];
+        nm_display_m[2] = display_matrix[2][0];
+        nm_display_m[3] = display_matrix[0][1];
+        nm_display_m[4] = display_matrix[1][1];
+        nm_display_m[5] = display_matrix[2][1];
+        nm_display_m[6] = display_matrix[0][2];
+        nm_display_m[7] = display_matrix[1][2];
+        nm_display_m[8] = display_matrix[2][2];
         float color_inv = (color_state_valid && nm_color_total > 0u)
                         ? 100.0 / float(nm_color_total) : 0.0;
         nm_p3_pct = clamp(float(nm_p3_pixels) * color_inv, 0.0, 100.0);
@@ -541,6 +658,7 @@ void hook() {
         for (int i = 0; i < 3; i++)
             nm_rgb_nits[i] = color_state_valid ? uintBitsToFloat(nm_rgb_bits[i]) * 10000.0 : 0.0;
 #else
+        nm_display_valid = 0.0;
         nm_p3_pct = 0.0;
         nm_2020_pct = 0.0;
         for (int i = 0; i < 3; i++) nm_rgb_nits[i] = 0.0;
@@ -747,7 +865,7 @@ void hook() {
 //!BIND HOOKED
 //!BIND NITMETER_STATE
 //!BIND NITMETER_STATS
-//!DESC NitMeter v1.7: overlay draw
+//!DESC NitMeter v1.8: overlay draw
 
 // NITMETER_STATS is bound only as the explicit data dependency on PASS 2 —
 // the stats themselves arrive through the NITMETER_STATE SSBO (same pattern
@@ -830,6 +948,13 @@ bool nm_outside_709(vec3 pq, vec3 lin2020) {
         dot(lin2020, vec3( 1.6604910021, -0.5876411388, -0.0728498633)),
         dot(lin2020, vec3(-0.1245504745,  1.1328998971, -0.0083494226)),
         dot(lin2020, vec3(-0.0181507634, -0.1005788980,  1.1187296614)));
+    return nm_outside_triangle(target);
+}
+bool nm_outside_display(vec3 lin2020) {
+    vec3 target = vec3(
+        dot(lin2020, vec3(nm_display_m[0], nm_display_m[1], nm_display_m[2])),
+        dot(lin2020, vec3(nm_display_m[3], nm_display_m[4], nm_display_m[5])),
+        dot(lin2020, vec3(nm_display_m[6], nm_display_m[7], nm_display_m[8])));
     return nm_outside_triangle(target);
 }
 #endif
@@ -983,6 +1108,20 @@ vec4 hook() {
         float y = max(dot(lin2020, vec3(0.2627, 0.6780, 0.0593)), 0.0);
         bool outside_709 = valid_signal && nm_outside_709(col, lin2020);
         if (!outside_709) col = pq_oetf3(vec3(y));
+
+        // Optional display-gamut warning. The matrix is built once in PASS 2
+        // from live shampv xy coordinates. Bright near-neutral diagonal bands
+        // alternate with the existing mode-4 view.
+        bool outside_display = nitmeter_display_clip > 0.5
+                            && nm_display_valid > 0.5
+                            && valid_signal
+                            && nm_outside_display(lin2020);
+        if (outside_display) {
+            vec2 px = HOOKED_pos * HOOKED_size;
+            float period = 20.0 * HOOKED_size.y / 1080.0;
+            float stripe = step(0.5, fract((px.x + px.y) / max(period, 1.0)));
+            col = mix(col, pq_nits(vec3(300.0)), 0.82 * stripe);
+        }
     }
 #endif
 
@@ -1001,6 +1140,16 @@ vec4 hook() {
 
     if (all(greaterThanEqual(lp, vec2(0.0))) && all(lessThan(lp, vec2(NM_PANEL_W, NM_PANEL_H)))) {
         col = mix(col, pq_nits(vec3(2.0)), 0.92);   // ~2-nit translucent background
+
+#if nitmeter_mode == 4
+        // Bad/degenerate xy input: keep the color scope usable, disable the
+        // zebra safely, and make the configuration failure unmistakable.
+        if (nitmeter_display_clip > 0.5 && nm_display_valid < 0.5) {
+            vec2 db = min(lp, vec2(NM_PANEL_W, NM_PANEL_H) - lp);
+            col = mix(col, pq_nits(vec3(220.0, 8.0, 8.0)),
+                      0.95 * step(min(db.x, db.y), 3.0));
+        }
+#endif
 
         float rx = NM_PANEL_W - 8.0;
         float m;

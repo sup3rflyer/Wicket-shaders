@@ -1,4 +1,4 @@
-// NitMeter v1.6 — HDR peak-nit analysis overlay for mpv (gpu-next)
+// NitMeter v1.7 — HDR peak-nit + Rec.709-gamut analysis overlay for mpv (gpu-next)
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Companion dev tool for CelFlare: decodes the PQ frame and displays
@@ -25,8 +25,23 @@
 //                  the MaxFALL averaging; ~0.5 s refresh; dilution on scope)
 //     C (orange) — session MaxCLL: running max frame peak since toggle-on
 //     F (green)  — session MaxFALL: running max FALL since toggle-on
-//   Values under 100 nits gain a tenths digit (e.g. 94.3). The small square
-//   on the P row is the display-ceiling indicator vs nitmeter_target,
+//   Color-scope rows (mode 4 replaces the luminance panel entirely):
+//     R / G / B  — independent frame-maximum linear BT.2020 channel levels
+//                  in nits (each maximum may come from a different pixel)
+//     P3         — full-raster percentage in the P3-D65 shell: outside
+//                  Rec.709 but inside P3-D65
+//     20         — full-raster percentage in the Rec.2020 shell: outside
+//                  P3-D65 but inside legal Rec.2020
+//   Gamut percentages include letterbox bars. A 0.01-nit + 0.25% boundary
+//   guard suppresses the nearest numerical/quantization fuzz while retaining
+//   subtle native-HDR excursions; larger encoded excursions are reported.
+//   This is an actual-decoded-signal scope: it cannot infer that a region was
+//   originally SDR once conversion/resampling/compression has placed it in a
+//   PQ/BT.2020 stream. There is deliberately no luminance gate because real
+//   HDR gamut excursions can live in dark saturated pixels.
+//   Values under 100 nits gain a tenths digit (e.g. 94.3). In luminance
+//   modes, the small square on the P row is the display-ceiling indicator
+//   vs nitmeter_target,
 //   driven by the 9 row (CONTENT peak — a strict-max driver went red on
 //   lone encode-ringing spikes no display visibly clips): green < 95% of
 //   target, yellow approaching, red = content exceeds the display
@@ -55,8 +70,8 @@
 //   nitmeter_sdr_guard tripwire below blanks the panel when it detects that.
 //
 //   Convenient driving is a small lua script cycling panel -> heatmap ->
-//   off on one key: it appends this file to glsl-shaders and sets the
-//   nitmeter_mode shader param via glsl-shader-opts. Manual equivalent:
+//   Rec.709 gamut -> off on one key: it appends this file to glsl-shaders
+//   and sets the nitmeter_mode shader param via glsl-shader-opts. Manual equivalent:
 //     change-list glsl-shader-opts append nitmeter_mode=2
 //     change-list glsl-shaders append "~~/shaders/NitMeter.glsl"
 //
@@ -74,17 +89,22 @@
 //     3 = heatmap encoded as plain gamma-2.2 SDR instead of PQ, for
 //       screenshots/encodes to share on SDR screens. Looks dim on the live
 //       PQ-passthrough display — capture mode, not viewing mode.
+//     4 = Rec.709 gamut mask + color-scope panel. In-gamut pixels become
+//       luminance-preserving grayscale; out-of-Rec.709 pixels keep their
+//       real PQ/BT.2020 color and brightness untouched. The panel contains
+//       only RGB channel maxima + exclusive P3/Rec.2020 gamut shares; no
+//       luminance rows, histogram, ceiling indicator, or graph.
 //     "Off" is not a mode: unload the shader (the script does this).
 //   nitmeter_target (DYNAMIC float, default 1000) — display peak in nits
 //     for the P-row ceiling indicator and the graph target line; match
 //     your target-peak. True live uniform (v1.6; the plain-float PARAM it
-//     replaced took the constant/rebuild path).
+//     replaced took the constant/rebuild path). Ignored in mode 4.
 //   nitmeter_corner (1) — 0 TL / 1 TR / 2 BL / 3 BR
 //   nitmeter_scale (DYNAMIC, 1.0) — panel size multiplier (1.0 = ~136 px
 //     wide at 1080p)
 //   nitmeter_graph (0) — 1 appends the P/9/A time-series strip
 //   nitmeter_heat_nits (DYNAMIC, 180) — display brightness of the heatmap
-//     bands and histogram bars (PQ mode)
+//     and histogram bars (PQ mode)
 //   nitmeter_pct (DYNAMIC, 0.0001) — fraction of frame pixels allowed
 //     ABOVE the 9-row readout (0.0001 = 99.99th percentile)
 //   nitmeter_reset (DYNAMIC, 0) — session reset edge: whenever the value
@@ -118,10 +138,10 @@
 // heatmap never contaminate their own statistics.
 
 //!PARAM nitmeter_mode
-//!DESC Display mode. 1 = panel · 2 = heatmap + panel · 3 = heatmap (gamma-2.2 SDR export) + panel.
+//!DESC Display mode. 1 = panel · 2 = heatmap + panel · 3 = heatmap (gamma-2.2 SDR export) + panel · 4 = Rec.709 mask + RGB/P3/2020 color scope.
 //!TYPE DEFINE
 //!MINIMUM 1
-//!MAXIMUM 3
+//!MAXIMUM 4
 1
 
 //!PARAM nitmeter_target
@@ -200,6 +220,18 @@
 //!VAR float nm_ring_p[120]
 //!VAR float nm_ring_9[120]
 //!VAR float nm_ring_a[120]
+//!VAR float nm_p3_pct
+//!VAR float nm_2020_pct
+//!VAR uint nm_p3_pixels
+//!VAR uint nm_2020_pixels
+//!VAR uint nm_color_total
+//!VAR uint nm_rgb_bits[3]
+//!VAR float nm_rgb_nits[3]
+//!VAR float nm_show_rgb[3]
+//!VAR float nm_show_p3
+//!VAR float nm_show_2020
+//!VAR float nm_color_show_ctr
+//!VAR uint nm_color_version
 //!STORAGE
 
 //!HOOK MAIN
@@ -239,6 +271,48 @@ float pq_oetf_norm(float L) {   // linear (1.0 = 10000 nits) -> PQ code
     return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
 }
 
+#if nitmeter_mode == 4
+// Test the actual encoded frame: PQ BT.2020 -> linear BT.2020 -> linear
+// Rec.709. A color is outside the Rec.709 primary triangle when its Rec.709
+// representation needs a negative component; there is deliberately no 1.0
+// upper-face test (that would measure the 10000-nit signal volume, not gamut).
+// Row coefficients are explicit to avoid GLSL mat3 column-major ambiguity.
+// Keep the PASS 3 copy in sync. The small relative guard rejects boundary
+// fuzz; encoded excursions from fast OETFs remain visible because this scope
+// reports the actual signal. The absolute floor handles near-black codes.
+vec3 nm_pq_eotf3(vec3 pq) {
+    return vec3(pq_eotf_norm(pq.r),
+                pq_eotf_norm(pq.g),
+                pq_eotf_norm(pq.b));
+}
+bool nm_signal_valid(vec3 pq) {
+    return !any(lessThan(pq, vec3(0.0)))
+        && !any(greaterThan(pq, vec3(1.0)))
+        && !any(notEqual(pq, pq));
+}
+bool nm_outside_triangle(vec3 target) {
+    float edge = max(target.r, max(target.g, target.b));
+    float tol = max(1e-6, 0.0025 * max(edge, 0.0)); // 0.01 nit floor + 0.25%
+    return any(lessThan(target, vec3(-tol)));
+}
+bool nm_outside_709(vec3 pq, vec3 lin2020) {
+    if (!nm_signal_valid(pq)) return true;
+    vec3 target = vec3(
+        dot(lin2020, vec3( 1.6604910021, -0.5876411388, -0.0728498633)),
+        dot(lin2020, vec3(-0.1245504745,  1.1328998971, -0.0083494226)),
+        dot(lin2020, vec3(-0.0181507634, -0.1005788980,  1.1187296614)));
+    return nm_outside_triangle(target);
+}
+bool nm_outside_p3(vec3 lin2020) {
+    // P3-D65 (same white as Rec.709/BT.2020), not cinema DCI-P3.
+    vec3 target = vec3(
+        dot(lin2020, vec3( 1.3435782526, -0.2821796705, -0.0613985821)),
+        dot(lin2020, vec3(-0.0652974528,  1.0757879158, -0.0104904631)),
+        dot(lin2020, vec3( 0.0028217873, -0.0195984945,  1.0167767073)));
+    return nm_outside_triangle(target);
+}
+#endif
+
 // Per-workgroup staging for the frame-global 256-bin pixel-code histogram
 // (percentile peak + drawn histogram, PASS 2). Each invocation reduces one
 // 16x16 block, so a workgroup covers 256 blocks; staging in shared memory
@@ -247,10 +321,26 @@ float pq_oetf_norm(float L) {   // linear (1.0 = 10000 nits) -> PQ code
 // via SPIRV-Cross; if a backend ever misbehaves here, fall back to
 // per-lane bins + a thread-0 serial tally like CelFlare PASS 5.
 shared uint s_ph[256];
+#if nitmeter_mode == 4
+shared uint s_p3_pixels[256];
+shared uint s_2020_pixels[256];
+shared uint s_color_total[256];
+shared float s_rgb_r[256];
+shared float s_rgb_g[256];
+shared float s_rgb_b[256];
+#endif
 
 void hook() {
     uint lid = gl_LocalInvocationIndex;
     s_ph[lid] = 0u;
+#if nitmeter_mode == 4
+    s_p3_pixels[lid] = 0u;
+    s_2020_pixels[lid] = 0u;
+    s_color_total[lid] = 0u;
+    s_rgb_r[lid] = 0.0;
+    s_rgb_g[lid] = 0.0;
+    s_rgb_b[lid] = 0.0;
+#endif
     barrier();
 
     ivec2 bpos = ivec2(gl_GlobalInvocationID.xy);
@@ -263,24 +353,96 @@ void hook() {
         float emax = 0.0;   // block max PQ code of per-pixel max(R,G,B)
         float lsum = 0.0;   // block sum of linear CLL (1.0 = 10000 nits)
         float ceil_cnt = 0.0;   // pixels at the signal ceiling (SDR-tripwire evidence)
+#if nitmeter_mode == 4
+        uint p3_pixels = 0u;
+        uint rec2020_pixels = 0u;
+        uint color_total = 0u;
+        vec3 rgb_max = vec3(0.0);
+#endif
         for (int j = 0; j < 16; j++) {
             for (int i = 0; i < 16; i++) {
                 vec2 uv = (base + vec2(float(i), float(j)) + 0.5) * HOOKED_pt;
                 // clamp-to-edge duplicates at the frame edge: no effect on
                 // max, negligible edge-weighting on the mean and histogram
                 vec3 rgb = HOOKED_tex(uv).rgb;
+#if nitmeter_mode == 4
+                // Invalid PQ cannot represent a real BT.2020 color. Exclude
+                // it before EOTF/max so overrange cannot pin a channel at
+                // 10000 nits and NaN cannot reach floatBitsToUint.
+                bool valid_signal = nm_signal_valid(rgb);
+                vec3 lin2020 = valid_signal ? nm_pq_eotf3(rgb) : vec3(0.0);
+                float e = valid_signal ? max(rgb.r, max(rgb.g, rgb.b)) : 0.0;
+#else
                 float e = max(rgb.r, max(rgb.g, rgb.b));
+#endif
                 emax = max(emax, e);
+#if nitmeter_mode == 4
+                // The component EOTFs needed by gamut analysis also give
+                // CLL because EOTF is monotonic: reuse them instead of doing
+                // a fourth scalar EOTF on max(PQ).
+                lsum += max(lin2020.r, max(lin2020.g, lin2020.b));
+#else
                 lsum += pq_eotf_norm(e);
+#endif
                 ceil_cnt += step(0.9995, e);
                 atomicAdd(s_ph[uint(clamp(e, 0.0, 0.999999) * 256.0)], 1u);
+#if nitmeter_mode == 4
+                // Unlike the established CLL/FALL paths above, do not count
+                // clamp-to-edge padding in the percentage denominator.
+                ivec2 ip = bpos * 16 + ivec2(i, j);
+                if (all(lessThan(ip, ivec2(HOOKED_size)))) {
+                    if (valid_signal) {
+                        bool outside_709 = nm_outside_709(rgb, lin2020);
+                        bool outside_p3 = nm_outside_p3(lin2020);
+                        if (outside_p3)
+                            rec2020_pixels += 1u;
+                        else if (outside_709)
+                            p3_pixels += 1u;
+                        rgb_max = max(rgb_max, lin2020);
+                    }
+                    color_total += 1u;
+                }
+#endif
             }
         }
         // Store PQ codes (perceptually uniform in [0,1]) so the intermediate
         // is robust to whatever SAVE format the fbo setting picks.
         imageStore(out_image, bpos, vec4(emax, pq_oetf_norm(lsum / 256.0), ceil_cnt / 256.0, 1.0));
+#if nitmeter_mode == 4
+        // Publish per-block counts for a workgroup-local reduction below.
+        // This avoids two contended global atomics per source block.
+        s_p3_pixels[lid] = p3_pixels;
+        s_2020_pixels[lid] = rec2020_pixels;
+        s_color_total[lid] = color_total;
+        s_rgb_r[lid] = rgb_max.r;
+        s_rgb_g[lid] = rgb_max.g;
+        s_rgb_b[lid] = rgb_max.b;
+#endif
     }
     barrier();
+#if nitmeter_mode == 4
+    if (lid == 0u) {
+        uint group_p3 = 0u;
+        uint group_2020 = 0u;
+        uint group_total = 0u;
+        vec3 group_rgb = vec3(0.0);
+        for (uint i = 0u; i < 256u; i++) {
+            group_p3 += s_p3_pixels[i];
+            group_2020 += s_2020_pixels[i];
+            group_total += s_color_total[i];
+            group_rgb = max(group_rgb, vec3(s_rgb_r[i], s_rgb_g[i], s_rgb_b[i]));
+        }
+        // Three count + three channel-max atomics per 16x16 workgroup:
+        // ~810 global atomics/frame at 4K. Positive-float bit patterns are
+        // monotonically ordered as uint, so atomicMax is exact here.
+        atomicAdd(nm_p3_pixels, group_p3);
+        atomicAdd(nm_2020_pixels, group_2020);
+        atomicAdd(nm_color_total, group_total);
+        atomicMax(nm_rgb_bits[0], floatBitsToUint(group_rgb.r));
+        atomicMax(nm_rgb_bits[1], floatBitsToUint(group_rgb.g));
+        atomicMax(nm_rgb_bits[2], floatBitsToUint(group_rgb.b));
+    }
+#endif
     // flush this workgroup's staging bins; PASS 2 reads then zeroes them
     uint c = s_ph[lid];
     if (c > 0u) atomicAdd(nm_phist[lid], c);
@@ -320,6 +482,7 @@ const float NM_HIST_LOG_HI = log2(10000.0);
 #define NM_SDR_ALPHA_DN     0.015   // suspicion release (~2 s @24p)
 #define NM_SHOW_FRAMES      12.0    // ~0.5 s @24p numeric sample-and-hold (readability)
 #define NM_PHIST_BINS       256     // pixel-code histogram bins — MUST match PASS 1 s_ph
+#define NM_COLOR_VERSION    0x4E4D4332u  // persistent-buffer suffix initialization token
 
 shared float s_max[144];
 shared float s_sum[144];
@@ -368,6 +531,27 @@ void hook() {
         float inv = 1.0 / max(float(total), 1.0);
         nm_peak = pk;
         nm_fall = sm * inv;
+        bool color_state_valid = nm_color_version == NM_COLOR_VERSION;
+        nm_color_version = NM_COLOR_VERSION;
+#if nitmeter_mode == 4
+        float color_inv = (color_state_valid && nm_color_total > 0u)
+                        ? 100.0 / float(nm_color_total) : 0.0;
+        nm_p3_pct = clamp(float(nm_p3_pixels) * color_inv, 0.0, 100.0);
+        nm_2020_pct = clamp(float(nm_2020_pixels) * color_inv, 0.0, 100.0);
+        for (int i = 0; i < 3; i++)
+            nm_rgb_nits[i] = color_state_valid ? uintBitsToFloat(nm_rgb_bits[i]) * 10000.0 : 0.0;
+#else
+        nm_p3_pct = 0.0;
+        nm_2020_pct = 0.0;
+        for (int i = 0; i < 3; i++) nm_rgb_nits[i] = 0.0;
+#endif
+        // Per-frame counters share the histogram's PASS 1 -> PASS 2 SSBO
+        // visibility contract. Always clear them so mode changes cannot
+        // inherit a partial/stale count from the persistent STORAGE buffer.
+        nm_p3_pixels = 0u;
+        nm_2020_pixels = 0u;
+        nm_color_total = 0u;
+        for (int i = 0; i < 3; i++) nm_rgb_bits[i] = 0u;
         // explicit session reset (edge on the nitmeter_reset DYNAMIC
         // param). Reload does NOT reset: the STORAGE buffer survives the
         // cycle script's remove+re-append (field-observed — C/F persisted
@@ -385,6 +569,7 @@ void hook() {
             // up to 12 frames (audit-caught) — this forces the show
             // snapshot to re-arm with current values further down
             nm_show_ctr = 0.0;
+            nm_color_show_ctr = 0.0;
             nm_ring_idx = 0.0;
             for (int i = 0; i < NM_RING_LEN; i++) {
                 nm_ring_p[i] = 0.0;
@@ -490,6 +675,37 @@ void hook() {
             nm_maxcll  = max(nm_maxcll, pk);
             nm_maxfall = max(nm_maxfall, nm_fall);
         }
+#if nitmeter_mode == 4
+        // Independent 0.5 s numeric hold: the spatial mask stays live, while
+        // all five color readouts remain readable instead of chattering.
+        // Process after reset + trip quarantine so a reset samples this frame
+        // and the first clean recovery frame cannot expose held SDR garbage.
+        if (!color_state_valid || tripped) {
+            // Do not arm the hold from the deliberately ignored cold-layout
+            // frame; frame 2 must be free to publish the first valid count.
+            for (int i = 0; i < 3; i++) nm_show_rgb[i] = 0.0;
+            nm_show_p3 = 0.0;
+            nm_show_2020 = 0.0;
+            nm_color_show_ctr = 0.0;
+        } else {
+            // Range check self-heals a garbage/NaN first-load counter.
+            if (!(nm_color_show_ctr >= 0.0 && nm_color_show_ctr <= NM_SHOW_FRAMES))
+                nm_color_show_ctr = 0.0;
+            if (nm_color_show_ctr <= 0.0) {
+                for (int i = 0; i < 3; i++) nm_show_rgb[i] = nm_rgb_nits[i];
+                nm_show_p3 = nm_p3_pct;
+                nm_show_2020 = nm_2020_pct;
+                nm_color_show_ctr = NM_SHOW_FRAMES;
+            }
+            nm_color_show_ctr -= 1.0;
+        }
+#else
+        // Force an immediate sample on the first frame after entering mode 4.
+        for (int i = 0; i < 3; i++) nm_show_rgb[i] = 0.0;
+        nm_show_p3 = 0.0;
+        nm_show_2020 = 0.0;
+        nm_color_show_ctr = 0.0;
+#endif
         // numeric sample-and-hold (Lilium-style ~0.5 s readout refresh):
         // measurement stays per-frame, only the SHOWN digits are held.
         // Countdown from 0 so the very first frame populates immediately.
@@ -531,7 +747,7 @@ void hook() {
 //!BIND HOOKED
 //!BIND NITMETER_STATE
 //!BIND NITMETER_STATS
-//!DESC NitMeter v1.6: overlay draw
+//!DESC NitMeter v1.7: overlay draw
 
 // NITMETER_STATS is bound only as the explicit data dependency on PASS 2 —
 // the stats themselves arrive through the NITMETER_STATE SSBO (same pattern
@@ -548,10 +764,20 @@ const float NM_HIST_LOG_HI = log2(10000.0);
 #define NM_HIST_BINS   24       // MUST match the nm_hist[24] SSBO array + PASS 2
 #define NM_RING_LEN    120      // MUST match the nm_ring_*[120] SSBO arrays + PASS 2
 #define NM_PANEL_W     136.0
-#if nitmeter_graph
-#define NM_PANEL_H     255.0   // + time-series strip at y [207,247)
+#if nitmeter_mode == 4
+#define NM_ROWS        5
+#define NM_PANEL_H     136.0   // five color rows only; no histogram/graph
 #else
-#define NM_PANEL_H     207.0
+#define NM_ROWS        6
+#define NM_HIST_Y0     159.0
+#define NM_HIST_Y1     199.0
+#define NM_GRAPH_Y0    207.0
+#define NM_GRAPH_Y1    247.0
+#if nitmeter_graph
+#define NM_PANEL_H     (NM_GRAPH_Y1 + 8.0)
+#else
+#define NM_PANEL_H     (NM_HIST_Y1 + 8.0)
+#endif
 #endif
 
 // PQ duplicate — keep in sync with the other passes.
@@ -571,6 +797,43 @@ vec3 pq_oetf3(vec3 L) {         // linear (1.0 = 10000 nits) -> PQ code
 }
 vec3 pq_nits(vec3 nits) { return pq_oetf3(nits / 10000.0); }
 
+#if nitmeter_mode == 4
+// Exact duplicate of the PASS 1 Rec.709 classifier used by the color scope.
+// Keep coefficients and tolerance identical so the number and painted mask
+// cannot disagree at the Rec.709 boundary.
+vec3 nm_pq_eotf3(vec3 pq) {
+    return vec3(pq_eotf_norm(pq.r),
+                pq_eotf_norm(pq.g),
+                pq_eotf_norm(pq.b));
+}
+bool nm_signal_valid(vec3 pq) {
+    return !any(lessThan(pq, vec3(0.0)))
+        && !any(greaterThan(pq, vec3(1.0)))
+        && !any(notEqual(pq, pq));
+}
+float nm_safe_pq_component(float e) {
+    return (e == e) ? clamp(e, 0.0, 1.0) : 0.0;
+}
+vec3 nm_safe_pq3(vec3 pq) {
+    return vec3(nm_safe_pq_component(pq.r),
+                nm_safe_pq_component(pq.g),
+                nm_safe_pq_component(pq.b));
+}
+bool nm_outside_triangle(vec3 target) {
+    float edge = max(target.r, max(target.g, target.b));
+    float tol = max(1e-6, 0.0025 * max(edge, 0.0)); // 0.01 nit floor + 0.25%
+    return any(lessThan(target, vec3(-tol)));
+}
+bool nm_outside_709(vec3 pq, vec3 lin2020) {
+    if (!nm_signal_valid(pq)) return true;
+    vec3 target = vec3(
+        dot(lin2020, vec3( 1.6604910021, -0.5876411388, -0.0728498633)),
+        dot(lin2020, vec3(-0.1245504745,  1.1328998971, -0.0083494226)),
+        dot(lin2020, vec3(-0.0181507634, -0.1005788980,  1.1187296614)));
+    return nm_outside_triangle(target);
+}
+#endif
+
 // Lilium-style luminance heatmap ramp (10000-nit cutoff), linear RGB.
 // Band edges 100 (SDR ref white) / 203 (BT.2408 HDR ref white) / 400 /
 // 1000 / 4000, continuous crossfade inside each band.
@@ -585,8 +848,15 @@ vec3 heat_lin(float n) {
 
 // 7-segment glyphs. Bits: A=1 B=2 C=4 D=8 E=16 F=32 G=64.
 const int NM_SEG[10] = int[10](0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F);
-// row label glyphs: P, 9 (99.99th-pct peak), H, A, C, F
+#if nitmeter_mode == 4
+// color rows: r / G / b channel maxima, P3 shell %, Rec.2020 shell %
+const int NM_LBL[5] = int[5](0x50, 0x3D, 0x7C, 0x73, 0x5B);
+// second glyph completes the on-panel P3 / 20 shorthand; -1 = none
+const int NM_LBL2[5] = int[5](-1, -1, -1, 0x4F, 0x3F);
+#else
+// luminance rows: P, 9 (99.99th-pct peak), H, A, C, F
 const int NM_LBL[6] = int[6](0x73, 0x6F, 0x76, 0x77, 0x39, 0x71);
+#endif
 
 float seg_rect(vec2 p, vec2 c, vec2 h) {
     vec2 d = abs(p - c) - h;
@@ -644,11 +914,30 @@ float dashes_mask(vec2 p, float h) {
     float xl = (float(slot) + 1.0) * slotw - p.x;
     return seg_rect(vec2(xl / h, p.y / h), vec2(0.33, 0.50), vec2(0.21, 0.05));
 }
+#if nitmeter_mode == 4
+// Compact percent sign in panel-local pixels: two dots + rising slash.
+float percent_mask(vec2 p) {
+    if (p.x < 0.0 || p.x >= 12.0 || p.y < 0.0 || p.y >= 20.0) return 0.0;
+    float m = seg_rect(p, vec2(2.0, 3.0), vec2(1.5));
+    m = max(m, seg_rect(p, vec2(10.0, 17.0), vec2(1.5)));
+    m = max(m, step(abs(p.x + 0.5 * p.y - 11.0), 0.8));
+    return m;
+}
+#endif
 
-// panel geometry: 6 label+digit rows, then the histogram strip
+#if nitmeter_mode == 4
+// Five color-only rows. P3 = P3-D65 shell; 20 = Rec.2020 shell.
+const float NM_ROW_Y[5] = float[5](8.0, 33.0, 58.0, 83.0, 108.0);
+const vec3 NM_ROW_NITS[5] = vec3[5](
+    vec3(230.0, 35.0, 35.0),
+    vec3(35.0, 230.0, 35.0),
+    vec3(45.0, 90.0, 230.0),
+    vec3(230.0, 190.0, 25.0),
+    vec3(30.0, 180.0, 230.0));
+#else
+// Six luminance rows: P white, 9 dim grey-white, H yellow, A cyan,
+// C orange, F green.
 const float NM_ROW_Y[6] = float[6](8.0, 33.0, 58.0, 83.0, 108.0, 133.0);
-// row colors as display nits: P white, 9 dim grey-white, H yellow, A cyan,
-// C orange, F green
 const vec3 NM_ROW_NITS[6] = vec3[6](
     vec3(230.0, 230.0, 230.0),
     vec3(150.0, 150.0, 150.0),
@@ -656,12 +945,13 @@ const vec3 NM_ROW_NITS[6] = vec3[6](
     vec3(15.0,  190.0, 230.0),
     vec3(230.0, 110.0, 15.0),
     vec3(60.0,  220.0, 60.0));
+#endif
 
 vec4 hook() {
     vec4 color = HOOKED_texOff(0);
     vec3 col = color.rgb;
 
-#if nitmeter_mode >= 2
+#if nitmeter_mode == 2 || nitmeter_mode == 3
     {
         float e = max(col.r, max(col.g, col.b));
         float n = pq_eotf_norm(e) * 10000.0;
@@ -679,6 +969,20 @@ vec4 hook() {
             : (n < 100.0) ? pq_nits(vec3(n))
                           : pq_oetf3(heat_lin(n) * (nitmeter_heat_nits / 10000.0));
 #endif
+    }
+#elif nitmeter_mode == 4
+    {
+        // Subtractive Rec.709-gamut view: in-gamut pixels become neutral at
+        // their original BT.2020 luminance; out-of-gamut pixels stay byte-for-
+        // byte on the original PQ/BT.2020 path so their real color/brightness
+        // is the mask. No analysis color is painted over them.
+        bool valid_signal = nm_signal_valid(col);
+        // Illegal/NaN PQ is not a real wide-gamut color: sanitize it only
+        // for a safe neutral display and keep it out of every color metric.
+        vec3 lin2020 = nm_pq_eotf3(valid_signal ? col : nm_safe_pq3(col));
+        float y = max(dot(lin2020, vec3(0.2627, 0.6780, 0.0593)), 0.0);
+        bool outside_709 = valid_signal && nm_outside_709(col, lin2020);
+        if (!outside_709) col = pq_oetf3(vec3(y));
     }
 #endif
 
@@ -701,9 +1005,18 @@ vec4 hook() {
         float rx = NM_PANEL_W - 8.0;
         float m;
         // row labels (always drawn, even while tripped — they say what's blank)
-        for (int r = 0; r < 6; r++) {
+        for (int r = 0; r < NM_ROWS; r++) {
             m = glyph_mask(NM_LBL[r], vec2((lp.x - 8.0) / 20.0, (lp.y - NM_ROW_Y[r]) / 20.0));
             col = mix(col, pq_nits(NM_ROW_NITS[r]), m);
+#if nitmeter_mode == 4
+            if (NM_LBL2[r] >= 0) {
+                m = glyph_mask(NM_LBL2[r], vec2((lp.x - 22.0) / 20.0,
+                                                (lp.y - NM_ROW_Y[r]) / 20.0));
+                col = mix(col, pq_nits(NM_ROW_NITS[r]), m);
+                m = percent_mask(vec2(lp.x - 38.0, lp.y - NM_ROW_Y[r]));
+                col = mix(col, pq_nits(NM_ROW_NITS[r]), m);
+            }
+#endif
         }
 
         bool sdr_suspect = false;
@@ -716,23 +1029,29 @@ vec4 hook() {
             vec2 db = min(lp, vec2(NM_PANEL_W, NM_PANEL_H) - lp);
             col = mix(col, pq_nits(vec3(180.0, 8.0, 8.0)),
                       0.9 * step(min(db.x, db.y), 3.0));
-            for (int r = 0; r < 6; r++) {
+            for (int r = 0; r < NM_ROWS; r++) {
                 m = dashes_mask(vec2(rx - lp.x, lp.y - NM_ROW_Y[r]), 20.0);
                 col = mix(col, pq_nits(NM_ROW_NITS[r]), m);
             }
             return vec4(col, color.a);
         }
 
-        // digit rows: P peak (shown, ~0.5 s hold), 9 percentile peak
-        // (shown), H peak-hold, A FALL (shown), C session MaxCLL,
-        // F session MaxFALL
+#if nitmeter_mode == 4
+        // Color-only scope: independent R/G/B maxima in nits, then exclusive
+        // P3-D65-shell and Rec.2020-shell full-raster percentages.
+        float vals[5] = float[5](nm_show_rgb[0], nm_show_rgb[1], nm_show_rgb[2],
+                                 nm_show_p3, nm_show_2020);
+#else
+        // Luminance scope: P peak, 9 percentile, H hold, A FALL, C/F maxima.
         float vals[6] = float[6](nm_show_peak, nm_show_p9999, nm_hold,
                                  nm_show_fall, nm_maxcll, nm_maxfall);
-        for (int r = 0; r < 6; r++) {
+#endif
+        for (int r = 0; r < NM_ROWS; r++) {
             m = value_mask(vals[r], vec2(rx - lp.x, lp.y - NM_ROW_Y[r]), 20.0);
             col = mix(col, pq_nits(NM_ROW_NITS[r]), m);
         }
 
+#if nitmeter_mode != 4
         // display-ceiling indicator (P row): CONTENT peak (9 row) vs
         // nitmeter_target — v1.5 repointed H at the percentile for spike
         // immunity; v1.6 finishes that for the verdict square (strict-max
@@ -750,7 +1069,7 @@ vec4 hook() {
         col = mix(col, pq_nits(tc), tm);
 
         // histogram strip: log2 axis, 1 -> 10000 nits
-        if (lp.x >= 8.0 && lp.x < 128.0 && lp.y >= 159.0 && lp.y < 199.0) {
+        if (lp.x >= 8.0 && lp.x < 128.0 && lp.y >= NM_HIST_Y0 && lp.y < NM_HIST_Y1) {
             float hx = (lp.x - 8.0) / 120.0;
             // reference ticks at 100 / 203 / 1000 / 4000 nits (positions
             // derived, constant-folded — v1.5 hardcoded the four fractions,
@@ -765,7 +1084,7 @@ vec4 hook() {
             // geometry edit can't silently reopen an OOB SSBO read
             int bin = clamp(int(hx * float(NM_HIST_BINS)), 0, NM_HIST_BINS - 1);
             float bh = pow(clamp(nm_hist[bin], 0.0, 1.0), 0.4);   // gamma'd so small areas stay visible
-            float yy = (199.0 - lp.y) / 40.0;                     // 0 bottom .. 1 top
+            float yy = (NM_HIST_Y1 - lp.y) / 40.0;                // 0 bottom .. 1 top
             if (yy < bh) {
                 float cn = exp2((float(bin) + 0.5) / float(NM_HIST_BINS) * NM_HIST_LOG_HI);
                 vec3 bc = (cn < 100.0) ? vec3(0.5) : heat_lin(cn);
@@ -787,10 +1106,10 @@ vec4 hook() {
         // the right — a live scope for the light-pump envelope. nm_ring_idx
         // is the next write slot = the OLDEST sample, so column c maps to
         // (idx + c) % len. Tripped-frame samples are 0 and draw as gaps.
-        if (lp.x >= 8.0 && lp.x < 128.0 && lp.y >= 207.0 && lp.y < 247.0) {
+        if (lp.x >= 8.0 && lp.x < 128.0 && lp.y >= NM_GRAPH_Y0 && lp.y < NM_GRAPH_Y1) {
             int c = int(lp.x - 8.0);
             int ri = (clamp(int(nm_ring_idx), 0, NM_RING_LEN - 1) + c) % NM_RING_LEN;
-            float yy = (247.0 - lp.y) / 40.0;                     // 0 bottom .. 1 top
+            float yy = (NM_GRAPH_Y1 - lp.y) / 40.0;               // 0 bottom .. 1 top
             // dim line at the display target
             float ty = clamp(log2(max(nitmeter_target, 1.0)) / NM_HIST_LOG_HI, 0.0, 1.0);
             col = mix(col, pq_nits(vec3(25.0)), step(abs(yy - ty), 0.02));
@@ -803,6 +1122,7 @@ vec4 hook() {
             if (tv.y > 0.0 && abs(yy - th.y) < 0.0375) col = mix(col, pq_nits(NM_ROW_NITS[1]), 1.0);
             if (tv.z > 0.0 && abs(yy - th.z) < 0.0375) col = mix(col, pq_nits(NM_ROW_NITS[0]), 1.0);
         }
+#endif
 #endif
     }
     return vec4(col, color.a);

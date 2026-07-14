@@ -247,9 +247,9 @@ Use it *instead of* a fixed Film Grain tier (above), not on top of one.
 
 ### NitMeter
 
-**HDR peak-nit analysis overlay** — a measurement/tuning companion for CelFlare (and native HDR content), not an image effect. Decodes the PQ frame and reports absolute-nit statistics as an on-screen panel, with an optional full-frame false-color heatmap.
+**HDR luminance and gamut analysis overlay** — a measurement/tuning companion for CelFlare (and native HDR content), not an image effect. Decodes the PQ frame for an absolute-nit luminance scope or a Rec.709/P3/Rec.2020 color scope.
 
-Per-pixel light level is computed as pixel CLL — `PQ-EOTF(max(R,G,B)) × 10000` — the same convention as MaxCLL/MaxFALL in HDR10 metadata. The panel shows:
+In luminance modes, per-pixel light level is computed as pixel CLL — `PQ-EOTF(max(R,G,B)) × 10000` — the same convention as MaxCLL/MaxFALL in HDR10 metadata. The luminance panel shows:
 
 | Row | Meaning |
 |-----|---------|
@@ -262,12 +262,26 @@ Per-pixel light level is computed as pixel CLL — `PQ-EOTF(max(R,G,B)) × 10000
 
 A log2 histogram (1 → 10000 nits, ticks at 100/203/1000/4000) shows the screen-area CLL distribution, and a small indicator on the `P` row goes green → yellow → red as the content peak approaches and exceeds `nitmeter_target` (your display ceiling).
 
+Mode 4 replaces that panel with a color-only scope:
+
+| Row | Meaning |
+|-----|---------|
+| **R / G / B** | Independent frame-maximum linear BT.2020 channel levels in nits. Each maximum may come from a different pixel. |
+| **P3** | Percentage of the full raster in the P3-D65 shell: outside Rec.709 but inside P3-D65. |
+| **20** | Percentage of the full raster in the Rec.2020 shell: outside P3-D65 but inside legal Rec.2020. |
+
+The two gamut percentages are exclusive and include letterbox bars. A 0.01-nit + 0.25% boundary guard suppresses the nearest numerical/quantization fuzz while retaining subtle native-HDR excursions; larger encoded excursions are reported as present in the signal. Mode 4 has no luminance rows, histogram, ceiling indicator, or time graph.
+
+The scope measures the **final decoded signal**, not mastering provenance. Rec.709 material composited or transcoded inside a PQ/BT.2020 video can therefore show small WCG residues from conversion, chroma resampling, scaling, graphics, or compression. These are real pixels in the delivered stream even when the original insert was SDR. The classifier deliberately has no luminance gate: genuine HDR gamut excursions can live in dark saturated regions too.
+
+After CelFlare, the base curve, specular gain, and light pump are chromaticity-preserving scalar expansion. Its enabled warm-hue and pale-skin perceptual corrections—and the fast PQ encoder’s finite error—can produce small boundary excursions; mode 4 reports those as part of CelFlare’s actual encoded output rather than treating CelFlare as a gamut-expansion effect.
+
 Runtime controls (live via `glsl-shader-opts`):
 
 | Param | Effect |
 |-------|--------|
-| `nitmeter_mode` | `1` = panel only, `2` = false-color heatmap + panel, `3` = heatmap encoded as gamma-2.2 SDR for screenshots. (Recompiles.) |
-| `nitmeter_target` | Display peak in nits for the `P`-row ceiling indicator — match your `target-peak`. Live, no recompile. |
+| `nitmeter_mode` | `1` = luminance panel, `2` = false-color heatmap + luminance panel, `3` = gamma-2.2 SDR-export heatmap + luminance panel, `4` = Rec.709 gamut mask + color-only scope. Mode 4 grayscales Rec.709 pixels at their original luminance while out-of-Rec.709 pixels retain their real PQ/BT.2020 color and brightness. (Recompiles.) |
+| `nitmeter_target` | Display peak in nits for the luminance panel's `P`-row ceiling indicator — match your `target-peak`. Ignored in mode 4. Live, no recompile. |
 
 **Requirements / order:** mpv with `vo=gpu-next`. The frame at `MAIN` must already be **PQ-encoded**, so load NitMeter **after CelFlare** (which emits PQ in-shader), or on native PQ HDR content (HDR10/HDR10+/DV) without it. HLG is not supported, and on plain SDR content the numbers are meaningless — a built-in guard blanks the panel when it detects SDR input.
 
@@ -277,7 +291,7 @@ glsl-shaders-append=~~/shaders/NitMeter.glsl
 glsl-shader-opts=nitmeter_mode=2,nitmeter_target=1000
 ```
 
-Most convenient driven from a small Lua script that cycles panel → heatmap → off on one key (appending/unloading the shader and setting `nitmeter_mode`).
+Most convenient driven from a small Lua script that cycles panel → heatmap → Rec.709 gamut mask → off on one key (appending/unloading the shader and setting `nitmeter_mode`).
 
 ---
 

@@ -1280,6 +1280,7 @@ void hook() {
 #define ADD_MAINT_TRANSPORT_MIN  0.875
 #define ADD_MAINT_ENV_LO         0.02
 #define ADD_MAINT_ENV_HI         0.10
+#define ADD_ATTACK_STEP          0.25
 #define ADD_VFLOW_COST_MAX       0.03
 #define ADD_VFLOW_SAD_CAP        0.10
 #define ADD_VFLOW_BIAS           0.0001
@@ -1407,22 +1408,42 @@ void hook() {
 #define PUMP_EDGE_GLOBAL_EPS       0.02   // per-cell rise above which a deep-interior cell counts as "rising"
 #define PUMP_EDGE_GLOBAL_FRAC_LO   0.40   // fraction of the deep interior rising below this: localized -> seed armed
 #define PUMP_EDGE_GLOBAL_FRAC_HI   0.75   // above this: frame-global rise -> border seed fully disengaged
-// Mask softening (v5.6 hardening, field report: cels read diamond-shaped and
-// a large event's BOUNDARY cells — whose cell-mean drive dilutes below
-// CELL_DRIVE_LOW — never open, leaving hard mosaic edges mid-event). The
-// PUBLISHED mask (pump_mask_cell, what PASS 6 samples) becomes
-// max(env, 3×3 binomial blur of env): max-preserving, so an isolated fire
-// keeps its FULL peak (a plain blur would cut a lone open cell 4× — kills the
-// flagship multi-fire amplitude) while every open cell grows a soft ≤1-cell
-// skirt that fills partially-covered boundary cells and rounds the bilinear
-// diamond. DYNAMICS ARE UNTOUCHED: the band-pass state, velocity release,
-// max-hold, and establish gate all still live on pump_env_cell — softening is
-// presentation-only, applied after the state update each frame. Safety: the
-// skirt can bleed ≤0.25 amplitude one cell past a genuinely-open cell (only
-// next to a real event by construction — the killer clip has no open cells to
-// bleed from), and per-pixel pump_w still holds dark pixels down under it.
-// 0 = publish the raw env (pre-v5.6 look).
+// Mask softening (v5.6, widened after a 2026-07 tunnel-reveal field report):
+// the per-cell proof can correctly authorize only the hot core of one broad
+// white opening, leaving its surrounding source light visibly tiled. The
+// PUBLISHED mask (pump_mask_cell, what PASS 6 samples) is therefore
+// max(env, a 5×5 weighted max-stencil). Max preserves an
+// isolated event's FULL peak. As bright-field coverage rises over 0.10..0.25,
+// the old one-cell skirt grows into a rounded two-cell pre-finish skirt
+// (full-gate isolated-cell bounds: 0.56 cardinal / 0.38 diagonal at one cell,
+// 0.14 cardinal at two) and multiple proved cells merge into one light volume.
+// PASS 6's per-pixel pump_w trims that volume back to the source's own bright
+// shape. DYNAMICS ARE UNTOUCHED: band-pass state, attack cap, velocity release,
+// max-hold, and proof all remain on pump_env_cell; this is presentation-only.
+// Overlapping cells cannot sum or amplify one another; overlaps follow the
+// strongest local envelope. Coverage chooses presentation WIDTH only; it never
+// grants amplitude. Safety remains opening-bounded: no authorized cell means an
+// exact-zero stencil,
+// unlike a scene-global scalar backstop (tested and rejected: it re-opened the
+// moving-lamp class). The subtractive fallback retains the narrower v5.6 3×3
+// skirt; spatial-off compiles this out; PUMP_MASK_BLOB5=0 restores 3×3 for
+// additive too.
+// PUMP_MASK_SOFTEN=0 publishes the raw env.
 #define PUMP_MASK_SOFTEN    1
+#define PUMP_MASK_BLOB5     1
+#define PUMP_MASK_BLOB_GAIN 6.0
+#define PUMP_MASK_BLOB_FRAC_LO 0.10
+#define PUMP_MASK_BLOB_FRAC_HI 0.25
+// A normalized 3x3 binomial finishing pass connects the adaptive skirt without
+// quantizing its amplitude. It is coverage-gated, so small/localized events
+// retain the proven narrow mask. Raw authorized cores are restored after
+// filtering; this smooths support without inventing an event or attenuating
+// its peak. At full gate an isolated core's final cardinal tail is 0.459,
+// 0.176, 0.029 at radii 1..3 cells; that last tail is only ~1.8% maximum
+// expansion before the source-brightness and cover gates. Cost is 1,584
+// thread-0 shared reads + 144 shared writes + 144 final SSBO writes per frame.
+#define PUMP_MASK_FINISH     1
+#define PUMP_MASK_FINISH_MIX 1.0
 // SPATIAL MODEL — two apply modes, selected by PASS 6's SPATIAL_PUMP_ADDITIVE:
 //  - SUBTRACTIVE (v5.2–v5.4, field-confirmed): pump_local = pump_env × mask.
 //    The env is a [0,1] SUPPRESSOR — spatial can only REMOVE the global scalar
@@ -1519,6 +1540,10 @@ shared float s_flow_texture[144];
 // cell's PRE-update state while the fused loop updates them in place.
 shared float s_pump_snap_f[144];
 shared float s_pump_snap_s[144];
+#if PUMP_MASK_FINISH && PUMP_MASK_SOFTEN && PUMP_MASK_BLOB5 && ADDITIVE_OPEN_GUARD
+// Thread-0-only intermediate presentation field for the finishing blur.
+shared float s_pump_shape[144];
+#endif
 #if ADDITIVE_OPEN_GUARD
 // Frozen very-slow reveal memory. It must not be read directly from the SSBO
 // while loop 2 updates cells serially or later indices would see this frame's
@@ -2903,6 +2928,17 @@ void hook() {
                 // by the border mirror in the publish loop.
                 a *= (1.0 - edge_seed);
                 #endif
+                // Additive proof completes after the source has already spent
+                // seven rising frames. Publishing its current `a` in one step
+                // made that delayed authorization look like a pop and exposed
+                // cell-to-cell proof timing as patches. Cap only the RISING
+                // authorized target to +0.25 env/frame: full-scale takes four
+                // frames, while a moderate event is not proportionally
+                // damped by an EMA. Pre-proof stays exact zero, while source
+                // fall/release below remains unslewed.
+                #if ADDITIVE_OPEN_GUARD
+                a = min(a, pump_env_cell[i] + ADD_ATTACK_STEP);
+                #endif
                 // Velocity-matched release: when the negative band-pass region
                 // is still falling THIS frame, follow its frame-to-frame fast
                 // level. The ratios telescope across a real fade instead of
@@ -2919,12 +2955,47 @@ void hook() {
                 // neighbour scan reads snap_s only).
                 s_pump_snap_f[i] = e;
             }
+            #if PUMP_MASK_SOFTEN && PUMP_MASK_BLOB5 && ADDITIVE_OPEN_GUARD
+            // Frame-global presentation-width selector: compute once on the
+            // reducer lane, not once per output cell (coherent SSBO read).
+            float pump_blob_gate = smoothstep(PUMP_MASK_BLOB_FRAC_LO,
+                                              PUMP_MASK_BLOB_FRAC_HI,
+                                              max(bright_frac, smoothed_bright_frac));
+            #if PUMP_MASK_FINISH
+            float pump_finish_mix = clamp(PUMP_MASK_FINISH_MIX * pump_blob_gate,
+                                          0.0, 1.0);
+            #endif
+            #endif
             // Publish the PRESENTATION mask (see PUMP_MASK_SOFTEN): the raw
             // env stays the dynamics state; PASS 6 samples pump_mask_cell.
             for (uint i = 0u; i < 144u; i++) {
+                float published;
                 #if PUMP_MASK_SOFTEN
                 int cy = int(i) / 16, cx = int(i) % 16;
                 float b = 0.0;
+                #if PUMP_MASK_BLOB5 && ADDITIVE_OPEN_GUARD
+                for (int dy = -2; dy <= 2; dy++)
+                    for (int dx = -2; dx <= 2; dx++) {
+                        int ny = clamp(cy + dy, 0, 8);
+                        int nx = clamp(cx + dx, 0, 15);
+                        int ax = abs(dx), ay = abs(dy);
+                        float wx = (ax == 0) ? 6.0 : (ax == 1) ? 4.0 : 1.0;
+                        float wy = (ay == 0) ? 6.0 : (ay == 1) ? 4.0 : 1.0;
+                        b = max(b, s_pump_snap_f[ny * 16 + nx] * wx * wy
+                                 * (PUMP_MASK_BLOB_GAIN / 256.0));
+                    }
+                float bn = 0.0;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int ny = clamp(cy + dy, 0, 8);
+                        int nx = clamp(cx + dx, 0, 15);
+                        bn += s_pump_snap_f[ny * 16 + nx]
+                            * float((2 - abs(dy)) * (2 - abs(dx)));
+                    }
+                bn *= 1.0 / 16.0;
+                float shaped = mix(bn, max(bn, b), pump_blob_gate);
+                published = max(s_pump_snap_f[i], shaped);
+                #else
                 for (int dy = -1; dy <= 1; dy++)
                     for (int dx = -1; dx <= 1; dx++) {
                         int ny = clamp(cy + dy, 0, 8);
@@ -2934,9 +3005,10 @@ void hook() {
                         b += s_pump_snap_f[ny * 16 + nx]
                            * float((2 - abs(dy)) * (2 - abs(dx)));
                     }
-                pump_mask_cell[i] = max(s_pump_snap_f[i], b * (1.0 / 16.0));
+                published = max(s_pump_snap_f[i], b * (1.0 / 16.0));
+                #endif
                 #else
-                pump_mask_cell[i] = s_pump_snap_f[i];
+                published = s_pump_snap_f[i];
                 #endif
                 #if PUMP_EDGE_ESTABLISH
                 // Border mirror (vignette safety): an outer-ring cell inherits
@@ -2959,9 +3031,34 @@ void hook() {
                 int dcx = (mcx == 0) ? 1 : (mcx == 15) ? 14 : mcx;
                 if ((mcy == 0 || mcy == 8) && (mcx == 0 || mcx == 15))
                     mir = max(mir, s_pump_snap_f[dcy * 16 + dcx]);
-                pump_mask_cell[i] = max(pump_mask_cell[i], mir);
+                published = max(published, mir);
+                #endif
+                #if PUMP_MASK_FINISH && PUMP_MASK_SOFTEN && PUMP_MASK_BLOB5 && ADDITIVE_OPEN_GUARD
+                s_pump_shape[i] = published;
+                #else
+                pump_mask_cell[i] = published;
                 #endif
             }
+            #if PUMP_MASK_FINISH && PUMP_MASK_SOFTEN && PUMP_MASK_BLOB5 && ADDITIVE_OPEN_GUARD
+            // Continuous finishing blur over the already-authorized
+            // presentation field. The broad-field selector controls only the
+            // blend toward this smoother shape. Restore raw env afterwards so
+            // no proved core can be reduced by the filter.
+            for (uint i = 0u; i < 144u; i++) {
+                int cy = int(i) / 16, cx = int(i) % 16;
+                float bf = 0.0;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int ny = clamp(cy + dy, 0, 8);
+                        int nx = clamp(cx + dx, 0, 15);
+                        bf += s_pump_shape[ny * 16 + nx]
+                            * float((2 - abs(dy)) * (2 - abs(dx)));
+                    }
+                bf *= 1.0 / 16.0;
+                float finished = mix(s_pump_shape[i], bf, pump_finish_mix);
+                pump_mask_cell[i] = max(s_pump_snap_f[i], finished);
+            }
+            #endif
             // ONSET takes the gated aggregate; the release path below keeps
             // the ungated drive_loc (sign + fall ratio), so reveal
             // suppression can never manufacture a release.
@@ -4273,10 +4370,11 @@ vec4 hook() {
         ivec2 pib = ivec2(floor(pg));
         ivec2 pi0 = clamp(pib,     ivec2(0), ivec2(15, 8));
         ivec2 pi1 = clamp(pib + 1, ivec2(0), ivec2(15, 8));
-        // pump_mask_cell = the PRESENTATION mask (max-preserving 3×3 soften of
-        // the raw per-cell env — see PASS 5's PUMP_MASK_SOFTEN): rounds the
-        // bilinear diamond and fills a large event's under-driven boundary
-        // cells. The raw env (pump_env_cell) stays the dynamics state.
+        // pump_mask_cell = the PRESENTATION mask (additive: max-preserving
+        // 5×5 weighted stencil; subtractive fallback: 3×3 binomial soften —
+        // see PASS 5's PUMP_MASK_SOFTEN). It rounds the bilinear diamond and
+        // fills a large event's under-driven bright body. The raw env
+        // (pump_env_cell) stays the dynamics state.
         float m00 = pump_mask_cell[pi0.y * 16 + pi0.x];
         float m10 = pump_mask_cell[pi0.y * 16 + pi1.x];
         float m01 = pump_mask_cell[pi1.y * 16 + pi0.x];
@@ -4288,13 +4386,10 @@ vec4 hook() {
         // the scalar bakes into pump_env — an asymmetric envelope since v5.7
         // (instant rise, rate-clamped fall ~0.5s; see PASS 5's PUMP_COVER_FALL;
         // a hard cut still zeroes it instantly via the reset). pump_env itself
-        // is not consumed: pump_env ≤ cover holds BY INDUCTION (pump_env =
-        // max(held·rel·floor, gate)·cover, where the held term is a prior
-        // pump_env ≤ prior cover ≤ 1 and gate ≤ 1 — note the proof leans on
-        // cover_gate ∈ [0,1]; a future >1 boost term there would silently
-        // break it). The guarded local amplitude is mask × cover. A cell's
-        // bounded post-proof maintenance credit is already folded into mask;
-        // no scene-global signal can bypass local opening authority here.
+        // is not consumed: no scene-global amplitude can change a local
+        // light's strength or rhythm. The guarded local amplitude is mask ×
+        // cover. A cell's bounded post-proof maintenance credit is already
+        // folded into mask.
         float pump_local = pump_mask * pump_cover_gate;
         #else
         // SUBTRACTIVE: the mask (per-cell "is this region brightening" ∈[0,1]) only

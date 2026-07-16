@@ -68,6 +68,57 @@
 //
 //  == PIPELINE / SIZING =====================================================
 //   density_combine  0 = additive, 1 = multiplicative density.
+//
+//  == OUTPUT CHAIN (what the OUTPUT hook is handed) =========================
+//   grain_hdr        the player's OUTPUT transfer, NOT a look knob. libplacebo
+//                    runs OUTPUT hooks AFTER the conversion to the target
+//                    colorspace, so this pass receives target-space codes: set
+//                    1 whenever mpv's target-trc resolves to pq (an explicit
+//                    target-trc=pq, or an HDR-signalled display under
+//                    target-colorspace-hint), else 0. It is independent of
+//                    which shaders precede us. Wrong value = the model is
+//                    measured on gamma SDR source codes at LUMA but keyed and
+//                    applied onto PQ codes here: the highlight fade and black
+//                    gate both go inert and grain lands off its tone bell.
+//   grain_headroom   whether the CONTENT extends above reference white, as
+//                    opposed to grain_hdr which describes the container. Only
+//                    read when grain_hdr = 1. 1 = an upstream SDR->HDR stage
+//                    (CelFlare) expands highlights past ref white: work-domain
+//                    1.0 is paper white with real detail above, so grain fades
+//                    just ABOVE it. 0 = plain SDR carried in a PQ container:
+//                    work-domain 1.0 IS the source clip ceiling, so the SDR
+//                    clip fade and the near-clip channel clamp apply exactly
+//                    as on an SDR target. Wrong value = grain in clipped
+//                    whites (1 on SDR content) or grain shaved off real
+//                    expanded highlights (0 under CelFlare).
+//   grain_ref_white  the nit level the chain anchors SDR white to; the bridge
+//                    divides by it, so it is DESCRIPTIVE -- it must equal what
+//                    the chain actually did, not what we would prefer. Plain
+//                    mpv PQ output anchors at hdr-reference-white, which is
+//                    "auto" by default = libplacebo's BT.2408 203 nits (hence
+//                    the 203 default; measured 202.4 on this chain). shampv
+//                    syncs this from hdr-reference-white ONLY while that is
+//                    pinned numeric -- so PIN IT, and any upstream SDR->PQ
+//                    encoder's own reference white gets pinned to the same
+//                    number and the whole chain stays coherent. If an upstream
+//                    shader owns the SDR->PQ encode and you leave
+//                    hdr-reference-white on auto, nothing syncs: match that
+//                    shader's reference white here by hand or grain keys off
+//                    the wrong point on the bell. Measured invariant: a wrong
+//                    ref white is a pure KEYING error, never a colour error --
+//                    the bridge is a self-consistent inverse pair for any
+//                    value, round-tripping within 1 LSB.
+//                    Three standing limits of the bridge, all verified by
+//                    measurement and all fine under the author's pinned config
+//                    (target-prim=bt.2020, bt709 sources, target-peak 1000):
+//                    (a) the 2020->709 matrix is HARDCODED, so it assumes
+//                    target-prim=bt.2020 -- under target-prim=display-p3 (and
+//                    target-prim defaults to auto) the matrix is simply wrong;
+//                    (b) the 2.4 inverse assumes a bt709/bt1886-tagged source
+//                    (exact there; an sRGB-tagged source mis-keys ~+5.7% at
+//                    code 0.5, ~+25% at 0.06); (c) the anchor holds only while
+//                    frame peak stays under target-peak -- above it libplacebo's
+//                    spline tone map engages and shifts what we are keying off.
 // ============================================================================
 
 // shampv shader API (plain comments to libplacebo). All params are DYNAMIC:
@@ -75,7 +126,8 @@
 // to invalidate the persisted GRAIN_STATE live.
 //@shampv input sdr
 //@shampv ref-white-param grain_ref_white
-//@shampv toggle grain_hdr debug_match density_combine
+//@shampv target-trc-param grain_hdr
+//@shampv toggle grain_hdr grain_headroom debug_match density_combine
 //@shampv measures LUMA
 
 //!PARAM match_grain
@@ -163,18 +215,25 @@
 1.0
 
 //!PARAM grain_hdr
-//!DESC HDR chain mode. 1 = output is PQ BT.2020 (CelFlare SDR→HDR): keys/applies grain in SDR via a per-pixel PQ bridge, fades out above ref white · 0 = plain SDR (bit-identical).
+//!DESC Output transfer — match mpv's target-trc. 1 = PQ BT.2020 out: grain keyed/applied in SDR via a PQ bridge, fades above ref white · 0 = plain SDR (bit-identical).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
+//!PARAM grain_headroom
+//!DESC Content headroom above ref white — only used when grain_hdr = 1. 1 = upstream SDR→HDR expansion: highlights extend past ref white, grain fades just above it · 0 = plain SDR in a PQ container: ref white is the clip ceiling, SDR clip fade + near-clip channel clamp apply.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
+
 //!PARAM grain_ref_white
-//!DESC SDR reference white (nits) for the HDR bridge — match hdr-reference-white and CelFlare's cf_ref_white. Only used when grain_hdr = 1.
+//!DESC SDR reference white (nits) the output chain anchors to — match hdr-reference-white (203 = its auto anchor). Only used when grain_hdr = 1.
 //!TYPE DYNAMIC float
 //!MINIMUM 80.0
 //!MAXIMUM 480.0
-116.0
+203.0
 
 //!BUFFER GRAIN_STATE
 //!VAR float m_observed
@@ -1151,17 +1210,19 @@ void hook() {
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
 
-// --- HDR (PQ BT.2020 output) domain bridge, grain_hdr=1 — for the CelFlare
-// chain. The grain model is measured on gamma-encoded SDR source codes, but
-// under the sdr-to-hdr retag the OUTPUT pixels are true PQ BT.2020 (CelFlare
-// decodes 709, expands, gamut-maps, PQ-encodes). Bridge per pixel: PQ code ->
-// linear BT.2020 nits -> linear BT.709 -> SDR-equivalent 2.4-gamma code vs
+// --- HDR (PQ BT.2020 output) domain bridge, grain_hdr=1. The grain model is
+// measured on gamma-encoded SDR source codes at LUMA, but whenever the player
+// target is PQ (target-trc=pq, or an HDR-signalled display) the OUTPUT pixels
+// this pass receives are true PQ BT.2020: libplacebo runs OUTPUT hooks AFTER
+// the conversion to the target colorspace, so measure and apply sit in
+// different domains unless we bridge. Bridge per pixel: PQ code -> linear
+// BT.2020 nits -> linear BT.709 -> SDR-equivalent 2.4-gamma code vs
 // grain_ref_white; key + apply the model there; convert back and re-encode.
 // Grain lands exactly as the SDR path wherever the image sits at SDR levels
-// (CelFlare holds midtones) and fades to zero shortly above reference white
-// (the measured bell extrapolates; grain does not persist into expanded
-// highlight cores). ST 2084
-// constants match CelFlare's own encode so the round-trip shares a transfer.
+// and fades to zero shortly above reference white (the measured bell
+// extrapolates; grain does not persist into expanded highlight cores).
+// Standard ST 2084 constants, so the round trip shares a transfer with
+// whatever performed the PQ encode upstream.
 float pq_eotf_nits(float e) {
     float p = pow(e, 1.0 / 78.84375);
     return 10000.0 * pow(max(p - 0.8359375, 0.0)
@@ -1213,14 +1274,19 @@ float matched_grain_scale(float lum, float hdr_mode) {
     float black_lo = mix(0.0010, 0.00025, hdr_mode);
     float black_hi = mix(0.0120, 0.00600, hdr_mode);
     float black_gate = smoothstep(black_lo, black_hi, lum);
-    // SDR keeps a long shoulder through the upper midrange but reaches exact
-    // zero at code-value clip white. Leaving residual grain at a hard clip
-    // makes positive excursions disappear while negative specks survive.
-    // CelFlare/PQ retains the approved reference-white/highlight fade: there,
-    // work-domain 1.0 is paper white rather than the end of the HDR signal.
-    float sdr_white = 1.0 - smoothstep(0.45, 1.00, lum);
+    // SDR keeps a long shoulder through the upper midrange, then enters an
+    // exact near-clip dead zone. Waiting for mathematical 1.0 leaves a tiny
+    // moving tail in perceptual whites: a still screenshot hides it, while
+    // temporal playback reveals it and channel clipping makes it one-sided.
+    // The PQ path retains the approved reference-white/highlight fade ONLY
+    // when the content actually extends above ref white (grain_headroom = 1,
+    // an upstream expansion made work-domain 1.0 paper white). Plain SDR in a
+    // PQ container (grain_headroom = 0) still clips at 1.0, so it keeps the
+    // SDR fade; the black gate stays container-keyed on hdr_mode.
+    float sdr_white = 1.0 - smoothstep(0.45, 0.95, lum);
     float pq_white = 1.0 - smoothstep(0.96, 1.10, lum);
-    float protection = black_gate * mix(sdr_white, pq_white, hdr_mode);
+    float white_hdr = hdr_mode * step(0.5, grain_headroom);
+    float protection = black_gate * mix(sdr_white, pq_white, white_hdr);
     float scale = sigma / MP_FIELD_STD_OUT * protection;
     // Density multiplication contributes one factor of luma. Divide it back
     // out so the absolute master-power curve survives into shadows; the small
@@ -1477,8 +1543,9 @@ void hook() {
 
     // grain_hdr bridge: work in the measured SDR domain (see helpers above).
     // Clamp the PQ input codes — YUV->RGB overshoot above 1.0 explodes the
-    // PQ EOTF. SDR-equivalent codes may exceed 1.0 where CelFlare expanded;
-    // the tone bell extrapolates toward zero grain shortly above 1.0.
+    // PQ EOTF. SDR-equivalent codes may exceed 1.0 wherever an upstream stage
+    // expanded highlights above reference white; the tone bell extrapolates
+    // toward zero grain shortly above 1.0.
     bool hdr_bridge = grain_hdr > 0.5;
     vec3 work_rgb = color.rgb;
     if (hdr_bridge) {
@@ -1486,8 +1553,9 @@ void hook() {
                          pq_eotf_nits(clamp(color.g, 0.0, 1.0)),
                          pq_eotf_nits(clamp(color.b, 0.0, 1.0)));
         vec3 linear_709 = bt2020_to_bt709(nits / grain_ref_white);
-        // CelFlare usually remains inside the source 709 gamut, but Oklab
-        // expansion can produce valid 2020 colors outside it. A signed gamma
+        // An upstream SDR→HDR expansion usually stays inside the source 709
+        // gamut, but wide-gamut expansion can produce valid 2020 colors
+        // outside it. A signed gamma
         // extension preserves those negative intermediate 709 components so
         // the inverse/forward matrix pair remains a round trip.
         work_rgb = signed_pow(linear_709, 1.0 / 2.4);
@@ -1498,6 +1566,7 @@ void hook() {
     float tone_scale = matched_grain_scale(color_luma, hdr_mode);
     vec3 scale_vec = vec3(tone_scale);
     vec3 pre_grain = work_rgb;
+    vec3 grain_delta;
     if (density_combine > 0.5) {
         vec3 field_var = vec3(0.08318138 * 0.08318138,
                               0.06602582 * 0.06602582,
@@ -1509,7 +1578,7 @@ void hook() {
         // for the correlated DoG field.
         vec3 density_delta = exp(x - 0.5 * DENSITY_GAIN * DENSITY_GAIN
                                * tone_scale * tone_scale * field_var) - 1.0;
-        work_rgb += work_rgb * density_delta;
+        grain_delta = work_rgb * density_delta;
         // Density multiplication cannot express an absolute noise floor below
         // the 0.015 divisor. Extend only picture-bearing near-black values with
         // the same zero-mean RGB perturbation; literal black/mattes stay exact.
@@ -1522,9 +1591,37 @@ void hook() {
         float pedestal_signal = max(DENSITY_SHADOW_FLOOR
                                   - max(color_luma, 0.0), 0.0)
                               * pedestal_gate;
-        work_rgb += vec3(pedestal_signal) * density_delta;
-    } else
-        work_rgb += vsum * scale_vec;
+        grain_delta += vec3(pedestal_signal) * density_delta;
+    } else {
+        grain_delta = vsum * scale_vec;
+    }
+
+    if (!hdr_bridge || grain_headroom < 0.5) {
+        // Luma can remain below 1.0 when only one or two RGB channels are
+        // clipped. (With grain_headroom = 0 the same source clipping survives
+        // inside a PQ container at work-domain 1.0, where the encode-side
+        // ref-white clip below reproduces the display's clamp — so the same
+        // defense applies.) Letting the display clamp those channels after grain would
+        // remove positive excursions while retaining dark pits — temporally
+        // conspicuous in tinted whites even though literal RGB white already
+        // has tone_scale == 0. Limit every channel symmetrically to its code
+        // headroom. Neutral highlights progressively share the tightest upper
+        // headroom, so a tinted white with one clipped channel cannot retain
+        // chromatic flicker; saturated colors keep their unclipped channels.
+        // Under the bridge (headroom = 0) a negative signed-gamma component
+        // (out-of-709 color) gets zero headroom = zero grain on that channel;
+        // intentional — such values are fp/gamut noise for ceiling-limited content.
+        vec3 channel_headroom = max(min(pre_grain, vec3(1.0) - pre_grain),
+                                    vec3(0.0));
+        float rgb_peak = max(max(pre_grain.r, pre_grain.g), pre_grain.b);
+        float rgb_floor = min(min(pre_grain.r, pre_grain.g), pre_grain.b);
+        float neutral_highlight = smoothstep(0.80, 0.95, rgb_floor);
+        float shared_upper = max(1.0 - rgb_peak, 0.0);
+        vec3 code_headroom = mix(channel_headroom, vec3(shared_upper),
+                                 neutral_highlight);
+        grain_delta = clamp(grain_delta, -code_headroom, code_headroom);
+    }
+    work_rgb += grain_delta;
 
     if (hdr_bridge) {
         // Grain is texture, not signal: it may never push a pixel above

@@ -5,8 +5,9 @@
 // SDR/HDR x light/medium/heavy variant matrix. Separable per-channel Gaussian
 // grain (red fine, green mid, blue coarse — the chromatic-size signature) is
 // generated once per SOURCE frame on a fixed 3840x2160 grid, then composited
-// display-scaled every present. SDR and HDR (PQ BT.2020, the CelFlare chain)
-// share ONE grain model via a per-pixel PQ bridge — flip grain_hdr. Pick a baked
+// display-scaled every present. SDR and HDR (PQ BT.2020 output, i.e. mpv's
+// target-trc=pq) share ONE grain model via a per-pixel PQ bridge — flip
+// grain_hdr to match the player target. Pick a baked
 // look with grain_preset (light/medium/heavy), or set it to custom (0) and tune
 // the individual DYNAMIC grain_* knobs; grain_hdr, grain_size and grain_rate stay
 // live in any preset. All controls apply with no recompile.
@@ -27,6 +28,7 @@
 // texture is what locks the grain cadence to the source, not the display.
 
 //@shampv toggle grain_hdr
+//@shampv target-trc-param grain_hdr
 //@shampv choice grain_preset custom light medium heavy
 //@shampv active-if grain_preset 0 grain_intensity grain_saturation grain_mid grain_steepness
 
@@ -80,14 +82,14 @@
 1.0
 
 //!PARAM grain_hdr
-//!DESC HDR chain mode. 1 = output is PQ BT.2020 (CelFlare SDR→HDR): keys/applies grain in SDR via a per-pixel PQ bridge, fades out above ref white · 0 = plain SDR (bit-identical).
+//!DESC Output transfer. Set to match mpv's target-trc. 1 = output is PQ BT.2020 (target-trc=pq, or an HDR-signalled display): keys/applies grain in SDR via a per-pixel PQ bridge, fades out above ref white · 0 = plain SDR output (bit-identical).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
 //!PARAM grain_ref_white
-//!DESC SDR reference white (nits) for the HDR bridge — match hdr-reference-white and CelFlare's cf_ref_white. Only used when grain_hdr = 1.
+//!DESC SDR reference white (nits) for the HDR bridge — the level the output chain anchors SDR white to. Match hdr-reference-white; if an upstream shader owns the SDR→PQ encode, match its reference white instead. Only used when grain_hdr = 1.
 //!TYPE DYNAMIC float
 //!MINIMUM 80.0
 //!MAXIMUM 480.0
@@ -308,11 +310,12 @@ float grain_scale(float lum, float mid, float steepness) {
     return curve * protection;
 }
 
-// --- HDR (PQ BT.2020) domain bridge, grain_hdr=1 — for the CelFlare chain.
-// The grain model is authored on gamma-2.4 SDR codes, but under the SDR-to-HDR
-// retag the OUTPUT pixels are true PQ. Bridge per pixel: PQ code -> nits ->
-// SDR-equivalent 2.4 code vs grain_ref_white; key + apply the model there;
-// re-encode. ST 2084 constants match CelFlare's own encode.
+// --- HDR (PQ BT.2020) domain bridge, grain_hdr=1. The grain model is authored
+// on gamma-2.4 SDR codes, but whenever the player target is PQ the OUTPUT
+// pixels this pass receives are true PQ (libplacebo runs OUTPUT hooks after
+// the conversion to the target colorspace). Bridge per pixel: PQ code -> nits
+// -> SDR-equivalent 2.4 code vs grain_ref_white; key + apply the model there;
+// re-encode. Standard ST 2084 constants, shared with any upstream PQ encode.
 float pq_eotf_nits(float e) {
     float p = pow(e, 1.0 / 78.84375);
     return 10000.0 * pow(max(p - 0.8359375, 0.0)
@@ -387,7 +390,7 @@ void hook() {
                           grain_scale(work_rgb.b, eff_mid, eff_steep));
 
     // HDR: grain is texture, not signal — fade it to zero just ABOVE reference
-    // white (code 1.0) so CelFlare-expanded highlight cores stay clean. This is
+    // white (code 1.0) so expanded highlight cores stay clean. This is
     // the "fades above reference white" promise made explicit; it is keyed by
     // the bridged code, so it tracks grain_ref_white. The SDR-range bell
     // (code <= 1.0) and the whole SDR path (grain_hdr=0) are untouched.

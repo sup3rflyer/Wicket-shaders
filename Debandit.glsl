@@ -184,9 +184,8 @@
 //
 // Chain order: list BEFORE CelFlare in glsl-shaders (same-hook passes run
 // in load order; CelFlare's expansion multiplies any step not flattened
-// first). The previous generation is parked as Debanditv1.glsl for the
-// ongoing field A/B — same db_* PARAM names on purpose so shampv
-// profiles transfer; do not load both at once.
+// first). The previous v1.11 generation is archived outside the public
+// release repo; its db_* PARAM names remain compatible for historical A/B.
 //
 // Known limits, documented honestly:
 // - Hair-class dense structure (strand clusters every ~15px) still

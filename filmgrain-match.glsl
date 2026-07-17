@@ -1,6 +1,6 @@
 // Small-template (TPL) architecture since 2026-07-10: grain is generated into
-// a 960x540 toroidal template (texels represent 4K-scan texels) and the
-// composite assembles a virtual 3840x2160 scan from per-block randomized
+// a 960x540 toroidal template (texels represent 2160-line scan texels) and the
+// composite assembles a picture-relative 2160-line scan from per-block randomized
 // template windows, AV1-FGS style. This file is CANONICAL and hand-maintained;
 // the pre-TPL full-field A/B build is archived outside the public release repo.
 // Copyright (C) 2026 Ágúst Ari
@@ -27,11 +27,14 @@
 //            (WIDTH/HEIGHT 1 -> a single workgroup; the LUMA plane itself is
 //            untouched -- the old full-plane passthrough copy was the shader's
 //            entire measurable GPU cost at 4K). Samples HOOKED.r across the
-//            full frame and writes only GRAIN_STATE.
+//            source raster with a fixed cut/matte probe, remaps the grain
+//            observer into the committed active picture, and writes only
+//            GRAIN_STATE.
 //   PASS 2 - Compute 32x32 at LUMA: regenerates the persistent 960x540 grain
 //            template on source-grain ticks and refreshes composite scalars.
-//   PASS 3 - Compute 32x32 at OUTPUT: assembles the virtual 4K field from
-//            randomized template windows and composites it onto HOOKED.
+//   PASS 3 - Compute 32x32 at OUTPUT: assembles the picture-relative virtual
+//            field from randomized template windows and composites it only
+//            inside the committed active picture.
 //
 // Runtime params. Only match_grain / debug_match / value_warp are on keys (F3 / Ctrl+F3 /
 // Alt+F3 via shader-toggle.lua); the rest are tuned by editing the DEFAULT value under each
@@ -42,7 +45,7 @@
 //  == CONTROL ===============================================================
 //   match_grain      0 = no synthetic output, 1 = Match Grain+; observation
 //                    continues so live A/B does not cold-start.                [F3]
-//   debug_match      compact 44-row machine-readable posterior overlay.         [Ctrl+F3]
+//   debug_match      compact 51-row machine-readable posterior/geometry overlay. [Ctrl+F3]
 //   state_epoch      harness reset token; bump once per source file.
 //
 //  == GRAIN LOOK (the dials to tune by eye) =================================
@@ -64,7 +67,7 @@
 //
 //  == RESTORATION (how much grain to rebuild on degraded sources) ===========
 //   restore_gain     missing-power lane only: 0 = character complement C,
-//                    1 = adaptive Match Grain+ P, 2 = force full authority.
+//                    1 = inferred target, >1 = explicit amplitude override.
 //
 //  == PIPELINE / SIZING =====================================================
 //   density_combine  0 = additive, 1 = multiplicative density.
@@ -138,7 +141,7 @@
 1.0
 
 //!PARAM debug_match
-//!DESC Debug overlay (toggle). 1 = compact 44-row Match Grain+ posterior readout · 0 = normal output.
+//!DESC Debug overlay (toggle). 1 = compact 51-row Match Grain+ posterior/geometry readout · 0 = normal output.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
@@ -201,7 +204,7 @@
 0.25
 
 //!PARAM restore_gain
-//!DESC Missing-power authority. 0 = complement only (C) · 1 = adaptive P (strong titles rise toward 2) · 2 = force full authority · >2 evaluation override.
+//!DESC Missing-power authority. 0 = complement only (C) · 1 = inferred missing-power target · >1 = explicit restoration override.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 4.0
@@ -272,6 +275,18 @@
 //!VAR float prev_grid[4096]
 //!VAR float prev_grid_off[4096]
 //!VAR float m_source_aspect
+//!VAR float m_active_inset_x
+//!VAR float m_active_inset_y
+//!VAR float m_pending_inset_x
+//!VAR float m_pending_inset_y
+//!VAR float m_geom_streak
+//!VAR float m_geom_streak_y
+//!VAR float m_geom_known
+//!VAR float m_geom_known_y
+//!VAR float m_geom_blackout
+//!VAR float m_geom_blackout_y
+//!VAR float m_geom_changed
+//!VAR float prev_probe[4096]
 //!STORAGE
 
 //!TEXTURE GRAIN_FIELD
@@ -298,19 +313,65 @@
 #define MP_TEMP_MAX            0.002
 #define MP_HP_TO_SOURCE        1.7888544
 #define MP_MEDABS_TO_STD       1.4826022
-#define MP_COMPLEMENT_POWER    0.040
+#define MP_COMPLEMENT_POWER    0.150
 #define MP_PRIOR_SIGMA         0.00055
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
 #define MP_FIELD_STD           0.0185
-#define MP_STATE_MAGIC         0.929451
+#define MP_STATE_MAGIC         0.940451
 #define MP_MIN_BIN_SAMPLES     24u
+#define MP_BAR_DARK_MAX        0.085
+#define MP_BAR_RANGE_MAX       0.025
+#define MP_BAR_DARK_SAMPLES    36u
+#define MP_BAR_MIN_CELLS       2
+#define MP_BAR_SIGNAL_MIN      32u
+#define MP_BAR_PICTURE_RANGE   0.05
+#define MP_BAR_EDGE_PICTURE    48u
+#define MP_BAR_LEVEL_MAX       0.008
+#define MP_ACTIVE_INSET_MAX    0.24
+#define MP_BLACKOUT_CODE_MAX   0.075
+#define MP_BLACKOUT_SIGNAL_MAX 8u
+#define MP_BLACKOUT_LATCH_MAX  4.0
+#define MP_GEOM_X_BOOTSTRAP    24.0
+#define MP_GEOM_Y_BOOTSTRAP    3.0
 
 // Flattened for conservative SPIRV-Cross/D3D11 lowering.
 shared uint s_hist[MP_TONE_BINS * MP_BANDS * AMP_BINS];
 shared uint s_content_hist[AMP_BINS];
 shared uint s_luma_now[MP_TONE_BINS];
 shared uint s_luma_prev[MP_TONE_BINS];
+shared float s_probe[MP_GRID_N];
+shared uint s_row_dark[MP_GRID_H];
+shared uint s_col_dark[MP_GRID_W];
+shared float s_row_range[MP_GRID_H];
+shared float s_col_range[MP_GRID_W];
+shared float s_row_level[MP_GRID_H];
+shared float s_col_level[MP_GRID_W];
+shared float s_refine_probe[512];
+shared uint s_state_ok;
+shared uint s_prev_ready;
+shared uint s_raster_changed;
+shared uint s_picture_signal;
+shared uint s_raster_signal;
+shared uint s_probe_count;
+shared uint s_probe_changed;
+shared float s_probe_hist_l1;
+shared uint s_probe_hard_cut;
+shared uint s_history_ready;
+shared float s_active_inset_x;
+shared float s_active_inset_y;
+shared float s_candidate_inset_x;
+shared float s_candidate_inset_y;
+shared uint s_candidate_valid_x;
+shared uint s_candidate_valid_y;
+shared uint s_candidate_immediate_x;
+shared uint s_candidate_immediate_y;
+shared uint s_scan_x0;
+shared uint s_scan_x1;
+shared uint s_scan_y0;
+shared uint s_scan_y1;
+shared float s_scan_inset_x;
+shared float s_scan_inset_y;
 shared uint s_valid_count;
 shared uint s_changed_count;
 shared uint s_fine_energy;
@@ -339,8 +400,8 @@ float prior_tone_shape(int b) {
 float prior_missing_fraction(int b) {
     float q = (float(b) + 0.5) / float(MP_TONE_BINS);
     float y = q * q;
-    float d = mix(0.95, 0.85, smoothstep(0.06, 0.45, y));
-    return mix(d, 0.70, smoothstep(0.58, 1.0, y));
+    float d = mix(0.92, 0.85, smoothstep(0.06, 0.45, y));
+    return mix(d, 0.80, smoothstep(0.58, 1.0, y));
 }
 
 // Compact picture-relative observer. Its measurements update hidden title/shot
@@ -348,14 +409,24 @@ float prior_missing_fraction(int b) {
 void lean_observe() {
     uint lid = gl_LocalInvocationIndex;
     uint nthreads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
-    bool state_ok = abs(m_state_magic - MP_STATE_MAGIC) < 0.0001
-                 && abs(m_state_epoch - state_epoch) < 0.5;
-    bool prev_ready = state_ok && m_prev_ready > 0.5;
+    if (lid == 0u) {
+        bool ok = abs(m_state_magic - MP_STATE_MAGIC) < 0.0001
+               && abs(m_state_epoch - state_epoch) < 0.5;
+        float raster_aspect = HOOKED_size.x / max(HOOKED_size.y, 1.0);
+        bool raster_changed = ok && abs(m_source_aspect - raster_aspect) > 0.001;
+        s_state_ok = ok ? 1u : 0u;
+        s_raster_changed = raster_changed ? 1u : 0u;
+        s_prev_ready = (ok && m_prev_ready > 0.5 && !raster_changed) ? 1u : 0u;
+    }
+    barrier();
+    bool state_ok = s_state_ok != 0u;
+    bool prev_ready = s_prev_ready != 0u;
 
     if (!state_ok) {
         for (uint k = lid; k < uint(MP_GRID_N); k += nthreads) {
             prev_grid[k] = -1.0;
             prev_grid_off[k] = 0.0;
+            prev_probe[k] = 0.0;
         }
         if (lid == 0u) {
             m_state_magic = MP_STATE_MAGIC;
@@ -365,6 +436,17 @@ void lean_observe() {
             m_gen_frame = 0.0;
             m_field_seed = 0.0;
             m_source_aspect = HOOKED_size.x / max(HOOKED_size.y, 1.0);
+            m_active_inset_x = 0.0;
+            m_active_inset_y = 0.0;
+            m_pending_inset_x = 0.0;
+            m_pending_inset_y = 0.0;
+            m_geom_streak = 0.0;
+            m_geom_streak_y = 0.0;
+            m_geom_known = 0.0;
+            m_geom_known_y = 0.0;
+            m_geom_blackout = 0.0;
+            m_geom_blackout_y = 0.0;
+            m_geom_changed = 0.0;
             m_observed = 0.0;
             m_structure_ratio = 1.0;
             m_coverage = 0.0;
@@ -406,6 +488,537 @@ void lean_observe() {
     }
     barrier();
 
+    if (lid == 0u && s_raster_changed != 0u) {
+        m_geom_known = 0.0;
+        m_geom_known_y = 0.0;
+        m_geom_streak = 0.0;
+        m_geom_streak_y = 0.0;
+        m_geom_blackout = 0.0;
+        m_geom_blackout_y = 0.0;
+    }
+    barrier();
+
+    // A fixed full-raster probe discovers centred baked mattes and keeps cut
+    // history independent of the active-picture mapping used by the grain
+    // observer. Limited-range black arrives here near 16/255, not zero.
+    if (lid == 0u) {
+        s_picture_signal = 0u;
+        s_raster_signal = 0u;
+        s_candidate_inset_x = m_active_inset_x;
+        s_candidate_inset_y = m_active_inset_y;
+        s_candidate_valid_x = 0u;
+        s_candidate_valid_y = 0u;
+        s_candidate_immediate_x = 0u;
+        s_candidate_immediate_y = 0u;
+    }
+    barrier();
+    for (uint k = lid; k < uint(MP_GRID_N); k += nthreads) {
+        uint gx = k % uint(MP_GRID_W);
+        uint gy = k / uint(MP_GRID_W);
+        vec2 probe_uv = (vec2(float(gx), float(gy)) + 0.5)
+                      / vec2(float(MP_GRID_W), float(MP_GRID_H));
+        float c = measure_luma(probe_uv);
+        s_probe[k] = c;
+        if (c > MP_BLACKOUT_CODE_MAX)
+            atomicAdd(s_raster_signal, 1u);
+        if (gx >= 16u && gx < 48u && gy >= 16u && gy < 48u
+            && c > 0.10)
+            atomicAdd(s_picture_signal, 1u);
+    }
+    barrier();
+
+    if (lid == 0u) {
+        s_scan_inset_x = clamp(m_active_inset_x, 0.0, MP_ACTIVE_INSET_MAX);
+        s_scan_inset_y = clamp(m_active_inset_y, 0.0, MP_ACTIVE_INSET_MAX);
+        s_scan_x0 = uint(floor(s_scan_inset_x * float(MP_GRID_W) + 0.5));
+        s_scan_y0 = uint(floor(s_scan_inset_y * float(MP_GRID_H) + 0.5));
+        s_scan_x1 = uint(MP_GRID_W) - s_scan_x0;
+        s_scan_y1 = uint(MP_GRID_H) - s_scan_y0;
+    }
+    barrier();
+
+    if (lid < uint(MP_GRID_H)) {
+        uint dark = 0u;
+        float lo = 1.0;
+        float hi = 0.0;
+        float sum = 0.0;
+        for (uint x = s_scan_x0; x < s_scan_x1; x++) {
+            float c = s_probe[int(lid) * MP_GRID_W + int(x)];
+            if (c < MP_BAR_DARK_MAX) {
+                dark++;
+                sum += c;
+                lo = min(lo, c);
+                hi = max(hi, c);
+            }
+        }
+        s_row_dark[lid] = dark;
+        s_row_range[lid] = max(hi - lo, 0.0);
+        s_row_level[lid] = sum / max(float(dark), 1.0);
+    }
+    if (lid < uint(MP_GRID_W)) {
+        uint dark = 0u;
+        float lo = 1.0;
+        float hi = 0.0;
+        float sum = 0.0;
+        for (uint y = s_scan_y0; y < s_scan_y1; y++) {
+            float c = s_probe[int(y) * MP_GRID_W + int(lid)];
+            if (c < MP_BAR_DARK_MAX) {
+                dark++;
+                sum += c;
+                lo = min(lo, c);
+                hi = max(hi, c);
+            }
+        }
+        s_col_dark[lid] = dark;
+        s_col_range[lid] = max(hi - lo, 0.0);
+        s_col_level[lid] = sum / max(float(dark), 1.0);
+    }
+    barrier();
+
+    if (lid == 0u) {
+        uint row_span = max(s_scan_x1 - s_scan_x0, 1u);
+        uint col_span = max(s_scan_y1 - s_scan_y0, 1u);
+        uint row_matte_min = (row_span * MP_BAR_DARK_SAMPLES + 63u) / 64u;
+        uint col_matte_min = (col_span * MP_BAR_DARK_SAMPLES + 63u) / 64u;
+        uint row_picture_dark = (row_span * MP_BAR_EDGE_PICTURE + 63u) / 64u;
+        uint col_picture_dark = (col_span * MP_BAR_EDGE_PICTURE + 63u) / 64u;
+        int top = 0;
+        int bottom = 0;
+        int left = 0;
+        int right = 0;
+        for (int y = 0; y < MP_GRID_H / 2; y++) {
+            bool matte = s_row_dark[y] >= row_matte_min
+                      && s_row_range[y] <= MP_BAR_RANGE_MAX
+                      && abs(s_row_level[y] - s_row_level[0])
+                         <= MP_BAR_LEVEL_MAX;
+            if (!matte) break;
+            top++;
+        }
+        for (int y = MP_GRID_H - 1; y >= MP_GRID_H / 2; y--) {
+            bool matte = s_row_dark[y] >= row_matte_min
+                      && s_row_range[y] <= MP_BAR_RANGE_MAX
+                      && abs(s_row_level[y] - s_row_level[MP_GRID_H - 1])
+                         <= MP_BAR_LEVEL_MAX;
+            if (!matte) break;
+            bottom++;
+        }
+        for (int x = 0; x < MP_GRID_W / 2; x++) {
+            bool matte = s_col_dark[x] >= col_matte_min
+                      && s_col_range[x] <= MP_BAR_RANGE_MAX
+                      && abs(s_col_level[x] - s_col_level[0])
+                         <= MP_BAR_LEVEL_MAX;
+            if (!matte) break;
+            left++;
+        }
+        for (int x = MP_GRID_W - 1; x >= MP_GRID_W / 2; x--) {
+            bool matte = s_col_dark[x] >= col_matte_min
+                      && s_col_range[x] <= MP_BAR_RANGE_MAX
+                      && abs(s_col_level[x] - s_col_level[MP_GRID_W - 1])
+                         <= MP_BAR_LEVEL_MAX;
+            if (!matte) break;
+            right++;
+        }
+
+        int top_support = 0, bottom_support = 0;
+        int left_support = 0, right_support = 0;
+        int full_top_support = 0, full_bottom_support = 0;
+        int full_left_support = 0, full_right_support = 0;
+        for (int d = 0; d < 3; d++) {
+            int yt = min(top + d, MP_GRID_H - 1);
+            int yb = max(MP_GRID_H - 1 - bottom - d, 0);
+            int xl = min(left + d, MP_GRID_W - 1);
+            int xr = max(MP_GRID_W - 1 - right - d, 0);
+            if (s_row_dark[yt] < row_picture_dark) top_support++;
+            if (s_row_dark[yb] < row_picture_dark) bottom_support++;
+            if (s_col_dark[xl] < col_picture_dark) left_support++;
+            if (s_col_dark[xr] < col_picture_dark) right_support++;
+            if (s_row_dark[d] < row_picture_dark) full_top_support++;
+            if (s_row_dark[MP_GRID_H - 1 - d] < row_picture_dark)
+                full_bottom_support++;
+            if (s_col_dark[d] < col_picture_dark) full_left_support++;
+            if (s_col_dark[MP_GRID_W - 1 - d] < col_picture_dark)
+                full_right_support++;
+        }
+
+        float picture_lo = 1.0;
+        float picture_hi = 0.0;
+        for (int y = 16; y < 48; y++) {
+            for (int x = 16; x < 48; x++) {
+                float c = s_probe[y * MP_GRID_W + x];
+                picture_lo = min(picture_lo, c);
+                picture_hi = max(picture_hi, c);
+            }
+        }
+        bool signal_ok = s_picture_signal >= MP_BAR_SIGNAL_MIN
+                      && picture_hi - picture_lo >= MP_BAR_PICTURE_RANGE;
+        float coarse_y = float(min(top, bottom)) / float(MP_GRID_H);
+        float coarse_x = float(min(left, right)) / float(MP_GRID_W);
+        bool bars_y = signal_ok && top >= MP_BAR_MIN_CELLS
+                   && bottom >= MP_BAR_MIN_CELLS
+                   && abs(top - bottom) <= 8
+                   && coarse_y <= MP_ACTIVE_INSET_MAX
+                   && (top_support >= 2 || bottom_support >= 2);
+        bool bars_x = signal_ok && left >= MP_BAR_MIN_CELLS
+                   && right >= MP_BAR_MIN_CELLS
+                   && abs(left - right) <= 8
+                   && coarse_x <= MP_ACTIVE_INSET_MAX
+                   && (left_support >= 2 || right_support >= 2);
+        bool full_y = signal_ok && !bars_y
+                   && full_top_support >= 2 && full_bottom_support >= 2;
+        bool full_x = signal_ok && !bars_x
+                   && full_left_support >= 2 && full_right_support >= 2;
+
+        if (bars_x) {
+            s_candidate_inset_x = coarse_x;
+            s_candidate_valid_x = 1u;
+            s_candidate_immediate_x = (min(left, right) >= 4
+                                    && abs(left - right) <= 1) ? 1u : 0u;
+        } else if (full_x) {
+            s_candidate_inset_x = 0.0;
+            s_candidate_valid_x = 1u;
+            s_candidate_immediate_x = 1u;
+        }
+        if (bars_y) {
+            s_candidate_inset_y = coarse_y;
+            s_candidate_valid_y = 1u;
+            s_candidate_immediate_y = (min(top, bottom) >= 4
+                                    && abs(top - bottom) <= 1) ? 1u : 0u;
+        } else if (full_y) {
+            s_candidate_inset_y = 0.0;
+            s_candidate_valid_y = 1u;
+            s_candidate_immediate_y = 1u;
+        }
+    }
+    barrier();
+
+    // Refine a coarse 1/64 edge inside its transition cell. Sixteen samples
+    // across each of eight sub-rows/sub-columns retain subtitle tolerance while
+    // reducing active-height error to about one source pixel at 1080p.
+    if (lid < 512u) {
+        uint side = lid / 128u;
+        uint q = lid % 128u;
+        uint step = q / 16u;
+        uint across = q % 16u;
+        float across_uv = (float(across) + 0.5) / 16.0;
+        vec2 uv = vec2(across_uv);
+        float offset = ((float(step) + 0.5) / 8.0 - 0.5)
+                     / float(MP_GRID_H);
+        bool enabled = false;
+        if (side == 0u && s_candidate_valid_y != 0u
+            && s_candidate_inset_y > 0.0) {
+            uv.x = s_scan_inset_x
+                 + across_uv * (1.0 - 2.0 * s_scan_inset_x);
+            uv.y = s_candidate_inset_y + offset;
+            enabled = true;
+        } else if (side == 1u && s_candidate_valid_y != 0u
+                   && s_candidate_inset_y > 0.0) {
+            uv.x = s_scan_inset_x
+                 + across_uv * (1.0 - 2.0 * s_scan_inset_x);
+            uv.y = 1.0 - (s_candidate_inset_y + offset);
+            enabled = true;
+        } else if (side == 2u && s_candidate_valid_x != 0u
+            && s_candidate_inset_x > 0.0) {
+            uv.x = s_candidate_inset_x + offset;
+            uv.y = s_scan_inset_y
+                 + across_uv * (1.0 - 2.0 * s_scan_inset_y);
+            enabled = true;
+        } else if (side == 3u && s_candidate_valid_x != 0u
+            && s_candidate_inset_x > 0.0) {
+            uv.x = 1.0 - (s_candidate_inset_x + offset);
+            uv.y = s_scan_inset_y
+                 + across_uv * (1.0 - 2.0 * s_scan_inset_y);
+            enabled = true;
+        }
+        s_refine_probe[lid] = enabled ? measure_luma(uv) : 1.0;
+    }
+    barrier();
+
+    if (lid == 0u) {
+        if (s_candidate_valid_y != 0u && s_candidate_inset_y > 0.0) {
+            int top_steps = 0;
+            int bottom_steps = 0;
+            for (int step = 0; step < 8; step++) {
+                uint dark_t = 0u;
+                uint dark_b = 0u;
+                float lo_t = 1.0, hi_t = 0.0;
+                float lo_b = 1.0, hi_b = 0.0;
+                float sum_t = 0.0, sum_b = 0.0;
+                for (int x = 0; x < 16; x++) {
+                    float ct = s_refine_probe[step * 16 + x];
+                    float cb = s_refine_probe[128 + step * 16 + x];
+                    if (ct < MP_BAR_DARK_MAX) {
+                        dark_t++;
+                        sum_t += ct;
+                        lo_t = min(lo_t, ct); hi_t = max(hi_t, ct);
+                    }
+                    if (cb < MP_BAR_DARK_MAX) {
+                        dark_b++;
+                        sum_b += cb;
+                        lo_b = min(lo_b, cb); hi_b = max(hi_b, cb);
+                    }
+                }
+                bool mt = dark_t >= 10u
+                       && max(hi_t - lo_t, 0.0) <= MP_BAR_RANGE_MAX
+                       && abs(sum_t / max(float(dark_t), 1.0)
+                            - s_row_level[0]) <= MP_BAR_LEVEL_MAX;
+                bool mb = dark_b >= 10u
+                       && max(hi_b - lo_b, 0.0) <= MP_BAR_RANGE_MAX
+                       && abs(sum_b / max(float(dark_b), 1.0)
+                            - s_row_level[MP_GRID_H - 1]) <= MP_BAR_LEVEL_MAX;
+                if (mt && top_steps == step) top_steps++;
+                if (mb && bottom_steps == step) bottom_steps++;
+            }
+            float refine_sum = 0.0;
+            float refine_count = 0.0;
+            if (top_steps > 0 && top_steps < 8) {
+                refine_sum += (float(top_steps) - 0.5) / 8.0 - 0.5;
+                refine_count += 1.0;
+            }
+            if (bottom_steps > 0 && bottom_steps < 8) {
+                refine_sum += (float(bottom_steps) - 0.5) / 8.0 - 0.5;
+                refine_count += 1.0;
+            }
+            if (refine_count > 0.0) {
+                s_candidate_inset_y += refine_sum / refine_count
+                                     / float(MP_GRID_H);
+            }
+        }
+        if (s_candidate_valid_x != 0u && s_candidate_inset_x > 0.0) {
+            int left_steps = 0;
+            int right_steps = 0;
+            for (int step = 0; step < 8; step++) {
+                uint dark_l = 0u;
+                uint dark_r = 0u;
+                float lo_l = 1.0, hi_l = 0.0;
+                float lo_r = 1.0, hi_r = 0.0;
+                float sum_l = 0.0, sum_r = 0.0;
+                for (int y = 0; y < 16; y++) {
+                    float cl = s_refine_probe[256 + step * 16 + y];
+                    float cr = s_refine_probe[384 + step * 16 + y];
+                    if (cl < MP_BAR_DARK_MAX) {
+                        dark_l++;
+                        sum_l += cl;
+                        lo_l = min(lo_l, cl); hi_l = max(hi_l, cl);
+                    }
+                    if (cr < MP_BAR_DARK_MAX) {
+                        dark_r++;
+                        sum_r += cr;
+                        lo_r = min(lo_r, cr); hi_r = max(hi_r, cr);
+                    }
+                }
+                bool ml = dark_l >= 10u
+                       && max(hi_l - lo_l, 0.0) <= MP_BAR_RANGE_MAX
+                       && abs(sum_l / max(float(dark_l), 1.0)
+                            - s_col_level[0]) <= MP_BAR_LEVEL_MAX;
+                bool mr = dark_r >= 10u
+                       && max(hi_r - lo_r, 0.0) <= MP_BAR_RANGE_MAX
+                       && abs(sum_r / max(float(dark_r), 1.0)
+                            - s_col_level[MP_GRID_W - 1]) <= MP_BAR_LEVEL_MAX;
+                if (ml && left_steps == step) left_steps++;
+                if (mr && right_steps == step) right_steps++;
+            }
+            float refine_sum = 0.0;
+            float refine_count = 0.0;
+            if (left_steps > 0 && left_steps < 8) {
+                refine_sum += (float(left_steps) - 0.5) / 8.0 - 0.5;
+                refine_count += 1.0;
+            }
+            if (right_steps > 0 && right_steps < 8) {
+                refine_sum += (float(right_steps) - 0.5) / 8.0 - 0.5;
+                refine_count += 1.0;
+            }
+            if (refine_count > 0.0) {
+                s_candidate_inset_x += refine_sum / refine_count
+                                     / float(MP_GRID_W);
+            }
+        }
+        s_candidate_inset_x = clamp(s_candidate_inset_x, 0.0,
+                                    MP_ACTIVE_INSET_MAX);
+        s_candidate_inset_y = clamp(s_candidate_inset_y, 0.0,
+                                    MP_ACTIVE_INSET_MAX);
+        // A one-frame subtitle/logo can obscure an otherwise stable pending
+        // edge exactly on a cut. Preserve that rectangle for cut normalization
+        // while keeping candidate validity false for commit authority.
+        if (s_candidate_valid_x == 0u
+            && m_geom_streak >= MP_GEOM_X_BOOTSTRAP)
+            s_candidate_inset_x = m_pending_inset_x;
+        if (s_candidate_valid_y == 0u
+            && m_geom_streak_y >= MP_GEOM_Y_BOOTSTRAP)
+            s_candidate_inset_y = m_pending_inset_y;
+    }
+    barrier();
+
+    // Fixed-coordinate cut evidence is normalized by the selected picture
+    // rectangle, so static baked bars cannot cap the changed fraction.
+    if (lid == 0u) {
+        s_probe_count = 0u;
+        s_probe_changed = 0u;
+    }
+    for (uint k = lid; k < uint(MP_TONE_BINS); k += nthreads) {
+        s_luma_now[k] = 0u;
+        s_luma_prev[k] = 0u;
+    }
+    barrier();
+    for (uint k = lid; k < uint(MP_GRID_N); k += nthreads) {
+        uint gx = k % uint(MP_GRID_W);
+        uint gy = k / uint(MP_GRID_W);
+        float cut_ix = s_candidate_inset_x;
+        float cut_iy = s_candidate_inset_y;
+        int x0 = int(floor(cut_ix * float(MP_GRID_W) + 0.5));
+        int y0 = int(floor(cut_iy * float(MP_GRID_H) + 0.5));
+        bool inside = int(gx) >= x0 && int(gx) < MP_GRID_W - x0
+                   && int(gy) >= y0 && int(gy) < MP_GRID_H - y0;
+        float c = s_probe[k];
+        float p = prev_ready ? prev_probe[k] : c;
+        if (inside) {
+            atomicAdd(s_probe_count, 1u);
+            atomicAdd(s_luma_now[tone_bin(c)], 1u);
+            atomicAdd(s_luma_prev[tone_bin(p)], 1u);
+            if (prev_ready && abs(c - p) > 0.018)
+                atomicAdd(s_probe_changed, 1u);
+        }
+        prev_probe[k] = c;
+    }
+    barrier();
+
+    if (lid == 0u) {
+        float probe_count = max(float(s_probe_count), 1.0);
+        float probe_changed = prev_ready
+                            ? float(s_probe_changed) / probe_count : 0.0;
+        float probe_hist = 0.0;
+        if (prev_ready) {
+            for (int b = 0; b < MP_TONE_BINS; b++)
+                probe_hist += abs(float(s_luma_now[b])
+                                - float(s_luma_prev[b]));
+            probe_hist /= probe_count;
+        }
+        bool hard_cut = prev_ready && probe_changed > 0.75
+                     && probe_hist > 0.25;
+
+        float cell_x = 1.0 / float(MP_GRID_W);
+        float cell_y = 1.0 / float(MP_GRID_H);
+        bool pending_ready_x = m_geom_streak >= MP_GEOM_X_BOOTSTRAP;
+        bool pending_ready_y = m_geom_streak_y >= MP_GEOM_Y_BOOTSTRAP;
+        bool pending_match_y = pending_ready_y
+                            && s_candidate_valid_y != 0u
+                            && abs(s_candidate_inset_y - m_pending_inset_y)
+                               <= 0.5 * cell_y;
+        bool blackout_frame = s_raster_signal <= MP_BLACKOUT_SIGNAL_MAX;
+        bool blackout_armed_x = m_geom_blackout >= 3.0;
+        bool blackout_armed_y = m_geom_blackout_y >= 3.0;
+        if (blackout_frame) {
+            m_geom_blackout = min(m_geom_blackout + 1.0,
+                                   MP_BLACKOUT_LATCH_MAX);
+            m_geom_blackout_y = min(m_geom_blackout_y + 1.0,
+                                     MP_BLACKOUT_LATCH_MAX);
+        }
+
+        bool valid_x = s_candidate_valid_x != 0u;
+        bool valid_y = s_candidate_valid_y != 0u;
+        bool diff_x = valid_x
+                   && abs(s_candidate_inset_x - m_active_inset_x)
+                      > 0.5 * cell_x;
+        bool diff_y = valid_y
+                   && abs(s_candidate_inset_y - m_active_inset_y)
+                      > 0.5 * cell_y;
+        if (!blackout_frame && valid_x)
+            m_geom_blackout = diff_x
+                            ? max(m_geom_blackout - 1.0, 0.0) : 0.0;
+        if (!blackout_frame && valid_y)
+            m_geom_blackout_y = diff_y
+                              ? max(m_geom_blackout_y - 1.0, 0.0) : 0.0;
+
+        if (diff_x) {
+            bool same = abs(s_candidate_inset_x - m_pending_inset_x)
+                      <= 0.5 * cell_x;
+            if (same)
+                m_geom_streak = min(m_geom_streak + 1.0, 65535.0);
+            else {
+                m_pending_inset_x = s_candidate_inset_x;
+                m_geom_streak = 1.0;
+            }
+        } else if (valid_x) {
+            m_pending_inset_x = m_active_inset_x;
+            m_geom_streak = 0.0;
+            m_geom_known = 1.0;
+        } else {
+            m_geom_streak = max(m_geom_streak - 1.0, 0.0);
+        }
+
+        if (diff_y) {
+            bool same = abs(s_candidate_inset_y - m_pending_inset_y)
+                      <= 0.5 * cell_y;
+            if (same)
+                m_geom_streak_y = min(m_geom_streak_y + 1.0, 65535.0);
+            else {
+                m_pending_inset_y = s_candidate_inset_y;
+                m_geom_streak_y = 1.0;
+            }
+        } else if (valid_y) {
+            m_pending_inset_y = m_active_inset_y;
+            m_geom_streak_y = 0.0;
+            m_geom_known_y = 1.0;
+        } else {
+            m_geom_streak_y = max(m_geom_streak_y - 1.0, 0.0);
+        }
+
+        bool commit_x = false;
+        bool commit_y = false;
+        float commit_inset_x = s_candidate_inset_x;
+        float commit_inset_y = s_candidate_inset_y;
+        if (diff_x) {
+            commit_x = ((!prev_ready && s_candidate_immediate_x != 0u)
+                     || ((hard_cut || blackout_armed_x)
+                         && s_candidate_immediate_x != 0u)
+                     || (m_geom_known < 0.5
+                         && m_geom_streak >= MP_GEOM_X_BOOTSTRAP));
+        } else if (hard_cut && !valid_x && pending_ready_x
+                   && abs(m_pending_inset_x - m_active_inset_x)
+                      > 0.5 * cell_x) {
+            commit_x = true;
+            commit_inset_x = m_pending_inset_x;
+        }
+        if (diff_y) {
+            commit_y = ((!prev_ready && s_candidate_immediate_y != 0u)
+                     || (hard_cut
+                         && (s_candidate_immediate_y != 0u
+                             || pending_match_y))
+                     || blackout_armed_y
+                     || (m_geom_known_y < 0.5
+                         && m_geom_streak_y >= MP_GEOM_Y_BOOTSTRAP));
+        } else if (hard_cut && !valid_y && pending_ready_y
+                   && abs(m_pending_inset_y - m_active_inset_y)
+                      > 0.5 * cell_y) {
+            commit_y = true;
+            commit_inset_y = m_pending_inset_y;
+        }
+
+        bool commit = commit_x || commit_y;
+        if (commit_x) {
+            m_active_inset_x = clamp(commit_inset_x, 0.0,
+                                     MP_ACTIVE_INSET_MAX);
+            m_pending_inset_x = m_active_inset_x;
+            m_geom_streak = 0.0;
+            m_geom_known = 1.0;
+            m_geom_blackout = 0.0;
+        }
+        if (commit_y) {
+            m_active_inset_y = clamp(commit_inset_y, 0.0,
+                                     MP_ACTIVE_INSET_MAX);
+            m_pending_inset_y = m_active_inset_y;
+            m_geom_streak_y = 0.0;
+            m_geom_known_y = 1.0;
+            m_geom_blackout_y = 0.0;
+        }
+        s_active_inset_x = m_active_inset_x;
+        s_active_inset_y = m_active_inset_y;
+        s_probe_hist_l1 = probe_hist;
+        s_probe_hard_cut = hard_cut ? 1u : 0u;
+        s_history_ready = (prev_ready && !commit) ? 1u : 0u;
+        m_geom_changed = commit ? 1.0 : 0.0;
+    }
+    barrier();
+
     if (lid == 0u) {
         s_valid_count = 0u;
         s_changed_count = 0u;
@@ -420,19 +1033,17 @@ void lean_observe() {
         s_hist[k] = 0u;
     for (uint k = lid; k < uint(AMP_BINS); k += nthreads)
         s_content_hist[k] = 0u;
-    for (uint k = lid; k < uint(MP_TONE_BINS); k += nthreads) {
-        s_luma_now[k] = 0u;
-        s_luma_prev[k] = 0u;
-    }
     barrier();
 
     // Offsets are picture-height-relative virtual-4K coordinates. Derive the
     // horizontal UV pitch from the actual LUMA raster aspect so the crosses
     // remain isotropic on 4:3, scope and portrait sources instead of silently
     // assuming 3840x2160. Three nested crosses provide a compact spectral body.
-    float uvx_per_vtex = HOOKED_size.y
+    vec2 active_inset = vec2(s_active_inset_x, s_active_inset_y);
+    vec2 active_extent = vec2(1.0) - 2.0 * active_inset;
+    float uvx_per_vtex = active_extent.y * HOOKED_size.y
                        / max(HOOKED_size.x * 2160.0, 1.0);
-    const float uvy_per_vtex = 1.0 / 2160.0;
+    float uvy_per_vtex = active_extent.y / 2160.0;
     vec2 dx1 = vec2(2.0 * uvx_per_vtex, 0.0);
     vec2 dy1 = vec2(0.0, 2.0 * uvy_per_vtex);
     vec2 dx3 = vec2(6.0 * uvx_per_vtex, 0.0);
@@ -441,9 +1052,10 @@ void lean_observe() {
     vec2 dy6 = vec2(0.0, 12.0 * uvy_per_vtex);
 
     for (uint k = lid; k < uint(MP_GRID_N); k += nthreads) {
-        vec2 uv = (vec2(float(k % uint(MP_GRID_W)),
-                        float(k / uint(MP_GRID_W))) + 0.5)
-                / vec2(float(MP_GRID_W), float(MP_GRID_H));
+        vec2 grid_uv = (vec2(float(k % uint(MP_GRID_W)),
+                             float(k / uint(MP_GRID_W))) + 0.5)
+                     / vec2(float(MP_GRID_W), float(MP_GRID_H));
+        vec2 uv = active_inset + grid_uv * active_extent;
         float c = measure_luma(uv);
         float xm1 = measure_luma(uv - dx1);
         float xp1 = measure_luma(uv + dx1);
@@ -466,16 +1078,13 @@ void lean_observe() {
         float band2 = lp3 - lp6;
         float edge = 0.25 * (abs(xp6 - xm6) + abs(yp6 - ym6));
         bool flat_ok = c > 0.002 && c < 0.985 && edge < 0.026;
-        bool prev_flat = prev_ready && prev_grid[k] > 0.0;
-        float prev_c = prev_ready ? max(abs(prev_grid[k]) - 1.0, 0.0) : c;
+        bool prev_flat = s_history_ready != 0u && prev_grid[k] > 0.0;
+        float prev_c = (s_history_ready != 0u)
+                     ? max(abs(prev_grid[k]) - 1.0, 0.0) : c;
 
         int now_lb = tone_bin(c);
-        atomicAdd(s_luma_now[now_lb], 1u);
-        if (prev_ready) {
-            atomicAdd(s_luma_prev[tone_bin(prev_c)], 1u);
-            if (abs(c - prev_c) > 0.018)
-                atomicAdd(s_changed_count, 1u);
-        }
+        if (s_history_ready != 0u && abs(c - prev_c) > 0.018)
+            atomicAdd(s_changed_count, 1u);
 
         // One continuous delivery-rolloff observation over all content. This is
         // deliberately not a classifier: it merely records how much of the local
@@ -582,16 +1191,12 @@ void lean_observe() {
         float structure_ratio = float(s_structure_fine)
                               / max(float(s_structure_broad), 1.0);
         float coverage = float(s_valid_count) / float(MP_GRID_N);
-        float changed = prev_ready
+        float changed = (s_history_ready != 0u)
                       ? float(s_changed_count) / float(MP_GRID_N) : 0.0;
-        float hist_l1 = 0.0;
-        if (prev_ready) {
-            for (int b = 0; b < MP_TONE_BINS; b++)
-                hist_l1 += abs(float(s_luma_now[b]) - float(s_luma_prev[b]));
-            hist_l1 /= float(MP_GRID_N);
-        }
-        bool hard_cut = prev_ready && changed > 0.75 && hist_l1 > 0.25;
+        float hist_l1 = s_probe_hist_l1;
+        bool hard_cut = s_probe_hard_cut != 0u;
         bool shot_boundary = !prev_ready || hard_cut;
+        bool geometry_only = m_geom_changed > 0.5 && !shot_boundary;
 
         // Temporal similarity supplies authority, not amount. It gates title
         // learning and shot refinement but never provides a master-power target.
@@ -600,7 +1205,7 @@ void lean_observe() {
         float q_random = 1.0 - smoothstep(0.35, 0.90,
                                           abs(log2(max(temporal_ratio, 0.01))));
         float q_still = 1.0 - smoothstep(0.03, 0.18, changed);
-        float static_gate = (prev_ready && !hard_cut)
+        float static_gate = (s_history_ready != 0u && !hard_cut)
                           ? q_cov * q_random * q_still : 0.0;
         float evidence = q_amp * static_gate;
 
@@ -608,7 +1213,6 @@ void lean_observe() {
         // A picture-population mean of sigma would confuse composition/exposure
         // with noise sensitivity, especially across bright/dark cuts.
         float gain_log_sum = 0.0;
-        float sigma_log_sum = 0.0;
         float gain_weight = 0.0;
         for (int b = 0; b < MP_TONE_BINS; b++) {
             float sigma0 = sigma_band[b * MP_BANDS];
@@ -619,14 +1223,11 @@ void lean_observe() {
                 float ratio = sigma0 * sigma0
                             / max(m_master_p[b], 1.0e-10);
                 gain_log_sum += w * log2(clamp(ratio, 0.25, 16.0));
-                sigma_log_sum += w * log2(max(sigma0, 1.0e-6));
                 gain_weight += w;
             }
         }
         float frame_gain_est = (gain_weight > 0.0)
                              ? exp2(gain_log_sum / gain_weight) : 1.0;
-        float frame_sigma_est = (gain_weight > 0.0)
-                              ? exp2(sigma_log_sum / gain_weight) : 0.0;
         float gain_weight_support = smoothstep(0.50, 2.0, gain_weight);
         // q_random is a continuous learning weight. Shot presentation uses a
         // steeper confidence curve: once temporal behaviour is convincingly
@@ -645,42 +1246,109 @@ void lean_observe() {
             m_title_conf += 0.005 * evidence * (1.0 - m_title_conf);
         }
 
+        // Grain presence is a title property, not eight independent detection
+        // gates. One temporally authenticated tone may establish the title-wide
+        // base; unavailable tones then inherit the same film-shaped curve. Only
+        // sustained, broadly observable near-zero evidence may pull that base
+        // down. Ambiguous, moving and boundary evidence leave it unchanged.
+        float prior_base_p = MP_PRIOR_SIGMA * MP_PRIOR_SIGMA;
+        float presence_rise = 0.0;
+        float presence_auth = 0.0;
+        float max_master_w = 0.0;
+        float clean_peak = 0.0;
+        float represented_peak = 0.0;
+        int clean_bins = 0;
+        int clean_first = MP_TONE_BINS;
+        int clean_last = -1;
+        for (int b = 0; b < MP_TONE_BINS; b++) {
+            float sigma0 = sigma_band[b * MP_BANDS];
+            float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
+            float amp_r = smoothstep(0.00012, 0.00070, sigma0);
+            float reliability = count_r * amp_r * q_cov * q_random * q_still;
+            float master_auth = smoothstep(0.10, 0.35, m_master_w[b])
+                              * smoothstep(0.08, 0.20, m_title_conf);
+            if (reliability > 0.0 && master_auth > 0.0) {
+                float shape = prior_tone_shape(b);
+                float candidate_gain = m_master_p[b]
+                                     / max(shape * shape * prior_base_p,
+                                           1.0e-12);
+                // Presence propagates only a conservative fraction of the
+                // measured bin's level. The measured bin keeps its full local
+                // master below; a peak is not copied wholesale across tones.
+                float borrowed_gain = min(3.24,
+                                          1.0 + 0.35
+                                          * max(candidate_gain - 1.0, 0.0));
+                float candidate = borrowed_gain * prior_base_p;
+                float candidate_auth = reliability * master_auth;
+                float rise = candidate_auth
+                           * max(candidate - m_title_power, 0.0);
+                if (rise > presence_rise) {
+                    presence_rise = rise;
+                    presence_auth = candidate_auth;
+                }
+            }
+            max_master_w = max(max_master_w, m_master_w[b]);
+
+            if (tone_count[b] >= MP_MIN_BIN_SAMPLES)
+                represented_peak = max(represented_peak, sigma0);
+
+            if (tone_count[b] >= 96u) {
+                clean_bins++;
+                clean_first = min(clean_first, b);
+                clean_last = max(clean_last, b);
+                clean_peak = max(clean_peak, sigma0);
+            }
+        }
+        bool broad_clean = clean_bins >= 3
+                        && clean_last - clean_first >= 2
+                        && coverage >= 0.35
+                        && q_still >= 0.80
+                        && clean_peak <= 0.00018
+                        && represented_peak <= 0.00030
+                        && temporal <= 0.00012
+                        && observed <= 0.00030
+                        && m_title_conf < 0.10
+                        && max_master_w < 0.15;
+        float clean_q = broad_clean
+                      ? smoothstep(0.35, 0.55, coverage)
+                      * smoothstep(0.80, 1.0, q_still)
+                      * (1.0 - smoothstep(0.00012, 0.00018, clean_peak))
+                      * (1.0 - smoothstep(0.00008, 0.00012, temporal))
+                      * (1.0 - smoothstep(0.00018, 0.00030, observed))
+                      : 0.0;
+        bool title_update_ok = s_history_ready != 0u
+                            && !shot_boundary && !geometry_only
+                            && m_shot_age >= 24.0;
+        float presence_drive = 0.0;
+        float clean_drive = 0.0;
+        if (title_update_ok && presence_rise > 0.0) {
+            m_title_power += 0.010 * presence_rise;
+            presence_drive = presence_auth;
+        } else if (title_update_ok && clean_q > 0.0) {
+            m_title_power = mix(m_title_power, 0.04 * prior_base_p,
+                                0.002 * clean_q);
+            clean_drive = clean_q;
+        }
+        m_title_power = clamp(m_title_power, 0.04 * prior_base_p,
+                              3.24 * prior_base_p);
+
         // A real cut commits only the authenticated title presentation. Spatial
         // evidence on the boundary cannot distinguish grain from picture texture;
         // the next three frames are the sole fast refinement window for proving
         // shot-local sensitivity and character temporally.
-        float title_mid_sigma = 0.0;
-        float prior_mid_sigma = 0.0;
-        for (int b = 2; b <= 5; b++) {
-            title_mid_sigma += sqrt(max(m_master_p[b], 0.0));
-            prior_mid_sigma += MP_PRIOR_SIGMA * prior_tone_shape(b);
-        }
-        float title_ratio = title_mid_sigma
-                          / max(prior_mid_sigma, 1.0e-6);
-        float title_strong = smoothstep(1.25, 1.80, title_ratio)
-                           * smoothstep(0.15, 0.50, m_title_conf);
         if (shot_boundary) {
             m_shot_age = 0.0;
             m_shot_gain = 1.0;
             m_shot_conf = 0.0;
-            // The '+' is restoration authority, not a universal amount bump.
-            // A known strong title keeps it across cuts; a cold-start shot must
-            // earn frame-local authority in the authenticated window below.
-            m_shot_restore_boost = mix(1.0, 2.0, title_strong);
             m_shot_size = m_title_size;
             m_shot_hardness = m_title_hardness;
             for (int b = 0; b < MP_TONE_BINS; b++)
                 m_shot_obs_w[b] = 0.0;
-        } else if (m_shot_age < 4.0) {
+        } else if (m_shot_age < 4.0 && !geometry_only) {
             float frame_gain = clamp(frame_gain_est, 0.50, 4.0);
             float gain_target = mix(1.0, frame_gain, shot_auth);
             m_shot_gain = mix(m_shot_gain, gain_target, 0.35);
             m_shot_conf = mix(m_shot_conf, shot_auth, 0.25);
-            float frame_strong = smoothstep(0.00110, 0.00180,
-                                             frame_sigma_est)
-                               * shot_auth;
-            m_shot_restore_boost = mix(1.0, 2.0,
-                                       max(frame_strong, title_strong));
             if (evidence > 0.0) {
                 float shape_rate = 0.18 * evidence;
                 m_shot_size = mix(m_shot_size, frame_size, shape_rate);
@@ -695,6 +1363,14 @@ void lean_observe() {
             m_shot_hardness = mix(m_shot_hardness, frame_hardness,
                                   0.0008 * evidence);
         }
+        // Grain presence establishes amount, not proof of delivery loss. The
+        // legacy boost lane remains neutral until a genuine loss estimator can
+        // authorize it without counting the same grain evidence twice.
+        m_shot_restore_boost = 1.0;
+
+        float title_presence_auth = smoothstep(0.08, 0.20, m_title_conf);
+        float cross_auth = title_presence_auth
+                         * smoothstep(0.10, 0.35, m_shot_conf);
 
         float title_sum = 0.0;
         float weight_sum = 0.0;
@@ -723,15 +1399,15 @@ void lean_observe() {
 
             }
 
-            // A spatial survivor read may only reduce restoration. It is
-            // therefore safe to acquire at a boundary before temporal
-            // authentication; title/master learning above remains temporal.
-            if (shot_boundary && spatial_reliability > 0.0) {
+            // Boundary texture is a candidate, never authority. Only temporal
+            // authentication may let a survivor reduce restoration, including
+            // during the otherwise-fast post-cut acquisition window.
+            if (shot_boundary) {
                 m_shot_obs_p[b] = pobs;
-                m_shot_obs_w[b] = 0.80 * spatial_reliability;
+                m_shot_obs_w[b] = 0.0;
             } else {
-                bool acquire = m_shot_age < 4.0;
-                float obs_support = acquire ? spatial_reliability : reliability;
+                bool acquire = m_shot_age < 4.0 && !geometry_only;
+                float obs_support = reliability;
                 if (obs_support > 0.0) {
                     float obs_rate = acquire ? 0.35 * obs_support
                                              : 0.0020 * obs_support;
@@ -741,17 +1417,24 @@ void lean_observe() {
                 }
             }
 
-            float master = m_master_p[b] * m_shot_gain;
-            float p0 = MP_PRIOR_SIGMA * prior_tone_shape(b);
-            p0 = p0 * p0 * m_shot_gain;
+            float shape = prior_tone_shape(b);
+            float title_curve = m_title_power * shape * shape * m_shot_gain;
+            float learned_master = m_master_p[b] * m_shot_gain;
+            float local_q = smoothstep(0.10, 0.35, m_master_w[b]);
+            float master = mix(title_curve, max(title_curve, learned_master),
+                               local_q);
             float deficit = prior_missing_fraction(b);
+            float missing_fraction = mix(deficit, min(deficit, 0.50),
+                                         cross_auth);
             float learned_authority = mix(0.65, 1.0, m_title_conf);
-            float unknown_restore = deficit * (p0 + learned_authority
-                                  * max(master - p0, 0.0));
-            float measured_restore = learned_authority
-                                   * (master - m_shot_obs_p[b]);
             float obs_weight = clamp(m_shot_obs_w[b], 0.0, 1.0);
             float char_target = MP_COMPLEMENT_POWER * master;
+            float unknown_restore = missing_fraction * master;
+            // Complement is already reserved missing power; survivor-driven
+            // restoration may fill only the remaining deficit.
+            float measured_restore = max(learned_authority
+                                       * (master - m_shot_obs_p[b])
+                                       - char_target, 0.0);
             // Weak observation selects the acquisition posterior; it does not
             // attenuate that prior a second time. Blend the signed deficit
             // before clamping so exceptionally strong survivor evidence can
@@ -762,7 +1445,14 @@ void lean_observe() {
 
             float char_up_rate, char_down_rate;
             float restore_up_rate, restore_down_rate;
-            if (shot_boundary) {
+            if (geometry_only) {
+                // Re-framing the observer changes neither the title nor the
+                // shot presentation on the commit frame.
+                char_up_rate = 0.0;
+                char_down_rate = 0.0;
+                restore_up_rate = 0.0;
+                restore_down_rate = 0.0;
+            } else if (shot_boundary) {
                 // Commit the title-shaped shot character on the boundary rather
                 // than letting an eye-visible adjustment trail into the shot.
                 // The boundary uses the authenticated title baseline, so complete
@@ -775,10 +1465,9 @@ void lean_observe() {
                 // Upward post-boundary refinement requires temporal
                 // authentication; the boundary survivor read is downward-only.
                 char_up_rate = 0.20 * evidence;
-                char_down_rate = 0.50 * max(m_shot_obs_w[b], reliability);
+                char_down_rate = 0.00008;
                 restore_up_rate = 0.35 * reliability;
-                restore_down_rate = 0.50 * max(m_shot_obs_w[b],
-                                               spatial_reliability);
+                restore_down_rate = 0.00008;
             } else {
                 // Once the shot is established, presentation moves on a
                 // roughly ten-minute horizon. The observer may keep learning
@@ -791,6 +1480,17 @@ void lean_observe() {
                 restore_up_rate = 0.00006 * static_gate;
                 restore_down_rate = 0.00008;
             }
+            if (!geometry_only && !shot_boundary) {
+                float pullback_rate = max(0.00008,
+                                          0.04 * max(obs_weight, cross_auth));
+                restore_down_rate = max(restore_down_rate, pullback_rate);
+            }
+            // A title-wide posterior is deliberately faster than ordinary
+            // shot drift, but remains a multi-second presentation change.
+            char_up_rate = max(char_up_rate, 0.004 * presence_drive);
+            restore_up_rate = max(restore_up_rate, 0.004 * presence_drive);
+            char_down_rate = max(char_down_rate, 0.003 * clean_drive);
+            restore_down_rate = max(restore_down_rate, 0.003 * clean_drive);
             float ar = (char_target > m_char_p[b])
                      ? char_up_rate : char_down_rate;
             float rr = (restore_target > m_restore_p[b])
@@ -798,17 +1498,16 @@ void lean_observe() {
             m_char_p[b] = mix(m_char_p[b], char_target, ar);
             m_restore_p[b] = mix(m_restore_p[b], restore_target, rr);
 
-            title_sum += m_master_p[b];
+            title_sum += master;
             weight_sum += m_master_w[b];
             char_sum += m_char_p[b];
             restore_sum += m_restore_p[b];
             target_missing_sum += restore_target;
         }
 
-        m_title_power = title_sum / float(MP_TONE_BINS);
         float avg_w = weight_sum / float(MP_TONE_BINS);
-        // User 0 remains an exact C bypass; 1 admits the shot-committed 1..2x
-        // title/frame authority; 2 forces 2x; values above 2 remain explicit overrides.
+        // The retained boost lane is neutral in the current estimator; keep
+        // this arithmetic synchronized with OUTPUT for state compatibility.
         float boost_q = clamp(m_shot_restore_boost - 1.0, 0.0, 1.0);
         float effective_restore = (restore_gain <= 2.0)
                                 ? mix(restore_gain,
@@ -821,7 +1520,7 @@ void lean_observe() {
                         * restore_sum / float(MP_TONE_BINS);
         m_loss_mix = (p_total > 1.0e-12) ? p_restore / p_total : 0.0;
         m_loss_conf = clamp(target_missing_sum
-                          / max(title_sum * m_shot_gain, 1.0e-12), 0.0, 1.0);
+                          / max(title_sum, 1.0e-12), 0.0, 1.0);
         m_est_missing = sqrt(max(restore_sum / float(MP_TONE_BINS), 0.0));
         m_eff_render = match_grain * grain_gain * sqrt(max(p_total, 0.0))
                      / MP_FIELD_STD;
@@ -867,7 +1566,8 @@ void hook() {
 // @120Hz and audio sync, 2026-07-06). The OUTPUT composite (redraw group,
 // per-present) just fetches GRAIN_FIELD, so re-presents cost ~nothing and
 // grain cadence can't ride the display refresh. TPL ARCHITECTURE
-// (2026-07-10): the grain "scan" is a VIRTUAL 3840x2160 4K field, but this
+// (2026-07-10): the grain "scan" is a virtual 2160-line picture-relative field,
+// whose width follows the committed active-picture aspect, but this
 // pass only generates the physical 960x540 TEMPLATE — the composite
 // assembles the virtual scan from per-block randomized template windows
 // (AV1-FGS style; see the block shuffle there). Template texels REPRESENT
@@ -1273,6 +1973,8 @@ float matched_grain_scale(float lum, float hdr_mode) {
     float char_p = mix(m_char_p[i0], m_char_p[i1], fract(p));
     float restore_p = mix(m_restore_p[i0], m_restore_p[i1], fract(p));
     // Keep this expression identical to PASS 1's p_total accounting.
+    // The retained boost lane is neutral in the current estimator; keep this
+    // arithmetic synchronized with PASS 1 for state compatibility.
     float boost_q = clamp(m_shot_restore_boost - 1.0, 0.0, 1.0);
     float effective_restore = (restore_gain <= 2.0)
                             ? mix(restore_gain,
@@ -1480,12 +2182,10 @@ void hook() {
         return;
     }
 
-    // Source-locked grain lives in canonical picture coordinates. OUTPUT is
-    // the full presentation canvas after placement, so recover the default
-    // contain-fit destination rectangle from the source raster aspect. Window
-    // padding therefore cannot resize or rephase the field. Output resolution
-    // sets only the footprint used to sample it; source resolution and scaler
-    // never change latent power or character.
+    // Source-locked grain lives in canonical active-picture coordinates.
+    // First recover the full source-raster placement (display-added padding),
+    // then nest the committed baked-picture rectangle inside it. Neither kind
+    // of matte may resize or rephase the field.
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     ivec2 gsize = imageSize(GRAIN_FIELD);
     vec2 canvas = HOOKED_size;
@@ -1493,21 +2193,32 @@ void hook() {
                         ? m_source_aspect
                         : canvas.x / max(canvas.y, 1.0);
     float canvas_aspect = canvas.x / max(canvas.y, 1.0);
-    vec2 active_size = canvas;
-    vec2 active_origin = vec2(0.0);
+    vec2 raster_size = canvas;
+    vec2 raster_origin = vec2(0.0);
     if (canvas_aspect > source_aspect + 0.0001) {
-        active_size.x = canvas.y * source_aspect;
-        active_origin.x = 0.5 * (canvas.x - active_size.x);
+        raster_size.x = canvas.y * source_aspect;
+        raster_origin.x = 0.5 * (canvas.x - raster_size.x);
     } else if (canvas_aspect < source_aspect - 0.0001) {
-        active_size.y = canvas.x / source_aspect;
-        active_origin.y = 0.5 * (canvas.y - active_size.y);
+        raster_size.y = canvas.x / source_aspect;
+        raster_origin.y = 0.5 * (canvas.y - raster_size.y);
     }
+    vec2 baked_inset = clamp(vec2(m_active_inset_x, m_active_inset_y),
+                             vec2(0.0), vec2(0.24));
+    vec2 active_origin = raster_origin + baked_inset * raster_size;
+    vec2 active_size = (vec2(1.0) - 2.0 * baked_inset) * raster_size;
     vec2 pixel_centre = vec2(gid) + 0.5;
+    // The detector commits the last confirmed matte sample. For masking,
+    // advance half a refinement substep and round inward to whole pixels so
+    // lifted mattes and bar-resident subtitles cannot receive grain.
+    vec2 mask_guard = vec2(baked_inset.x > 0.0 ? 1.0 / 1024.0 : 0.0,
+                           baked_inset.y > 0.0 ? 1.0 / 1024.0 : 0.0);
+    vec2 mask_lo = ceil(raster_origin
+                      + (baked_inset + mask_guard) * raster_size);
+    vec2 mask_hi = floor(raster_origin + raster_size
+                       - (baked_inset + mask_guard) * raster_size);
     if (debug_match <= 0.5
-        && (pixel_centre.x < active_origin.x
-         || pixel_centre.y < active_origin.y
-         || pixel_centre.x >= active_origin.x + active_size.x
-         || pixel_centre.y >= active_origin.y + active_size.y)) {
+        && (float(gid.x) < mask_lo.x || float(gid.y) < mask_lo.y
+         || float(gid.x) >= mask_hi.x || float(gid.y) >= mask_hi.y)) {
         imageStore(out_image, gid, color);
         return;
     }
@@ -1650,7 +2361,7 @@ void hook() {
 
     if (debug_match > 0.5) {
         const int X_OFF = 24, Y_OFF = 400, BW = 10, BH = 10;
-        const int ANCHOR = 10, NBITS = 16, NROWS = 44;
+        const int ANCHOR = 10, NBITS = 16, NROWS = 51;
         ivec2 gid = ivec2(gl_GlobalInvocationID.xy) - ivec2(X_OFF, Y_OFF);
         if (gid.x >= 0 && gid.y >= 0
             && gid.x < ANCHOR + NBITS * BW && gid.y < NROWS * BH) {
@@ -1680,9 +2391,16 @@ void hook() {
                                       * 2000000.0;
             else if (row < 36)  v = sqrt(max(m_restore_p[row - 28], 0.0))
                                       * 2000000.0;
-            else                v = sqrt(max(m_shot_obs_p[row - 36]
+            else if (row < 44)  v = sqrt(max(m_shot_obs_p[row - 36]
                                       * m_shot_obs_w[row - 36], 0.0))
                                       * 2000000.0;
+            else if (row == 44) v = m_active_inset_x * 200000.0;
+            else if (row == 45) v = m_active_inset_y * 200000.0;
+            else if (row == 46) v = m_pending_inset_x * 200000.0;
+            else if (row == 47) v = m_pending_inset_y * 200000.0;
+            else if (row == 48) v = max(m_geom_streak, m_geom_streak_y);
+            else if (row == 49) v = min(m_geom_known, m_geom_known_y) * 65000.0;
+            else                v = m_geom_changed * 65000.0;
             uint val = uint(clamp(v, 0.0, 65535.0));
             if (gid.x < ANCHOR)
                 color.rgb = vec3(1.0);

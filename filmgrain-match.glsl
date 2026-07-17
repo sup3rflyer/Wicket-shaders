@@ -303,7 +303,7 @@
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
 #define MP_FIELD_STD           0.0185
-#define MP_STATE_MAGIC         0.928451
+#define MP_STATE_MAGIC         0.929451
 #define MP_MIN_BIN_SAMPLES     24u
 
 // Flattened for conservative SPIRV-Cross/D3D11 lowering.
@@ -749,15 +749,16 @@ void lean_observe() {
             float unknown_restore = deficit * (p0 + learned_authority
                                   * max(master - p0, 0.0));
             float measured_restore = learned_authority
-                                   * max(master - m_shot_obs_p[b], 0.0);
-            measured_restore = min(unknown_restore, measured_restore);
+                                   * (master - m_shot_obs_p[b]);
             float obs_weight = clamp(m_shot_obs_w[b], 0.0, 1.0);
             float char_target = MP_COMPLEMENT_POWER * master;
             // Weak observation selects the acquisition posterior; it does not
-            // attenuate that prior a second time. Strong surviving evidence
-            // instead asks only for the measured missing power.
-            float restore_target = mix(unknown_restore, measured_restore,
-                                       obs_weight);
+            // attenuate that prior a second time. Blend the signed deficit
+            // before clamping so exceptionally strong survivor evidence can
+            // exhaust the missing-power budget even at partial confidence.
+            float restore_target = clamp(mix(unknown_restore,
+                                             measured_restore, obs_weight),
+                                         0.0, unknown_restore);
 
             float char_up_rate, char_down_rate;
             float restore_up_rate, restore_down_rate;

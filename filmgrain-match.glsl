@@ -318,8 +318,21 @@
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
 #define MP_FIELD_STD           0.0185
-#define MP_STATE_MAGIC         0.940451
+#define MP_STATE_MAGIC         0.941451
 #define MP_MIN_BIN_SAMPLES     24u
+// Film-plausible evidence band. Per-frame sigma above this band is not
+// photographic grain (fireworks, confetti, dense near-field rain, damage):
+// soft-reject it from BOTH the per-bin master update and title presence,
+// upstream of every lane, so implausible evidence cannot enter the
+// persistent posterior at all. Calibrated ABOVE the heaviest catalogued
+// legitimate grain — Golden Spurtle Super35 reads sigma 0.0026-0.0035 in
+// this domain (harness, 2026-07-17) and must pass at full weight; in-band
+// grain twins are bounded by the rate/breadth/reversibility layers instead,
+// a level test cannot catch them. The absolute master ceiling backstops
+// sustained band-edge evidence.
+#define MP_SIGMA_PLAUS_LO      0.0040
+#define MP_SIGMA_PLAUS_HI      0.0065
+#define MP_MASTER_P_MAX        2.0e-5
 #define MP_BAR_DARK_MAX        0.085
 #define MP_BAR_RANGE_MAX       0.025
 #define MP_BAR_DARK_SAMPLES    36u
@@ -1211,7 +1224,13 @@ void lean_observe() {
 
         // Estimate shot sensitivity after dividing out the title's luma curve.
         // A picture-population mean of sigma would confuse composition/exposure
-        // with noise sensitivity, especially across bright/dark cuts.
+        // with noise sensitivity, especially across bright/dark cuts. The
+        // divisor must be EXACTLY the unit-gain curve presentation renders
+        // (title curve blended with the per-bin master by local evidence) —
+        // dividing by the bare per-bin master lets title-borrowed presence
+        // re-enter through shot gain and double-count into the committed
+        // presentation.
+        float prior_base_p = MP_PRIOR_SIGMA * MP_PRIOR_SIGMA;
         float gain_log_sum = 0.0;
         float gain_weight = 0.0;
         for (int b = 0; b < MP_TONE_BINS; b++) {
@@ -1220,8 +1239,18 @@ void lean_observe() {
             float amp_r = smoothstep(0.00012, 0.00070, sigma0);
             float w = count_r * amp_r;
             if (w > 0.0) {
+                float shape = prior_tone_shape(b);
+                float title_unit = m_title_power * shape * shape;
+                float local_q = smoothstep(0.10, 0.35, m_master_w[b]);
+                // Floor the divisor at a quarter of the acquisition prior:
+                // a clean-lane-drained title must not read the first grainy
+                // shot as gain-4 sensitivity and then suppress its own
+                // master establishment through the gain-normalized update.
+                float unit_master = max(mix(title_unit, m_master_p[b],
+                                            local_q),
+                                        0.25 * shape * shape * prior_base_p);
                 float ratio = sigma0 * sigma0
-                            / max(m_master_p[b], 1.0e-10);
+                            / max(unit_master, 1.0e-10);
                 gain_log_sum += w * log2(clamp(ratio, 0.25, 16.0));
                 gain_weight += w;
             }
@@ -1248,13 +1277,14 @@ void lean_observe() {
 
         // Grain presence is a title property, not eight independent detection
         // gates. One temporally authenticated tone may establish the title-wide
-        // base; unavailable tones then inherit the same film-shaped curve. Only
-        // sustained, broadly observable near-zero evidence may pull that base
-        // down. Ambiguous, moving and boundary evidence leave it unchanged.
-        float prior_base_p = MP_PRIOR_SIGMA * MP_PRIOR_SIGMA;
+        // base; unavailable tones then inherit the same film-shaped curve.
+        // Sustained, broadly observable near-zero evidence pulls the base back
+        // toward the level it actually measures — at ANY confidence, so a
+        // transient misread can always be walked back — while implausibly hot
+        // evidence never enters. Ambiguous, moving and boundary evidence leave
+        // the base unchanged.
         float presence_rise = 0.0;
-        float presence_auth = 0.0;
-        float max_master_w = 0.0;
+        int presence_bins = 0;
         float clean_peak = 0.0;
         float represented_peak = 0.0;
         int clean_bins = 0;
@@ -1264,7 +1294,10 @@ void lean_observe() {
             float sigma0 = sigma_band[b * MP_BANDS];
             float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
             float amp_r = smoothstep(0.00012, 0.00070, sigma0);
-            float reliability = count_r * amp_r * q_cov * q_random * q_still;
+            float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
+                                           MP_SIGMA_PLAUS_HI, sigma0);
+            float reliability = count_r * amp_r * plaus
+                              * q_cov * q_random * q_still;
             float master_auth = smoothstep(0.10, 0.35, m_master_w[b])
                               * smoothstep(0.08, 0.20, m_title_conf);
             if (reliability > 0.0 && master_auth > 0.0) {
@@ -1272,22 +1305,23 @@ void lean_observe() {
                 float candidate_gain = m_master_p[b]
                                      / max(shape * shape * prior_base_p,
                                            1.0e-12);
-                // Presence propagates only a conservative fraction of the
-                // measured bin's level. The measured bin keeps its full local
-                // master below; a peak is not copied wholesale across tones.
-                float borrowed_gain = min(3.24,
-                                          1.0 + 0.35
-                                          * max(candidate_gain - 1.0, 0.0));
-                float candidate = borrowed_gain * prior_base_p;
+                // The candidate is the measured bin's FULL level (capped by
+                // the plausibility roof): shrinking the target instead of the
+                // rate would equilibrate erased tones permanently below the
+                // measured ones and hold a step between them. Caution lives
+                // in the approach rate below, annealed by how many tones
+                // corroborate, so one outlier bin transfers slowly while
+                // broad agreement transfers at full weight.
+                float candidate = min(candidate_gain, 3.24) * prior_base_p;
                 float candidate_auth = reliability * master_auth;
                 float rise = candidate_auth
                            * max(candidate - m_title_power, 0.0);
-                if (rise > presence_rise) {
-                    presence_rise = rise;
-                    presence_auth = candidate_auth;
-                }
+                presence_rise = max(presence_rise, rise);
+                // Breadth counts bins that CORROBORATE the rise, not bins
+                // that merely qualified: a single outlier tone must anneal
+                // at the slow rate even when other tones are measurable.
+                if (rise > 0.0) presence_bins++;
             }
-            max_master_w = max(max_master_w, m_master_w[b]);
 
             if (tone_count[b] >= MP_MIN_BIN_SAMPLES)
                 represented_peak = max(represented_peak, sigma0);
@@ -1306,9 +1340,7 @@ void lean_observe() {
                         && clean_peak <= 0.00018
                         && represented_peak <= 0.00030
                         && temporal <= 0.00012
-                        && observed <= 0.00030
-                        && m_title_conf < 0.10
-                        && max_master_w < 0.15;
+                        && observed <= 0.00030;
         float clean_q = broad_clean
                       ? smoothstep(0.35, 0.55, coverage)
                       * smoothstep(0.80, 1.0, q_still)
@@ -1319,15 +1351,22 @@ void lean_observe() {
         bool title_update_ok = s_history_ready != 0u
                             && !shot_boundary && !geometry_only
                             && m_shot_age >= 24.0;
-        float presence_drive = 0.0;
-        float clean_drive = 0.0;
         if (title_update_ok && presence_rise > 0.0) {
-            m_title_power += 0.010 * presence_rise;
-            presence_drive = presence_auth;
+            float breadth = mix(0.35, 1.0,
+                                smoothstep(1.0, 3.0, float(presence_bins)));
+            m_title_power += 0.010 * breadth * presence_rise;
         } else if (title_update_ok && clean_q > 0.0) {
-            m_title_power = mix(m_title_power, 0.04 * prior_base_p,
-                                0.002 * clean_q);
-            clean_drive = clean_q;
+            // Downward target is the level the clean window actually measures
+            // (floored), never a fixed drain: reversibility means converging
+            // to the evidence, not to zero. Established titles descend slower
+            // — flats are exactly where delivery erasure is most certain, so
+            // quiet evidence against an established grainy title is weak.
+            float clean_target = max(represented_peak * represented_peak,
+                                     0.04 * prior_base_p);
+            float clean_rate = 0.002 * clean_q
+                             * mix(1.0, 0.25,
+                                   smoothstep(0.05, 0.50, m_title_conf));
+            m_title_power = mix(m_title_power, clean_target, clean_rate);
         }
         m_title_power = clamp(m_title_power, 0.04 * prior_base_p,
                               3.24 * prior_base_p);
@@ -1368,10 +1407,6 @@ void lean_observe() {
         // authorize it without counting the same grain evidence twice.
         m_shot_restore_boost = 1.0;
 
-        float title_presence_auth = smoothstep(0.08, 0.20, m_title_conf);
-        float cross_auth = title_presence_auth
-                         * smoothstep(0.10, 0.35, m_shot_conf);
-
         float title_sum = 0.0;
         float weight_sum = 0.0;
         float char_sum = 0.0;
@@ -1382,15 +1417,24 @@ void lean_observe() {
             float pobs = sigma0 * sigma0;
             float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
             float amp_r = smoothstep(0.00012, 0.00070, sigma0);
-            float spatial_reliability = count_r * amp_r * q_cov;
+            float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
+                                           MP_SIGMA_PLAUS_HI, sigma0);
+            float spatial_reliability = count_r * amp_r * plaus * q_cov;
             float reliability = spatial_reliability * q_random * q_still;
 
             // Best-preserved evidence updates the absolute title master curve.
             // Downward evidence is deliberately much slower because delivery
-            // erasure is more likely than a physically noiseless master.
+            // erasure is more likely than a physically noiseless master. The
+            // master is TITLE-referenced: divide the current shot sensitivity
+            // out of the observation, or one long high-gain shot leaks its
+            // sensitivity into the persistent curve and, via presence, the
+            // title-wide base. The absolute ceiling is the film-plausible
+            // roof for sustained band-edge evidence the soft reject passes.
             if (reliability > 0.0) {
-                float clipped = clamp(pobs, 0.25 * m_master_p[b],
+                float pobs_title = pobs / max(m_shot_gain, 0.25);
+                float clipped = clamp(pobs_title, 0.25 * m_master_p[b],
                                       4.0 * m_master_p[b]);
+                clipped = min(clipped, MP_MASTER_P_MAX);
                 float master_rate = (clipped > m_master_p[b]) ? 0.003 : 0.0003;
                 m_master_p[b] = mix(m_master_p[b], clipped,
                                     master_rate * reliability);
@@ -1399,15 +1443,21 @@ void lean_observe() {
 
             }
 
-            // Boundary texture is a candidate, never authority. Only temporal
-            // authentication may let a survivor reduce restoration, including
-            // during the otherwise-fast post-cut acquisition window.
-            if (shot_boundary) {
+            // A spatial survivor read may only reduce restoration. It is
+            // therefore safe to acquire at a boundary before temporal
+            // authentication — a cut into grain-rich surviving content must
+            // not commit the full deficit on top of that grain for even one
+            // window; title/master learning above remains temporal.
+            if (shot_boundary && spatial_reliability > 0.0) {
+                m_shot_obs_p[b] = pobs;
+                m_shot_obs_w[b] = 0.80 * spatial_reliability;
+            } else if (shot_boundary) {
                 m_shot_obs_p[b] = pobs;
                 m_shot_obs_w[b] = 0.0;
             } else {
                 bool acquire = m_shot_age < 4.0 && !geometry_only;
-                float obs_support = reliability;
+                float obs_support = acquire ? spatial_reliability
+                                            : reliability;
                 if (obs_support > 0.0) {
                     float obs_rate = acquire ? 0.35 * obs_support
                                              : 0.0020 * obs_support;
@@ -1421,24 +1471,30 @@ void lean_observe() {
             float title_curve = m_title_power * shape * shape * m_shot_gain;
             float learned_master = m_master_p[b] * m_shot_gain;
             float local_q = smoothstep(0.10, 0.35, m_master_w[b]);
-            float master = mix(title_curve, max(title_curve, learned_master),
-                               local_q);
-            float deficit = prior_missing_fraction(b);
-            float missing_fraction = mix(deficit, min(deficit, 0.50),
-                                         cross_auth);
+            // Local evidence wins in BOTH directions: a confidently-measured
+            // quiet bin must be allowed to render below the title curve, or
+            // downward per-bin learning is presentation-inert.
+            float master = mix(title_curve, learned_master, local_q);
+            float missing_fraction = prior_missing_fraction(b);
             float learned_authority = mix(0.65, 1.0, m_title_conf);
             float obs_weight = clamp(m_shot_obs_w[b], 0.0, 1.0);
             float char_target = MP_COMPLEMENT_POWER * master;
             float unknown_restore = missing_fraction * master;
             // Complement is already reserved missing power; survivor-driven
             // restoration may fill only the remaining deficit.
-            float measured_restore = max(learned_authority
-                                       * (master - m_shot_obs_p[b])
-                                       - char_target, 0.0);
             // Weak observation selects the acquisition posterior; it does not
             // attenuate that prior a second time. Blend the signed deficit
             // before clamping so exceptionally strong survivor evidence can
             // exhaust the missing-power budget even at partial confidence.
+            float measured_restore = learned_authority
+                                   * (master - m_shot_obs_p[b])
+                                   - char_target;
+            // Bound the signed deficit at one budget below zero: a strong
+            // survivor still exhausts the budget at partial confidence
+            // (target 0 from obs_weight 0.5 up), but a single implausibly
+            // hot boundary frame at low seed weight cannot zero the whole
+            // shot's restoration on its own.
+            measured_restore = max(measured_restore, -unknown_restore);
             float restore_target = clamp(mix(unknown_restore,
                                              measured_restore, obs_weight),
                                          0.0, unknown_restore);
@@ -1463,34 +1519,27 @@ void lean_observe() {
                 restore_down_rate = 1.0;
             } else if (m_shot_age < 4.0) {
                 // Upward post-boundary refinement requires temporal
-                // authentication; the boundary survivor read is downward-only.
+                // authentication; the survivor read is downward-only, so its
+                // shedding stays motion-ungated — disappearing proof must
+                // revoke toward the title baseline even inside a moving cut.
                 char_up_rate = 0.20 * evidence;
-                char_down_rate = 0.00008;
+                char_down_rate = 0.50 * max(m_shot_obs_w[b], reliability);
                 restore_up_rate = 0.35 * reliability;
-                restore_down_rate = 0.00008;
+                restore_down_rate = 0.50 * max(m_shot_obs_w[b],
+                                               spatial_reliability);
             } else {
                 // Once the shot is established, presentation moves on a
                 // roughly ten-minute horizon. The observer may keep learning
-                // quickly internally without making that learning visible.
+                // quickly internally without making that learning visible;
+                // title-lane movement surfaces at the next boundary commit,
+                // never mid-shot. The survivor-driven pullback is the one
+                // faster lane: it can only shed restoration that visible
+                // surviving grain contradicts.
                 char_up_rate = 0.00004 * static_gate;
                 char_down_rate = 0.00008;
-                // Upward movement remains motion-gated. The acquisition prior
-                // was already committed at the boundary and needs no fallback
-                // path that could accumulate during a moving shot.
                 restore_up_rate = 0.00006 * static_gate;
-                restore_down_rate = 0.00008;
+                restore_down_rate = max(0.00008, 0.04 * obs_weight);
             }
-            if (!geometry_only && !shot_boundary) {
-                float pullback_rate = max(0.00008,
-                                          0.04 * max(obs_weight, cross_auth));
-                restore_down_rate = max(restore_down_rate, pullback_rate);
-            }
-            // A title-wide posterior is deliberately faster than ordinary
-            // shot drift, but remains a multi-second presentation change.
-            char_up_rate = max(char_up_rate, 0.004 * presence_drive);
-            restore_up_rate = max(restore_up_rate, 0.004 * presence_drive);
-            char_down_rate = max(char_down_rate, 0.003 * clean_drive);
-            restore_down_rate = max(restore_down_rate, 0.003 * clean_drive);
             float ar = (char_target > m_char_p[b])
                      ? char_up_rate : char_down_rate;
             float rr = (restore_target > m_restore_p[b])
@@ -1709,13 +1758,23 @@ void hook() {
     const float soften_eff = 0.0;
 
     // CONTRAST/BANDPASS: build inner (s1) AND outer (s2 = BP_RATIO*s1) blur weights.
-    // bp_alpha is UNIFORM across the workgroup (grain_contrast/match_grain are
-    // all uniform), so the bp_alpha>0 branch below is uniform control flow -> the
-    // barriers inside it are legal. bp_alpha=0 -> outer blur skipped, bp_norm=1,
-    // grain = blur(s1) = the old lowpass generator, bit-identical (A/B-safe).
+    // bp_alpha is UNIFORM across the workgroup (grain_contrast/match_grain/
+    // m_shot_hardness are uniform reads), and the outer blur below runs
+    // UNCONDITIONALLY (X3663 rework), so every barrier stays in uniform
+    // control flow. bp_alpha=0 -> vsum2 multiplied out in the combine,
+    // bp_norm=1, grain = blur(s1) = the old lowpass generator (A/B-safe).
     float render_hardness = smoothstep(0.25, 0.82, m_shot_hardness);
     float bp_alpha = BP_ALPHA * grain_contrast * match_grain
                    * render_hardness;
+    // DoG positivity guard: when both blur sigmas clamp at SIGMA_MAX the
+    // kernels coincide and the covariance zero-crossing sits at alpha 1.0
+    // (>1 for any distinct pair, by Cauchy-Schwarz). Capping alpha below 1
+    // guarantees the combined field stays positively correlated with the
+    // inner blur on every channel at every grain_size — the coarse-shot
+    // blue-channel inversion (audit bug #6) becomes unreachable. bp_norm
+    // re-normalizes RMS, so the cap only limits how much DC the hardest
+    // settings strip.
+    bp_alpha = min(bp_alpha, 0.95);
     if (lid < uint(2 * MAX_TAPS + 1)) {
         int idx = int(lid);
         float dx = float(idx - MAX_TAPS);
@@ -1916,6 +1975,9 @@ void hook() {
 #define TPL_OV    8.0    // overlap-blend band width past each block boundary
 #define MP_TONE_BINS_OUT 8
 #define MP_FIELD_STD_OUT 0.0185
+// MUST equal PASS 1's MP_STATE_MAGIC (same translation-unit-sync rule as
+// MP_TONE_BINS_OUT / MP_FIELD_STD_OUT — no compile guard exists).
+#define MP_STATE_MAGIC_OUT 0.941451
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
 
@@ -2172,6 +2234,16 @@ vec3 virtual_pixel(vec2 centre, float output_step, float vseed, ivec2 g) {
 
 void hook() {
     vec4 color = HOOKED_tex(HOOKED_pos);
+
+    // State-validity guard: on RGB / no-LUMA sources PASS 1 never runs, so
+    // GRAIN_STATE holds whatever the API left there (zero-init is common but
+    // not guaranteed; NaN m_eff_render would pass a <=0 gate as false). An
+    // unvalidated state must passthrough unconditionally — including debug,
+    // whose rows would render garbage.
+    if (!(abs(m_state_magic - MP_STATE_MAGIC_OUT) < 0.0001)) {
+        imageStore(out_image, ivec2(gl_GlobalInvocationID), color);
+        return;
+    }
 
     // Real zero path: avoid template reads and, in HDR mode, avoid a decode/encode
     // round trip. PASS 1 still observes, so later evidence opens without a toggle-

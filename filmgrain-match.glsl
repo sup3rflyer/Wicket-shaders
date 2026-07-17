@@ -303,7 +303,7 @@
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
 #define MP_FIELD_STD           0.0185
-#define MP_STATE_MAGIC         0.927451
+#define MP_STATE_MAGIC         0.928451
 #define MP_MIN_BIN_SAMPLES     24u
 
 // Flattened for conservative SPIRV-Cross/D3D11 lowering.
@@ -593,8 +593,8 @@ void lean_observe() {
         bool hard_cut = prev_ready && changed > 0.75 && hist_l1 > 0.25;
         bool shot_boundary = !prev_ready || hard_cut;
 
-        // Temporal similarity authenticates learning only. It never enters a
-        // master-power target, so camera/content motion cannot create grain.
+        // Temporal similarity supplies authority, not amount. It gates title
+        // learning and shot refinement but never provides a master-power target.
         float q_amp = smoothstep(0.00018, 0.00080, observed);
         float q_cov = smoothstep(0.08, 0.28, coverage);
         float q_random = 1.0 - smoothstep(0.35, 0.90,
@@ -627,7 +627,13 @@ void lean_observe() {
                              ? exp2(gain_log_sum / gain_weight) : 1.0;
         float frame_sigma_est = (gain_weight > 0.0)
                               ? exp2(sigma_log_sum / gain_weight) : 0.0;
-        float gain_support = q_cov * smoothstep(0.50, 2.0, gain_weight);
+        float gain_weight_support = smoothstep(0.50, 2.0, gain_weight);
+        // q_random is a continuous learning weight. Shot presentation uses a
+        // steeper confidence curve: once temporal behaviour is convincingly
+        // stochastic, amplitude comes from measured power, not from how far
+        // inside the authenticity band this frame happened to land.
+        float shot_auth = gain_weight_support * q_cov * q_still
+                        * smoothstep(0.02, 0.15, q_random);
 
         // Title character is a hidden posterior. It only learns from stable,
         // photographic evidence and never decays because a shot or region is
@@ -639,53 +645,55 @@ void lean_observe() {
             m_title_conf += 0.005 * evidence * (1.0 - m_title_conf);
         }
 
-        // A real cut commits the title-derived shot presentation immediately;
-        // it never clears grain. The cut masks the change, and the next three
-        // frames are the sole fast refinement window for evidence that was not
-        // trustworthy on the boundary.
-        float cut_support = q_amp * q_cov;
+        // A real cut commits only the authenticated title presentation. Spatial
+        // evidence on the boundary cannot distinguish grain from picture texture;
+        // the next three frames are the sole fast refinement window for proving
+        // shot-local sensitivity and character temporally.
+        float title_mid_sigma = 0.0;
+        float prior_mid_sigma = 0.0;
+        for (int b = 2; b <= 5; b++) {
+            title_mid_sigma += sqrt(max(m_master_p[b], 0.0));
+            prior_mid_sigma += MP_PRIOR_SIGMA * prior_tone_shape(b);
+        }
+        float title_ratio = title_mid_sigma
+                          / max(prior_mid_sigma, 1.0e-6);
+        float title_strong = smoothstep(1.25, 1.80, title_ratio)
+                           * smoothstep(0.15, 0.50, m_title_conf);
         if (shot_boundary) {
             m_shot_age = 0.0;
-            float frame_gain = clamp(frame_gain_est, 0.50, 4.0);
-            m_shot_gain = mix(1.0, frame_gain, 0.65 * gain_support);
-            m_shot_conf = 0.65 * gain_support;
-            float title_mid_sigma = 0.0;
-            float prior_mid_sigma = 0.0;
-            for (int b = 2; b <= 5; b++) {
-                title_mid_sigma += sqrt(max(m_master_p[b], 0.0));
-                prior_mid_sigma += MP_PRIOR_SIGMA * prior_tone_shape(b);
-            }
-            float title_ratio = title_mid_sigma
-                              / max(prior_mid_sigma, 1.0e-6);
-            float frame_strong = smoothstep(0.00110, 0.00180,
-                                             frame_sigma_est)
-                               * gain_support;
-            float title_strong = smoothstep(1.25, 1.80, title_ratio)
-                               * smoothstep(0.15, 0.50, m_title_conf);
+            m_shot_gain = 1.0;
+            m_shot_conf = 0.0;
             // The '+' is restoration authority, not a universal amount bump.
-            // Commit it only at the perceptually masked boundary so strong
-            // titles can restore erased bands without within-shot buildup.
-            m_shot_restore_boost = mix(1.0, 2.0,
-                                       max(frame_strong, title_strong));
-            m_shot_size = mix(m_title_size, frame_size, 0.35 * cut_support);
-            m_shot_hardness = mix(m_title_hardness, frame_hardness,
-                                  0.35 * cut_support);
+            // A known strong title keeps it across cuts; a cold-start shot must
+            // earn frame-local authority in the authenticated window below.
+            m_shot_restore_boost = mix(1.0, 2.0, title_strong);
+            m_shot_size = m_title_size;
+            m_shot_hardness = m_title_hardness;
             for (int b = 0; b < MP_TONE_BINS; b++)
                 m_shot_obs_w[b] = 0.0;
+        } else if (m_shot_age < 4.0) {
+            float frame_gain = clamp(frame_gain_est, 0.50, 4.0);
+            float gain_target = mix(1.0, frame_gain, shot_auth);
+            m_shot_gain = mix(m_shot_gain, gain_target, 0.35);
+            m_shot_conf = mix(m_shot_conf, shot_auth, 0.25);
+            float frame_strong = smoothstep(0.00110, 0.00180,
+                                             frame_sigma_est)
+                               * shot_auth;
+            m_shot_restore_boost = mix(1.0, 2.0,
+                                       max(frame_strong, title_strong));
+            if (evidence > 0.0) {
+                float shape_rate = 0.18 * evidence;
+                m_shot_size = mix(m_shot_size, frame_size, shape_rate);
+                m_shot_hardness = mix(m_shot_hardness, frame_hardness,
+                                      shape_rate);
+            }
         } else if (evidence > 0.0) {
-            bool acquire = m_shot_age < 4.0;
-            float shot_support = evidence;
-            float shot_rate = acquire ? 0.35 * shot_support
-                                      : 0.0015 * shot_support;
-            float gain_hi = (evidence > 0.0) ? 16.0 : 4.0;
-            float frame_gain = clamp(frame_gain_est, 0.50, gain_hi);
-            m_shot_gain = mix(m_shot_gain, frame_gain, shot_rate);
-            m_shot_conf += (acquire ? 0.25 : 0.003) * shot_support
-                         * (1.0 - m_shot_conf);
-            float shape_rate = acquire ? 0.18 * shot_support
-                                       : 0.0008 * shot_support;
-            m_shot_size = mix(m_shot_size, frame_size, shape_rate);
-            m_shot_hardness = mix(m_shot_hardness, frame_hardness, shape_rate);
+            float frame_gain = clamp(frame_gain_est, 0.50, 4.0);
+            m_shot_gain = mix(m_shot_gain, frame_gain, 0.0015 * evidence);
+            m_shot_conf += 0.003 * evidence * (1.0 - m_shot_conf);
+            m_shot_size = mix(m_shot_size, frame_size, 0.0008 * evidence);
+            m_shot_hardness = mix(m_shot_hardness, frame_hardness,
+                                  0.0008 * evidence);
         }
 
         float title_sum = 0.0;
@@ -756,15 +764,15 @@ void lean_observe() {
             if (shot_boundary) {
                 // Commit the title-shaped shot character on the boundary rather
                 // than letting an eye-visible adjustment trail into the shot.
-                // m_shot_gain already folds confidence into the committed
-                // target, so complete both presentation terms atomically.
+                // The boundary uses the authenticated title baseline, so complete
+                // both presentation terms atomically at that neutral shot gain.
                 char_up_rate = 1.0;
                 char_down_rate = 1.0;
                 restore_up_rate = 1.0;
                 restore_down_rate = 1.0;
             } else if (m_shot_age < 4.0) {
-                // Post-boundary upward refinement still requires temporally
-                // authenticated evidence; only the boundary commit is spatial.
+                // Upward post-boundary refinement requires temporal
+                // authentication; the boundary survivor read is downward-only.
                 char_up_rate = 0.20 * evidence;
                 char_down_rate = 0.50 * max(m_shot_obs_w[b], reliability);
                 restore_up_rate = 0.35 * reliability;
@@ -798,8 +806,8 @@ void lean_observe() {
 
         m_title_power = title_sum / float(MP_TONE_BINS);
         float avg_w = weight_sum / float(MP_TONE_BINS);
-        // User 0 remains an exact C bypass; 1 admits the cut-committed 1..2x
-        // title authority; 2 forces 2x; values above 2 remain explicit overrides.
+        // User 0 remains an exact C bypass; 1 admits the shot-committed 1..2x
+        // title/frame authority; 2 forces 2x; values above 2 remain explicit overrides.
         float boost_q = clamp(m_shot_restore_boost - 1.0, 0.0, 1.0);
         float effective_restore = (restore_gain <= 2.0)
                                 ? mix(restore_gain,

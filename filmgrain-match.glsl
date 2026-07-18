@@ -314,6 +314,16 @@
 #define MP_HP_TO_SOURCE        1.7888544
 #define MP_MEDABS_TO_STD       1.4826022
 #define MP_COMPLEMENT_POWER    0.150
+// Surviving delivered grain is DAMAGED evidence — clumped, blocked,
+// DCT-mushed — so it counts against the restoration deficit at its
+// fidelity, never at its raw energy (author spec 2026-07-17: the shader
+// lays an even bed of restoration-grade grain across the picture; a
+// JND-level addition on grainy titles is a failure, because even inside
+// surviving grain we are repairing compressed patches and clumping).
+// 0.50 = provisional: delivered grain is at best half restoration-grade.
+// Future: key this to measured delivery health (m_structure_ratio) and
+// the ProRes master-vs-degraded erasure calibration.
+#define MP_SURVIVOR_FIDELITY   0.50
 #define MP_PRIOR_SIGMA         0.00055
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
@@ -1358,17 +1368,27 @@ void lean_observe() {
         } else if (title_update_ok && clean_q > 0.0) {
             // Downward target is the level the clean window actually measures
             // (floored), never a fixed drain: reversibility means converging
-            // to the evidence, not to zero. Established titles descend slower
-            // — flats are exactly where delivery erasure is most certain, so
-            // quiet evidence against an established grainy title is weak.
+            // to the evidence, not to zero. The rate carries the censoring
+            // model: clean evidence is collectable ONLY from flat, still
+            // regions — exactly where delivery erasure is near-certain — so
+            // quiet flats get ~the survival complement (~0.12) of face-value
+            // weight. A genuinely clean title still converges over an
+            // episode; held cels and dark still scenes inside a grainy title
+            // can no longer hole the base between presence refills (presence
+            // runs ~40x faster). Field bug 2026-07-17 night: the previous
+            // 0.002 full-rate lane drained titles to the floor during any
+            // long quiet scene and whole shots rendered no grain at all.
             float clean_target = max(represented_peak * represented_peak,
-                                     0.04 * prior_base_p);
-            float clean_rate = 0.002 * clean_q
+                                     0.25 * prior_base_p);
+            float clean_rate = 0.00025 * clean_q
                              * mix(1.0, 0.25,
                                    smoothstep(0.05, 0.50, m_title_conf));
             m_title_power = mix(m_title_power, clean_target, clean_rate);
         }
-        m_title_power = clamp(m_title_power, 0.04 * prior_base_p,
+        // The floor keeps a drained title at half the cold-start bed: a
+        // measured-clean master renders a subtle acquisition layer, never
+        // nothing (charter: a zero-grain master is never authorized).
+        m_title_power = clamp(m_title_power, 0.25 * prior_base_p,
                               3.24 * prior_base_p);
 
         // A real cut commits only the authenticated title presentation. Spatial
@@ -1467,6 +1487,47 @@ void lean_observe() {
                 }
             }
 
+        }
+
+        // Title-wide survived fraction -> ONE bed level. The added layer
+        // keeps the rendition curve's SHAPE: per-bin survivor differencing
+        // inverted the film bell — zero added exactly in the measurable
+        // mids, full deficit at the crushed/clipped extremes — an
+        // anti-physical tonal profile (author spec, 2026-07-17 night).
+        // Survivors therefore modulate the bed's LEVEL through one
+        // fidelity-discounted aggregate; per-bin evidence keeps informing
+        // the master curve, never the added field's tonal shape. With
+        // fidelity 0.5 the bed level stays in [~0.5, 1] x missing fraction:
+        // an even, film-shaped bed that lossy survivors can halve but never
+        // extinguish — surviving delivered grain is damaged evidence
+        // (clumping, blocking, compressed patches), and no lossy delivery
+        // is a ProRes master.
+        float surv_wsum = 0.5;   // prior mass: no survivor evidence
+        float surv_dsum = 0.5;   // means the full missing fraction
+        for (int b = 0; b < MP_TONE_BINS; b++) {
+            float w = clamp(m_shot_obs_w[b], 0.0, 1.0);
+            if (w <= 0.0) continue;
+            float shape = prior_tone_shape(b);
+            float title_curve = m_title_power * shape * shape * m_shot_gain;
+            float learned_master = m_master_p[b] * m_shot_gain;
+            float local_q = smoothstep(0.10, 0.35, m_master_w[b]);
+            float master_b = mix(title_curve, learned_master, local_q);
+            float healthy = MP_SURVIVOR_FIDELITY
+                          * min(m_shot_obs_p[b] / max(master_b, 1.0e-12),
+                                1.0);
+            surv_wsum += w;
+            surv_dsum += w * (1.0 - healthy);
+        }
+        float bed_deficit = surv_dsum / surv_wsum;
+
+        for (int b = 0; b < MP_TONE_BINS; b++) {
+            float sigma0 = sigma_band[b * MP_BANDS];
+            float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
+            float amp_r = smoothstep(0.00012, 0.00070, sigma0);
+            float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
+                                           MP_SIGMA_PLAUS_HI, sigma0);
+            float spatial_reliability = count_r * amp_r * plaus * q_cov;
+            float reliability = spatial_reliability * q_random * q_still;
             float shape = prior_tone_shape(b);
             float title_curve = m_title_power * shape * shape * m_shot_gain;
             float learned_master = m_master_p[b] * m_shot_gain;
@@ -1476,28 +1537,9 @@ void lean_observe() {
             // downward per-bin learning is presentation-inert.
             float master = mix(title_curve, learned_master, local_q);
             float missing_fraction = prior_missing_fraction(b);
-            float learned_authority = mix(0.65, 1.0, m_title_conf);
             float obs_weight = clamp(m_shot_obs_w[b], 0.0, 1.0);
             float char_target = MP_COMPLEMENT_POWER * master;
-            float unknown_restore = missing_fraction * master;
-            // Complement is already reserved missing power; survivor-driven
-            // restoration may fill only the remaining deficit.
-            // Weak observation selects the acquisition posterior; it does not
-            // attenuate that prior a second time. Blend the signed deficit
-            // before clamping so exceptionally strong survivor evidence can
-            // exhaust the missing-power budget even at partial confidence.
-            float measured_restore = learned_authority
-                                   * (master - m_shot_obs_p[b])
-                                   - char_target;
-            // Bound the signed deficit at one budget below zero: a strong
-            // survivor still exhausts the budget at partial confidence
-            // (target 0 from obs_weight 0.5 up), but a single implausibly
-            // hot boundary frame at low seed weight cannot zero the whole
-            // shot's restoration on its own.
-            measured_restore = max(measured_restore, -unknown_restore);
-            float restore_target = clamp(mix(unknown_restore,
-                                             measured_restore, obs_weight),
-                                         0.0, unknown_restore);
+            float restore_target = bed_deficit * missing_fraction * master;
 
             float char_up_rate, char_down_rate;
             float restore_up_rate, restore_down_rate;

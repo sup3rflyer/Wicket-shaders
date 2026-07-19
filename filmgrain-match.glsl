@@ -94,6 +94,19 @@
 //                    as on an SDR target. Wrong value = grain in clipped
 //                    whites (1 on SDR content) or grain shaved off real
 //                    expanded highlights (0 under CelFlare).
+//   grain_fade       where grain fades to white: the work-domain luma at
+//                    which grain reaches zero. ONE knob for every chain --
+//                    below the fade the amount follows the title's own
+//                    rendition curve (no aesthetic shoulder). Clip-limited
+//                    chains (grain_hdr = 0, or grain_headroom = 0) cap the
+//                    effective top at 0.95 (the near-clip dead zone), so
+//                    the 1.10 default is stock on every chain; with
+//                    headroom it is the above-ref-white reach -- we cannot
+//                    know the upstream expansion's tuning, so match it by
+//                    eye, per source if needed. Below ref white the knob
+//                    moves the LUMA fade only: the per-channel grain bound
+//                    stays floored at ref white (overshoot physics), so
+//                    bright saturated channels keep their grain.
 //   grain_ref_white  the nit level the chain anchors SDR white to; the bridge
 //                    divides by it, so it is DESCRIPTIVE -- it must equal what
 //                    the chain actually did, not what we would prefer. Plain
@@ -130,11 +143,11 @@
 //@shampv input sdr
 //@shampv ref-white-param grain_ref_white
 //@shampv target-trc-param grain_hdr
-//@shampv toggle grain_hdr grain_headroom debug_match density_combine
+//@shampv toggle match_grain grain_hdr grain_headroom debug_match density_combine
 //@shampv measures LUMA
 
 //!PARAM match_grain
-//!DESC Match Grain+ mix. 1 = complementary remastering · 0 = no synthetic output while observation remains live.
+//!DESC Match Grain+ mix (shampv A/B toggle). 1 = complementary remastering · 0 = no synthetic output while observation remains live · intermediate mix values stay valid via opts.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
@@ -230,6 +243,13 @@
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
+
+//!PARAM grain_fade
+//!DESC Where grain fades to white — work-domain luma of full fade-out, one knob for every chain. Default 1.10 = stock top end (clip-limited chains cap the effective top at 0.95) · with grain_headroom = 1 it is the above-ref-white reach — tune to the upstream expansion by eye · below ref white the knob moves the fade only (the per-channel grain bound stays floored at ref white) · below the fade, amount follows the title's rendition curve only.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.5
+//!MAXIMUM 2.5
+1.10
 
 //!PARAM grain_ref_white
 //!DESC SDR reference white (nits) the output chain anchors to — match hdr-reference-white (203 = its auto anchor). Only used when grain_hdr = 1.
@@ -328,7 +348,7 @@
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
 #define MP_FIELD_STD           0.0185
-#define MP_STATE_MAGIC         0.941451
+#define MP_STATE_MAGIC         0.942451
 #define MP_MIN_BIN_SAMPLES     24u
 // Film-plausible evidence band. Per-frame sigma above this band is not
 // photographic grain (fireworks, confetti, dense near-field rain, damage):
@@ -1283,6 +1303,14 @@ void lean_observe() {
             m_title_size = mix(m_title_size, frame_size, a_title);
             m_title_hardness = mix(m_title_hardness, frame_hardness, a_title);
             m_title_conf += 0.005 * evidence * (1.0 - m_title_conf);
+        } else {
+            // Staleness: title confidence is re-earned across scenes (tau
+            // ~4.6 min at 24p), never session-permanent. Odyssey benchmark:
+            // conf saturated at 0.975 and held full learned authority plus a
+            // 4x-annealed drain for the rest of the session. Decay can only
+            // REDUCE authority, so motion/quiet stretches stay charter-safe;
+            // a grainy title re-earns 0->0.5 in ~6 s of good evidence.
+            m_title_conf *= (1.0 - 1.5e-4);
         }
 
         // Grain presence is a title property, not eight independent detection
@@ -1451,16 +1479,35 @@ void lean_observe() {
             // title-wide base. The absolute ceiling is the film-plausible
             // roof for sustained band-edge evidence the soft reject passes.
             if (reliability > 0.0) {
-                float pobs_title = pobs / max(m_shot_gain, 0.25);
+                // Sensitivity normalization deflates hot shots only. Dividing
+                // by gain < 1 INFLATES the learned target, and an over-learned
+                // master reads exactly as gain < 1 at the next cut -- the
+                // runaway measured on the Odyssey benchmark (master bins up
+                // 3x, title pinned at its cap in ~2 min). A genuinely quiet
+                // shot now learns conservatively low at the slow rate instead
+                // -- recoverable, unlike the ratchet.
+                float pobs_title = pobs / clamp(m_shot_gain, 1.0, 4.0);
                 float clipped = clamp(pobs_title, 0.25 * m_master_p[b],
                                       4.0 * m_master_p[b]);
                 clipped = min(clipped, MP_MASTER_P_MAX);
-                float master_rate = (clipped > m_master_p[b]) ? 0.003 : 0.0003;
+                // 3:1, not 10:1: a blind rate asymmetry rectifies fluctuating
+                // evidence (fire/texture sigma jitter) into a one-way climb.
+                // The erasure prior still earns a downward discount, but down
+                // reads here carry measurable grain (amp_r > 0), unlike the
+                // clean lane's censored flats. Calibration point for the
+                // ProRes ground-truth pass.
+                float master_rate = (clipped > m_master_p[b]) ? 0.003 : 0.001;
                 m_master_p[b] = mix(m_master_p[b], clipped,
                                     master_rate * reliability);
                 m_master_w[b] += 0.005 * reliability
                                * (1.0 - m_master_w[b]);
 
+            } else {
+                // Staleness: per-bin authority is re-earned, not permanent.
+                // Evidence-free stretches relax local_q back toward the title
+                // curve (tau ~4.6 min at 24p). The learned LEVEL stays --
+                // absence is not evidence of a clean master.
+                m_master_w[b] *= (1.0 - 1.5e-4);
             }
 
             // A spatial survivor read may only reduce restoration. It is
@@ -1776,11 +1823,14 @@ void hook() {
     if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u)
         imageStore(out_image, ivec2(0), vec4(0.0));
 
-    // Observation remains live, but clean/no-evidence material does not pay the
-    // template-generation cost. When evidence opens, this pass precedes OUTPUT
-    // and fills the field on that same source frame.
-    if ((grain_gain <= 0.0 || match_grain <= 0.0 || m_eff_render <= 0.0)
-        && debug_match <= 0.5)
+    // Param-off skip only. m_eff_render may NOT join this guard: it is an SSBO
+    // read, and an early return conditioned on buffer data puts every barrier
+    // below into varying control flow for FXC (D3D11 X3663 -- the same class
+    // the unconditional outer blur already works around; params are cbuffer
+    // values and provably uniform, buffer loads are not). The skip it bought
+    // was structurally dead anyway: the restoration bed keeps m_eff_render > 0
+    // on real content, and OUTPUT still gates on it safely (no barriers there).
+    if ((grain_gain <= 0.0 || match_grain <= 0.0) && debug_match <= 0.5)
         return;
 
     // Grain is generated in virtual-4K texels. Shot character is committed from
@@ -2019,7 +2069,7 @@ void hook() {
 #define MP_FIELD_STD_OUT 0.0185
 // MUST equal PASS 1's MP_STATE_MAGIC (same translation-unit-sync rule as
 // MP_TONE_BINS_OUT / MP_FIELD_STD_OUT — no compile guard exists).
-#define MP_STATE_MAGIC_OUT 0.941451
+#define MP_STATE_MAGIC_OUT 0.942451
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
 
@@ -2089,19 +2139,26 @@ float matched_grain_scale(float lum, float hdr_mode) {
     float black_lo = mix(0.0010, 0.00025, hdr_mode);
     float black_hi = mix(0.0120, 0.00600, hdr_mode);
     float black_gate = smoothstep(black_lo, black_hi, lum);
-    // SDR keeps a long shoulder through the upper midrange, then enters an
-    // exact near-clip dead zone. Waiting for mathematical 1.0 leaves a tiny
-    // moving tail in perceptual whites: a still screenshot hides it, while
-    // temporal playback reveals it and channel clipping makes it one-sided.
-    // The PQ path retains the approved reference-white/highlight fade ONLY
-    // when the content actually extends above ref white (grain_headroom = 1,
-    // an upstream expansion made work-domain 1.0 paper white). Plain SDR in a
-    // PQ container (grain_headroom = 0) still clips at 1.0, so it keeps the
-    // SDR fade; the black gate stays container-keyed on hdr_mode.
-    float sdr_white = 1.0 - smoothstep(0.45, 0.95, lum);
-    float pq_white = 1.0 - smoothstep(0.96, 1.10, lum);
+    // ONE fade-to-white envelope for every chain (author decree 2026-07-19,
+    // resolving charter-audit P2): below the fade, amount follows the
+    // rendition curve only -- no aesthetic shoulder. grain_fade sets the
+    // work-domain luma where grain reaches zero. Clip-limited chains (plain
+    // SDR, or SDR in a PQ container) cap the top at 0.95: waiting for
+    // mathematical 1.0 leaves a tiny moving tail in perceptual whites --
+    // temporal playback reveals it and channel clipping makes it one-sided
+    // (the 2026-07-15 live-white finding). With headroom the top is the
+    // user's above-ref-white reach; we cannot know the upstream expansion's
+    // tuning. The 0.96/1.10 start/top ratio is the retained stock geometry.
+    // OUTPUT's symmetric room clamp and flash-guard ceiling key on the same
+    // top; the black gate stays container-keyed on hdr_mode.
     float white_hdr = hdr_mode * step(0.5, grain_headroom);
-    float protection = black_gate * mix(sdr_white, pq_white, white_hdr);
+    // Floored at the declared PARAM minimum: a degenerate override would
+    // collapse the smoothstep edges below (NaN through the whole tone scale).
+    float fade_user = max(grain_fade, 0.5);
+    float fade_top = mix(min(fade_user, 0.95), fade_user, white_hdr);
+    float white_fade = 1.0 - smoothstep(fade_top * (0.96 / 1.10),
+                                        fade_top, lum);
+    float protection = black_gate * white_fade;
     float scale = sigma / MP_FIELD_STD_OUT * protection;
     // Density multiplication contributes one factor of luma. Divide it back
     // out so the absolute master-power curve survives into shadows; the small
@@ -2454,17 +2511,45 @@ void hook() {
         vec3 code_headroom = mix(channel_headroom, vec3(shared_upper),
                                  neutral_highlight);
         grain_delta = clamp(grain_delta, -code_headroom, code_headroom);
+    } else {
+        // CelFlare/PQ path: the same defense one octave up. The flash-guard
+        // ceiling below is one-sided -- inside the open fade band a positive
+        // excursion used to clip at the pixel's own level while the fade
+        // still passed amplitude, leaving rectified negative-only pits on
+        // expanded highlights (charter-audit P3), per-channel on tinted ones.
+        // Bound the delta symmetrically against the sanctioned grain domain
+        // instead: where grain cannot go up it may not go down. Neutral
+        // highlights share the tightest upper room exactly like the SDR
+        // limiter, scaled to the clamp top. No floor arm here -- the PQ
+        // pedestal owns near-black and work-domain black is not a clip.
+        // The clamp top floors at ref white: overshoot physics only exists
+        // at/above 1.0. A grain_fade below ref white is a purely cosmetic
+        // target owned by the LUMA fade -- enforcing it per channel would
+        // delete grain from bright saturated channels (R 0.95 at luma 0.43)
+        // while their neighbours keep full grain: colored, directional
+        // suppression on ordinary unclipped content (re-base audit P1).
+        float clamp_top = max(grain_fade, 1.0);
+        vec3 up_room = max(vec3(clamp_top) - pre_grain, vec3(0.0));
+        float rgb_peak = max(max(pre_grain.r, pre_grain.g), pre_grain.b);
+        float rgb_floor = min(min(pre_grain.r, pre_grain.g), pre_grain.b);
+        float neutral_highlight = smoothstep(0.80 * clamp_top,
+                                             0.95 * clamp_top, rgb_floor);
+        float shared_upper = max(clamp_top - rgb_peak, 0.0);
+        vec3 code_room = mix(up_room, vec3(shared_upper), neutral_highlight);
+        grain_delta = clamp(grain_delta, -code_room, code_room);
     }
     work_rgb += grain_delta;
 
     if (hdr_bridge) {
         // Grain is texture, not signal: it may never push a pixel above
-        // max(its own pre-grain level, reference white). The SDR path gets
-        // this clip for free downstream at code 1.0; without it a broad
-        // bright-keyed bell + a large density excursion re-encodes into the
-        // PQ range ABOVE ref white and a grain frame can flash toward
-        // display peak (design-audit finding, 2026-07-04).
-        work_rgb = min(work_rgb, max(pre_grain, vec3(1.0)));
+        // max(its own pre-grain level, the sanctioned grain ceiling) -- ref
+        // white for clip-limited content, the user's fade top under an
+        // upstream expansion. The symmetric room clamp above already bounds
+        // the delta inside that domain, so this stays a flash guard against
+        // large density excursions re-encoding toward display peak
+        // (design-audit finding, 2026-07-04), never a tone shaper.
+        float ceil_top = (grain_headroom < 0.5) ? 1.0 : max(grain_fade, 1.0);
+        work_rgb = min(work_rgb, max(pre_grain, vec3(ceil_top)));
         vec3 linear_709 = signed_pow(work_rgb, 2.4);
         vec3 out_nits = grain_ref_white * max(bt709_to_bt2020(linear_709), vec3(0.0));
         color.rgb = vec3(pq_oetf_code(out_nits.r), pq_oetf_code(out_nits.g),

@@ -1,5 +1,13 @@
-// CelFlare v5.17 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.18 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
+//
+// v5.18 stabilizes the steep ordinary-spec ramp without filtering RGB. A
+// pair-locked bilateral reference constrains same-surface outliers, while a
+// strong antipodal-neighbour floor lifts pepper pits only when several pairs
+// agree and one-sided edges do not. Affine ramps remain exact; clipped centers
+// and raw super-white stay center-owned. An independently warmed scene gate
+// rejects broad neutral high-key shoulders without disturbing the flagship
+// history when disabled.
 //
 // Motion-aware additive A2 is the shipping light-pump path. Local flow
 // refinement, reveal memory, a pump-domain motion veto and persisted proof
@@ -20,8 +28,9 @@
 //     luminance). Gradient-preserving — local contrast survives by
 //     construction via multiplicative expansion in Oklab.
 //  2. Specular bonus: additive, scene-detected from peak-channel tiers, with
-//     a per-pixel ramp on raw luma. Restores HDR pop where SDR
-//     compressed most while rejecting bright colored surfaces.
+//     a raw-luma per-pixel ramp and an optional edge-aware local range lock.
+//     Restores HDR pop where SDR compressed most while rejecting bright
+//     colored surfaces.
 //
 // Quick start: all supported user controls live in the USER TUNING block
 // directly below. cf_ref_white MUST match hdr-reference-white in mpv.conf;
@@ -90,6 +99,27 @@
 //!MAXIMUM 2.0
 0.6
 
+//!PARAM cf_spec_stab
+//!DESC Local specular coherence (experimental). 1 = range-lock outliers and strongly lift pair-coherent pepper pits without crossing one-sided edges · 0 = raw flagship ramp.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
+
+//!PARAM cf_spec_scene_reject
+//!DESC Broad neutral high-key shoulder rejection (experimental A/B). 1 = suppress both spec routes on admitted diffuse fields · 0 = flagship scene gate.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
+
+//!PARAM cf_spec_radius
+//!DESC Specular field outer reach in current-frame pixels (experimental). 6 is the broad/blunt A/B; reduce toward 2 if low-contrast boundaries spread too far.
+//!TYPE DYNAMIC float
+//!MINIMUM 2.0
+//!MAXIMUM 6.0
+6.0
+
 //!PARAM cf_pump
 //!DESC Light pump — temporary surge on sustained brightening (explosions, tunnel exits, spells). ↑ = stronger surge · 1 = shipped · 0 = off.
 //!TYPE DYNAMIC float
@@ -156,6 +186,7 @@
 //!BUFFER CELFLARE_ADD_STATE
 //!VAR float smoothed_bright_frac
 //!VAR float smoothed_spec_signal
+//!VAR float smoothed_spec_flagship
 //!VAR float smoothed_contrast
 //!VAR float smoothed_log_avg
 //!VAR float smoothed_growth_mode
@@ -258,8 +289,9 @@
 #define GRAIN_EDGE_NORM     2.7
 // Ring equalizer (2026-07-16), parked after field A/B exposed a dark trough
 // around soft cloud edges. The established bright-asymmetric stabilizer still
-// serves the gentler base curve, while the steep spec ramp now reads raw luma
-// so no 9/18px decision field can draw a specular shoulder. Keep this off
+// serves the gentler base curve, while the flagship steep spec ramp reads raw
+// luma. This fork's separate compact symmetric field never reads Y_decision, so
+// no 9/18px decision footprint can draw a specular shoulder. Keep this off
 // unless that field result is explicitly revisited. Historical notes follow.
 #define GRAIN_RING_EQUALIZER 0
 // Bounded two-sided decision correction against
@@ -1126,6 +1158,25 @@ void hook() {
 // near-white V>0.97 cell always passes (sat 0.30 is far above specular
 // whites; the carpet's qualifying cells measured sat 0.40–0.88).
 #define BRIGHT_SPEC_SAT_MAX   0.30  // bright-spec tier counts only cells with sat below this
+
+// Broad achromatic top-field routing. A grainy near-white shoulder can have a
+// sparse >0.92 tail even though it contains no distinct specular object. The
+// normal tier-ratio test reads that tail as excellent separation because the
+// >0.92 population is much smaller than the broad >0.75 population. Detect
+// this class from the TOP-BAND population itself: the top must occupy a broad
+// part of the picture, and very little of that top population may be chromatic.
+// Once admitted, the field rejects both the normal 0.92 route and the stricter
+// >0.97 recovery: grain on the motivating field passes both soft tiers, so the
+// recovery is not independent evidence there. Base expansion remains untouched.
+// This is intentionally scene-level, before the local range lock.
+#define SPEC_BROAD_TOP_LO          0.08  // spec routes start yielding at 8% top-band cover
+#define SPEC_BROAD_TOP_HI          0.12  // spec routes fully yield at 12% top-band cover
+#define SPEC_TOP_CHROMA_SAT_LO     0.05  // top-cell chroma membership begins here
+#define SPEC_TOP_CHROMA_SAT_HI     0.20  // top-cell chroma membership is full here
+#define SPEC_TOP_CHROMA_FRAC_LO    0.05  // below: top band is fully achromatic
+#define SPEC_TOP_CHROMA_FRAC_HI    0.20  // above: top band is chromatic enough to keep normal route
+#define SPEC_SHOULDER_FILL_LO       0.20  // spec/top density below: sparse glints, no rejection
+#define SPEC_SHOULDER_FILL_HI       0.40  // spec/top density above: grainy shoulder-tail evidence
 
 // Saturated-channel spec detection. Count pixels using V = max(R,G,B) rather
 // than Y so pure saturated primaries (red LED Y=0.21 but V=1.0) qualify as
@@ -2142,6 +2193,7 @@ void hook() {
         uint  change_count      = 0u;
         float bright_spec_sum   = 0.0;
         float top_sum           = 0.0;
+        float top_chroma_sum    = 0.0;
         float illum_min         = 1.0;
         float illum_max         = 0.0;
         float illum_v_psum      = 0.0;
@@ -2227,8 +2279,12 @@ void hook() {
                                  ? smoothstep(BRIGHT_SPEC_THRESH - TIER_SOFT_HALFBAND,
                                               BRIGHT_SPEC_THRESH + TIER_SOFT_HALFBAND, ii)
                                  : 0.0;
-            top_sum           += smoothstep(TOP_BAND_THRESH - TIER_SOFT_HALFBAND,
-                                            TOP_BAND_THRESH + TIER_SOFT_HALFBAND, ii);
+            float top_member    = smoothstep(TOP_BAND_THRESH - TIER_SOFT_HALFBAND,
+                                             TOP_BAND_THRESH + TIER_SOFT_HALFBAND, ii);
+            top_sum           += top_member;
+            top_chroma_sum    += top_member
+                               * smoothstep(SPEC_TOP_CHROMA_SAT_LO,
+                                            SPEC_TOP_CHROMA_SAT_HI, s_sat[i]);
         }
 
         const float N_SAMPLES = 144.0;
@@ -2312,13 +2368,41 @@ void hook() {
         float bs_raw      = bs_onset * bs_shutoff * bs_gate;
         float bright_scene = smoothstep(BRIGHT_SCENE_LOW, BRIGHT_SCENE_HIGH, smoothed_log_avg);
 
+        // Grain on a broad neutral shoulder is not a specular tier. Measure
+        // chromatic occupancy only inside the top band: a colored object lower
+        // in the picture must not rescue a broad grayscale sky/flash field.
+        // A broad neutral object alone is not evidence that the whole scene lacks
+        // real glints. Reject only when the frame is also high-key AND a dense
+        // fraction of its top shoulder spills into the normal spec tier. This
+        // keeps a white wall/window in a dark scene, or snow with only sparse
+        // exceptional points, from globally vetoing unrelated highlights.
+        // Current log_avg is used for the reject key so a dark-to-white cut cannot
+        // inherit the old scene key. Bar cells were excluded from both top sums,
+        // so numerator and denominator stay aligned.
+        float top_chroma_frac = top_chroma_sum / max(top_sum, 1e-5);
+        float broad_top = smoothstep(SPEC_BROAD_TOP_LO, SPEC_BROAD_TOP_HI,
+                                     top_frac);
+        float achromatic_top = 1.0 - smoothstep(SPEC_TOP_CHROMA_FRAC_LO,
+                                                SPEC_TOP_CHROMA_FRAC_HI,
+                                                top_chroma_frac);
+        float high_key = smoothstep(BRIGHT_SCENE_LOW, BRIGHT_SCENE_HIGH, log_avg);
+        float shoulder_fill = spec_frac / max(top_frac, 1e-5);
+        float dense_shoulder = smoothstep(SPEC_SHOULDER_FILL_LO,
+                                          SPEC_SHOULDER_FILL_HI, shoulder_fill);
+        float broad_achro_reject = broad_top * achromatic_top
+                                 * high_key * dense_shoulder;
+        float scene_spec_keep = 1.0 - broad_achro_reject;
+
         // Natural (pre-bypass) form of spec_raw — fed to the velocity calc so
         // the growth-mode discriminator runs on unboosted signal (avoids a
-        // positive feedback loop with the shutoff lift below). Recovery is
-        // applied here too so velocity reflects the real scene-relative spec.
-        float spec_raw_natural = spec_onset * spec_shutoff * tier_mode;
-        spec_raw_natural = mix(spec_raw_natural,
-                               max(spec_raw_natural, bs_raw), bright_scene);
+        // positive feedback loop with the shutoff lift below). Deliberately
+        // EXCLUDE scene_spec_keep here: the broad-field classifier opening as
+        // a neutral field recedes is not physical specular growth and must not
+        // drive the base-curve growth bypass. The authorization is applied only
+        // to the actual bonus path below.
+        float spec_normal_natural = spec_onset * spec_shutoff * tier_mode;
+        float spec_raw_natural = mix(spec_normal_natural,
+                                     max(spec_normal_natural, bs_raw), bright_scene);
 
         // Scene cut detection — 144-sample grid (reuses the stats grid).
         // SCENE_CUT_PCT (0.50) interpretation stays "majority of cells moved";
@@ -2409,11 +2493,15 @@ void hook() {
             : mix(smoothed_growth_mode, growth_mode_instant, alpha);
 
         float shutoff_eff = mix(spec_shutoff, 1.0,
-                                GROWTH_SHUTOFF_LIFT * smoothed_growth_mode);
-        float spec_raw    = spec_onset * shutoff_eff * tier_mode;
-        // Apply bright-scene recovery to the lifted form as well — same
-        // bs_raw and bright_scene weighting.
-        spec_raw = mix(spec_raw, max(spec_raw, bs_raw), bright_scene);
+                                 GROWTH_SHUTOFF_LIFT * smoothed_growth_mode);
+        float spec_normal_flagship = spec_onset * shutoff_eff * tier_mode;
+        float spec_raw_flagship = mix(spec_normal_flagship,
+                                      max(spec_normal_flagship, bs_raw), bright_scene);
+        // The stabilized history carries the broad-achromatic authorization
+        // after the growth lift, so neither recovery nor growth can resurrect
+        // the rejected field. The ungated flagship history stays warm beside it
+        // for an exact live cf_spec_scene_reject A/B in PASS 6.
+        float spec_raw = spec_raw_flagship * scene_spec_keep;
 
         // ---- Light-pump band-pass (sudden sustained brightening) ----
         // Two fixed-alpha EMAs of pnorm_illum_v (highlight-weighted p-norm of
@@ -3281,6 +3369,7 @@ void hook() {
         if (frame == 0) {
             smoothed_bright_frac  = 0.0;
             smoothed_spec_signal  = 0.0;
+            smoothed_spec_flagship = 0.0;
             smoothed_spec_natural = 0.0;
             smoothed_top_frac     = 0.0;
             smoothed_contrast     = contrast;
@@ -3304,6 +3393,8 @@ void hook() {
             smoothed_bright_frac  = mix(smoothed_bright_frac, bright_frac, alpha);
             smoothed_top_frac     = mix(smoothed_top_frac, top_frac, alpha);
             smoothed_spec_signal  = mix(smoothed_spec_signal, spec_raw, alpha_spec);
+            smoothed_spec_flagship = mix(smoothed_spec_flagship,
+                                         spec_raw_flagship, alpha_spec);
             smoothed_spec_natural = mix(smoothed_spec_natural, spec_raw_natural, alpha);
             smoothed_contrast     = mix(smoothed_contrast, contrast, alpha);
             smoothed_log_avg      = mix(smoothed_log_avg, log_avg, alpha);
@@ -3342,7 +3433,7 @@ void hook() {
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
 //!BIND MOTION_FLOW
-//!DESC CelFlare v5.17 (motion-aware additive A2)
+//!DESC CelFlare v5.18 (motion-aware additive A2 + spec coherence)
 
 // =============================================
 //  MAIN TUNING — deep anchors. The supported user surface is the cf_* block
@@ -3666,6 +3757,44 @@ void hook() {
 // nits (dark scene, full signal, Y=1.2) rises from ~534 to ~545.
 #define SPEC_OVERSHOOT_GAIN 0.3
 #define SPEC_RAMP_CEIL      1.10    // Hard cap on ramp; safety against extreme overshoot
+// Experimental spec-field range lock. The raw center ramp always owns the
+// result while it stays within ±SPEC_LOCK_BAND of a same-surface reference;
+// only larger local outliers move. The reference is formed in LUMA, then sent
+// through the ramp. Pair-locked antipodal sampling makes an affine luminance
+// gradient an exact identity despite the ramp's curvature — unlike averaging
+// neighbouring ramp values, which would soften a clean nonlinear transition.
+//
+// A fixed inner 3x3 field supplies local evidence. Four equal-weight outer
+// pairs at cf_spec_radius make this deliberately broad/blunt. The reference
+// remains center-bilateral. The stronger lift is different: an antipodal pair
+// may donate only when its two neighbours agree within the edge range, and a
+// fixed fraction of all pairs must carry spec support. Thus a coherent bright
+// field can fill a pepper pit even when it differs strongly from the center,
+// while a one-sided hard boundary cannot. A blunt 0.05 below-onset pad lets
+// pits join an admitted field; lower pixels remain exact. Thin dark structures
+// surrounded on both sides are the principal A/B risk. The clipped center and
+// super-white stay untouched; sub-clip hot values may still be range-locked.
+#define SPEC_LOCK_RADIUS       cf_spec_radius
+#define SPEC_LOCK_RANGE_LO     0.025
+#define SPEC_LOCK_RANGE_HI     0.100
+#define SPEC_LOCK_SUPPORT_PAD  0.050
+#define SPEC_LOCK_CENTER_W     2.0
+#define SPEC_LOCK_OUTER_W      1.0
+#define SPEC_LOCK_MAX_NEIGH_W (8.0 * (1.0 + SPEC_LOCK_OUTER_W))
+#define SPEC_LOCK_MAX_PAIR_W  (4.0 * (1.0 + SPEC_LOCK_OUTER_W))
+#define SPEC_LOCK_BAND         0.005
+#define SPEC_LOCK_LIFT_MAX     0.500
+#define SPEC_LOCK_SUPPORT_Y    0.025
+#define SPEC_LOCK_CONF_LO      0.35
+#define SPEC_LOCK_CONF_HI      0.70
+#define SPEC_LOCK_MASS_LO      0.30
+#define SPEC_LOCK_MASS_HI      0.60
+#define SPEC_LOCK_LIFT_MASS_LO 0.25
+#define SPEC_LOCK_LIFT_MASS_HI 0.50
+#define SPEC_LOCK_LIFT_EDGE_LO 0.025
+#define SPEC_LOCK_LIFT_EDGE_HI 0.075
+#define SPEC_LOCK_HOT_LO       0.82
+#define SPEC_LOCK_HOT_HI       1.00
 // Luminance-field ring blend (2026-07-16, parked for the upper-stabilizer
 // A/B). Its support-preserving v3 form remains below for comparison, but the
 // field test needs a pure tonal path with no 9px spec operator.
@@ -4132,6 +4261,85 @@ float spec_ramp_shape(float y, float y_low, float g) {
     return min(pow(t, g) + max(y - 1.0, 0.0) * SPEC_OVERSHOOT_GAIN, SPEC_RAMP_CEIL);
 }
 
+// Return (luma reference, accepted-neighbour confidence, pair-supported spec
+// mass, broad positive-envelope luma), plus the independent lift support.
+// The four inner pairs are the exact 8-neighbour 3x3 footprint. The four outer
+// pairs sit halfway between those axes (22.5° phase): interleaving the angular
+// coverage prevents both radii from reinforcing the same cardinal/diagonal
+// spokes, while preserving the same 16 fetches and affine identity. Every pair
+// shares its weaker bilateral weight: one cross-edge tap rejects the whole
+// direction, while yp+yn preserves an affine center level exactly.
+vec4 spec_local_reference(float center_y, float y_low,
+                          out float lift_support) {
+    float r = SPEC_LOCK_RADIUS;
+    vec2 offsets[8] = vec2[8](
+        vec2(1.0, 0.0),
+        vec2(0.0, 1.0),
+        vec2(1.0, 1.0),
+        vec2(1.0,-1.0),
+        vec2( 0.92387953 * r, 0.38268343 * r),
+        vec2( 0.38268343 * r, 0.92387953 * r),
+        vec2(-0.38268343 * r, 0.92387953 * r),
+        vec2( 0.92387953 * r,-0.38268343 * r)
+    );
+    float y_sum = center_y * SPEC_LOCK_CENTER_W;
+    float y_weight = SPEC_LOCK_CENTER_W;
+    float accepted_mass = 0.0;
+    float supported_mass = 0.0;
+    float lift_excess = 0.0;
+    float lift_mass = 0.0;
+    for (int i = 0; i < 8; i++) {
+        vec2 o = offsets[i];
+        float yp = get_luma(HOOKED_texOff( o).rgb);
+        float yn = get_luma(HOOKED_texOff(-o).rgb);
+        float wp = 1.0 - smoothstep(SPEC_LOCK_RANGE_LO,
+                                    SPEC_LOCK_RANGE_HI,
+                                    abs(yp - center_y));
+        float wn = 1.0 - smoothstep(SPEC_LOCK_RANGE_LO,
+                                    SPEC_LOCK_RANGE_HI,
+                                    abs(yn - center_y));
+        float ring_w = i >= 4 ? SPEC_LOCK_OUTER_W : 1.0;
+        float wp2 = wp * wp * ring_w;
+        float wn2 = wn * wn * ring_w;
+        float w = min(wp2, wn2);
+
+        // Soft support is measured directly above the luma onset. A 0.025
+        // span closely tracks the former ~0.08 ramp-support interval across
+        // the live gamma range without evaluating 16 neighbour pow() calls.
+        float sp = smoothstep(y_low, y_low + SPEC_LOCK_SUPPORT_Y, yp);
+        float sn = smoothstep(y_low, y_low + SPEC_LOCK_SUPPORT_Y, yn);
+
+        y_sum += (yp + yn) * w;
+        y_weight += 2.0 * w;
+        accepted_mass += 2.0 * w;
+        supported_mass += (sp + sn) * w;
+        // STRONG PAIR-COHERENT LIFT. A pepper pit in a bright flat field sees
+        // matching values on both sides of every axis; a real boundary makes
+        // antipodal taps disagree. Pair contrast therefore gates donation
+        // independently of the center-to-neighbour delta that defines the
+        // range lock above. Conditional normalization supplies the bright
+        // neighbour level rather than diluting it toward the onset; the fixed
+        // lift-support fraction below prevents one surviving pair from acting
+        // like a complete field.
+        float pair_y = 0.5 * (yp + yn);
+        float pair_match = 1.0 - smoothstep(SPEC_LOCK_LIFT_EDGE_LO,
+                                            SPEC_LOCK_LIFT_EDGE_HI,
+                                            abs(yp - yn));
+        float pair_spec = smoothstep(y_low, y_low + SPEC_LOCK_SUPPORT_Y,
+                                     pair_y);
+        float lift_w = pair_match * pair_spec * ring_w;
+        lift_excess += clamp(pair_y - y_low, 0.0, 1.0 - y_low) * lift_w;
+        lift_mass += lift_w;
+    }
+    float y_ref = min(y_sum / max(y_weight, 1e-6), 1.0);
+    float confidence = clamp(accepted_mass / SPEC_LOCK_MAX_NEIGH_W, 0.0, 1.0);
+    float support = clamp(supported_mass / SPEC_LOCK_MAX_NEIGH_W, 0.0, 1.0);
+    float lift_y = min(y_low + lift_excess / max(lift_mass, 1e-6), 1.0);
+    lift_support = clamp(lift_mass / SPEC_LOCK_MAX_PAIR_W, 0.0, 1.0);
+
+    return vec4(y_ref, confidence, support, lift_y);
+}
+
 vec4 hook() {
 #if cf_debug == 9
     // Motion-flow debug view: the block-match field (MOTION_FLOW, 16x9)
@@ -4182,6 +4390,13 @@ vec4 hook() {
 #endif
     vec4 color = HOOKED_texOff(0);
     vec3 rgb_gamma = color.rgb;
+    // Both temporal tracks stay warm in PASS 5. Mixing complete histories here
+    // makes the dynamic scene-reject control an immediate, exact live A/B;
+    // unlike multiplying separate EMAs, correlated scene changes retain the
+    // flagship alpha instead of acquiring an alpha-squared response.
+    float applied_spec_signal = mix(smoothed_spec_flagship,
+                                    smoothed_spec_signal,
+                                    cf_spec_scene_reject);
 
     // -------------------------------------------------------------------------
     // DEBUG: legend panel (bottom-left) — title + color key for the active view
@@ -4244,7 +4459,7 @@ vec4 hook() {
                 if (bar_x < smoothed_log_avg) dbg = vec3(0.0, 0.6, 0.0);
             } else {
                 // Row 4: spec_signal (cyan)
-                if (bar_x < smoothed_spec_signal) dbg = vec3(0.0, 0.6, 0.6);
+                if (bar_x < applied_spec_signal) dbg = vec3(0.0, 0.6, 0.6);
             }
             // White outline + 25/50/75 tick marks for visual reference.
             const float thick = 0.0015;
@@ -4475,7 +4690,8 @@ vec4 hook() {
     // -------------------------------------------------------------------------
     // SPECULAR BONUS — scene-detected, spatially-modulated
     // -------------------------------------------------------------------------
-    // Scene gate: smoothed_spec_signal from stats pass (16×9 tier detection).
+    // Scene gate: applied_spec_signal selects the continuously warmed flagship
+    // or stabilized stats history (16×9 tier detection).
     // Per-pixel ramp: smoothstep on Y selects which pixels get boost.
     // Y_illum modulates peak and gamma (same pattern as base curve) —
     // adds continuous spatial variation that breaks 8-bit quantization.
@@ -4488,10 +4704,12 @@ vec4 hook() {
         // the shared scene axis hoisted above STEP 4.
         float spec_peak = mix(SPEC_PEAK_DARK, SPEC_PEAK_BRIGHT, apl_t);
         float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, apl_t);
-        // Drive signal: raw luma, Y ONLY. PASS 1 stabilization remains active
-        // for the gentler base curve, but its 9/18px decision footprint is
+        // Drive signal: raw Y ONLY. PASS 1 stabilization remains active for
+        // the gentler base curve, but its 9/18px decision footprint is
         // deliberately excluded from this steep ramp after it drew visible
-        // cloud shoulders. A saturation-gated peak-channel (V)
+        // cloud shoulders. The optional range lock below constrains ramp
+        // outliers; it never replaces this center driver.
+        // A saturation-gated peak-channel (V)
         // escape for dim saturated emissives (red LED Y=0.21, blue laser
         // Y=0.07, magenta neon Y=0.29) lived here from v5.1 (v_drive +
         // SPEC_V_ESCAPE luma fade 0.45-0.60) and was DELETED 2026-07-02
@@ -4507,17 +4725,79 @@ vec4 hook() {
         // driver to THIS ramp. The surviving V path is the bounded
         // BASE_V_CREDIT on the ~10x-gentler base ramp (see its block for
         // why that one is safe where this one wasn't).
-        float spec_driver = Y_gamma;
         // APL-tiered onset: parabolic bump pushes the ramp threshold up in
         // mid-bright scenes where lots of pixels are 0.88–0.93 but aren't
         // genuine specular. Endpoints stay at SPEC_Y_LOW. Bump peaks at
         // apl_t=0.5 with value SPEC_Y_LOW_MID_BUMP.
         float spec_y_low = SPEC_Y_LOW
                          + SPEC_Y_LOW_MID_BUMP * apl_t * (1.0 - apl_t) * 4.0;
-        // Ramp shape (onset smoothstep, pow, super-white overshoot bonus,
-        // hard ceil) lives in spec_ramp_shape() so the blend below can
-        // evaluate the identical curve per tap.
-        float center_r = spec_ramp_shape(spec_driver, spec_y_low, spec_gamma);
+        float ordinary_r = pow(smoothstep(spec_y_low, 1.0, Y_gamma), spec_gamma);
+        float raw_ordinary_r = ordinary_r;
+
+        // Edge-aware LOCAL RANGE LOCK in spec-strength space. The bilateral
+        // luma field produces a reference ramp and evidence only. Raw r stays
+        // exact while it lies inside ±BAND; large deviations are clipped to
+        // that local band only where enough same-surface, spec-supporting mass
+        // exists. A clean affine luma ramp is an algebraic identity because
+        // each accepted antipodal pair averages exactly to center_y before the
+        // nonlinear ramp. Insufficient evidence, an isolated glint, or a hard
+        // edge falls back to raw. The 0.05 below-onset pad can fill a grain pit
+        // inside a broad admitted field; this blunt A/B accepts wider reach.
+        if (cf_spec_stab > 0.0
+            && cf_spec > 0.0
+            && cf_strength > 0.0
+            && applied_spec_signal > 1e-5
+            && Y_gamma > spec_y_low - SPEC_LOCK_SUPPORT_PAD
+            && ordinary_r < SPEC_LOCK_HOT_HI)
+        {
+            float lift_support;
+            vec4 local = spec_local_reference(Y_gamma, spec_y_low,
+                                              lift_support);
+            float ref_r = pow(smoothstep(spec_y_low, 1.0, local.x), spec_gamma);
+            float locked_r = ref_r
+                           + clamp(ordinary_r - ref_r,
+                                   -SPEC_LOCK_BAND, SPEC_LOCK_BAND);
+            locked_r = clamp(locked_r, 0.0, 1.0);
+
+            float confidence = smoothstep(SPEC_LOCK_CONF_LO,
+                                          SPEC_LOCK_CONF_HI, local.y);
+            float support = smoothstep(SPEC_LOCK_MASS_LO,
+                                       SPEC_LOCK_MASS_HI, local.z);
+            // Protect the hot core only from DOWNWARD correction. Fading a
+            // lifted grain pit here can withdraw support faster than raw r
+            // rises, creating a non-monotone notch below a clipped field.
+            float hot_release = 1.0;
+            if (locked_r < ordinary_r)
+                hot_release -= smoothstep(SPEC_LOCK_HOT_LO,
+                                          SPEC_LOCK_HOT_HI, ordinary_r);
+            ordinary_r = mix(ordinary_r, locked_r,
+                             cf_spec_stab * confidence * support * hot_release);
+
+            // STRONG ADJACENT LIFT. The pair-coherent conditional mean can set
+            // a much higher floor than the former fixed-area average, but it
+            // can only raise and never extrapolates beyond a donor. Antipodal
+            // contrast plus fixed support reject true boundaries; a pepper pit
+            // surrounded by a coherent bright field is deliberately filled.
+            float lift_r = pow(smoothstep(spec_y_low, 1.0, local.w), spec_gamma);
+            float lift_floor = max(lift_r - SPEC_LOCK_BAND, 0.0);
+            float lift_target = max(ordinary_r,
+                                    min(lift_floor,
+                                        raw_ordinary_r + SPEC_LOCK_LIFT_MAX));
+            float lift_evidence = smoothstep(SPEC_LOCK_LIFT_MASS_LO,
+                                             SPEC_LOCK_LIFT_MASS_HI,
+                                             lift_support);
+            float lift_center = smoothstep(spec_y_low - SPEC_LOCK_SUPPORT_Y,
+                                           spec_y_low, Y_gamma);
+            ordinary_r = mix(ordinary_r, lift_target,
+                             cf_spec_stab * lift_evidence * lift_center);
+
+        }
+        // Super-white is raw center evidence: add it after the range lock so a
+        // neighbour can neither donate it nor average it away. At
+        // cf_spec_stab=0 this is algebraically the flagship local ramp.
+        float center_r = ordinary_r
+                       + max(Y_gamma - 1.0, 0.0) * SPEC_OVERSHOOT_GAIN;
+        center_r = min(center_r, SPEC_RAMP_CEIL);
         float spec_ramp = center_r;
         #if SPEC_BLEND
         // The center ramp owns support. Below onset center_r is exactly 0,
@@ -4567,7 +4847,7 @@ vec4 hook() {
         // with the base curve on its own). Scaling here (not on the PEAK
         // defines) keeps the dark:bright ratio and saturation gate untouched
         // at any knob setting.
-        spec_strength = spec_peak * spec_ramp * smoothed_spec_signal
+        spec_strength = spec_peak * spec_ramp * applied_spec_signal
                       * cf_spec * cf_strength;
 
         // Saturation gate. Genuine specular is near-white. Bright colored

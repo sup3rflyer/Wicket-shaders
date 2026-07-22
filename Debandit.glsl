@@ -250,18 +250,18 @@
 1.0
 
 //!PARAM db_thr
-//!DESC Banding step-size ceiling (8-bit codes) — drives the amplitude gate, snap reach and envelope. ↑ = bigger steps (2 = typical web, 4 = brutal) · ↓ = gentler.
+//!DESC Banding step-size ceiling (8-bit codes) — drives the amplitude gate, snap reach and envelope. ↑ = bigger steps (2 = typical web, 4 = brutal) · ↓ = gentler. Default 1.5 protects faint soft structure (defocused lines); raise per-source for rough encodes.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.5
 //!MAXIMUM 4.0
-2.0
+1.5
 
 //!PARAM db_flat
 //!DESC Luma flatness ceiling (8-bit codes, ±32px window) — above it = texture, correction fades out (zero at 2×). ↑ = reach steeper gradients · ↓ = protect more detail.
 //!TYPE DYNAMIC float
 //!MINIMUM 2.0
 //!MAXIMUM 24.0
-6.0
+5.0
 
 //!PARAM db_chroma
 //!DESC Chroma-path strength (opponent). ↑ 1 = full (shipped) · 0 = luma-only. Independently gated — fixes chroma banding even where steep luma shading shuts the luma gates.

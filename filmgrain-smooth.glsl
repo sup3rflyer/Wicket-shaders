@@ -183,6 +183,12 @@ const uvec2 isize = uvec2(gl_WorkGroupSize) + uvec2(2 * MAX_TAPS);
 shared float grain_r[isize.y][isize.x];
 shared float grain_g[isize.y][isize.x];
 shared float grain_b[isize.y][isize.x];
+// NV-Vulkan SSBO snapshot: per-thread reads of a BUFFER-directive SSBO run
+// uncached on NVIDIA Vulkan (dev-notes win-harness results-0723-ssbo-sweep /
+// Match Grain audit), so lane 0 reads the frame counter once per workgroup
+// and publishes it through shared memory. Value-identical — the tick pass
+// finished writing before this pass launched, so every lane reads one value.
+shared float sh_gen_frame;
 
 const float weights_red[3] = { 0.23899, 0.52202, 0.23899 };
 const float weights_green[5] = { 0.05449, 0.24420, 0.40262, 0.24420, 0.05449 };
@@ -205,9 +211,14 @@ float rand_triangular(inout uint state, float variance_scale) {
 
 void hook() {
     uint num_threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    // SSBO snapshot (see sh_gen_frame above). The barrier sits in uniform
+    // control flow ahead of the existing two, before any use of the seed.
+    if (gl_LocalInvocationIndex == 0u)
+        sh_gen_frame = m_gen_frame;
+    barrier();
     // Source-locked seed: floor(counter * rate) reseeds once per source frame at
     // grain_rate 1.0, every 2nd source frame at 0.5, on ANY display.
-    uint frame_seed = uint(max(0.0, floor(m_gen_frame * grain_rate)));
+    uint frame_seed = uint(max(0.0, floor(sh_gen_frame * grain_rate)));
 
     // grain_preset resolve (gen side): a tier sets global saturation and the
     // per-channel chroma balance / variance / intensity-mult (the tunings that

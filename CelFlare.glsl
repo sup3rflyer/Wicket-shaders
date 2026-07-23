@@ -3433,6 +3433,7 @@ void hook() {
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
 //!BIND MOTION_FLOW
+//!COMPUTE 16 16
 //!DESC CelFlare v5.18 (motion-aware additive A2 + spec coherence)
 
 // =============================================
@@ -4340,7 +4341,43 @@ vec4 spec_local_reference(float center_y, float y_low,
     return vec4(y_ref, confidence, support, lift_y);
 }
 
-vec4 hook() {
+// ---------------------------------------------------------------------------
+// WORKGROUP STATE SNAPSHOT — NV-Vulkan uncached SSBO reads
+// ---------------------------------------------------------------------------
+// On NVIDIA Vulkan, per-pixel loads from a BUFFER-directive SSBO bypass the
+// cache: this pass's ~10 scalar + 4 pump-cell reads per pixel measured
+// 0.153 ms/frame at 1080p vs 0.024 ms for the identical pass on d3d11
+// (dev-notes win-harness results-0723-ssbo-sweep; same find as the Match
+// Grain composite). So the pass is COMPUTE and lane 0 snapshots every scalar
+// the live path reads into workgroup shared memory (the 16x9 pump mask cells
+// cooperatively), published by a single barrier FIRST in hook(), before any
+// data-dependent return (FXC X3663: barriers only in uniform control flow;
+// no other barrier exists in this TU). Value-identical: PASS 5 finished
+// writing this state before the pass launched, so every lane would read the
+// same values. Debug-view reads (cf_debug != 0 builds) stay direct.
+//
+// Structure: COMPUTE hooks must define void hook() and write out_image
+// themselves (the vec4-return protocol is fragment-only — see the other
+// compute passes in this file). The whole former fragment body lives
+// unchanged in cf_shade(); hook() is a thin wrapper owning the snapshot,
+// the barrier and the guarded store, so every cf_shade() return site and
+// its X3663 story stay exactly as reviewed.
+shared float sh_spec_flagship;
+shared float sh_spec_signal;
+shared float sh_bright_frac;
+shared float sh_growth_mode;
+shared float sh_log_avg;
+shared float sh_top_frac;
+shared float sh_contrast;
+#if ENABLE_LIGHT_PUMP
+shared float sh_pump_env;
+shared float sh_pump_cover_gate;
+#if ENABLE_SPATIAL_PUMP
+shared float sh_pump_mask_cell[144];
+#endif
+#endif
+
+vec4 cf_shade() {
 #if cf_debug == 9
     // Motion-flow debug view: the block-match field (MOTION_FLOW, 16x9)
     // bilinear-upsampled. Grey (0.5,0.5) = still; red/green encode +x/+y
@@ -4394,8 +4431,8 @@ vec4 hook() {
     // makes the dynamic scene-reject control an immediate, exact live A/B;
     // unlike multiplying separate EMAs, correlated scene changes retain the
     // flagship alpha instead of acquiring an alpha-squared response.
-    float applied_spec_signal = mix(smoothed_spec_flagship,
-                                    smoothed_spec_signal,
+    float applied_spec_signal = mix(sh_spec_flagship,
+                                    sh_spec_signal,
                                     cf_spec_scene_reject);
 
     // -------------------------------------------------------------------------
@@ -4538,7 +4575,7 @@ vec4 hook() {
     // face brightness range that would create visible contours.
 
     // Scene-level adaptation (from SSBO — uniform per frame)
-    float bf = smoothstep(0.0, BRIGHT_FRAC_REF, smoothed_bright_frac);
+    float bf = smoothstep(0.0, BRIGHT_FRAC_REF, sh_bright_frac);
 
     // Regional adaptation (from illumination field — varies per pixel)
     float spatial_t = Y_illum;
@@ -4547,7 +4584,7 @@ vec4 hook() {
     // grows — that's the moment the user wants the impressive HDR pop. Pulls
     // PEAK_ATTEN back toward zero in proportion to smoothed_growth_mode.
     #if ENABLE_GROWTH_BYPASS
-    float peak_atten_eff = PEAK_ATTEN * (1.0 - GROWTH_PEAK_ATTEN_BYPASS * smoothed_growth_mode);
+    float peak_atten_eff = PEAK_ATTEN * (1.0 - GROWTH_PEAK_ATTEN_BYPASS * sh_growth_mode);
     #else
     float peak_atten_eff = PEAK_ATTEN;
     #endif
@@ -4559,7 +4596,7 @@ vec4 hook() {
     // shaped-not-dampened weight: OFF through mid-key, phasing in only for
     // genuinely bright scene keys (both smoothsteps of the temporally
     // smoothed log_avg, so shape transitions inherit the EMA's smoothness).
-    float apl_t = smoothstep(APL_KEY_DARK, APL_KEY_BRIGHT, smoothed_log_avg);
+    float apl_t = smoothstep(APL_KEY_DARK, APL_KEY_BRIGHT, sh_log_avg);
     // cool_w — bright-key scenes cool toward the SDR grade, weighted by the
     // illumination field so the cooling lands on broad bright FIELDS while
     // mid-luminance regions (faces, warm objects) keep the ship curve — see
@@ -4570,14 +4607,14 @@ vec4 hook() {
     // lift — exactly the uniform-lift class the design audit rejected).
     float cool_w  = smoothstep(0.5, 1.0, apl_t)
                   * smoothstep(COOL_ILLUM_LO, COOL_ILLUM_HI, Y_illum);
-    float relax_w = cool_w * smoothstep(TOP_FRAC_LO, TOP_FRAC_HI, smoothed_top_frac);
+    float relax_w = cool_w * smoothstep(TOP_FRAC_LO, TOP_FRAC_HI, sh_top_frac);
     // Growth-mode bypass on the SHAPE, mirroring the amplitude bypass at
     // STEP 4: an expanding bright event should restore the full pre-reshape
     // curve (bloom through the midtones), not just its amplitude — without
     // this the steepened gamma would keep holding the event's mid-rim down
     // at full growth_mode (audit-caught half-bypass).
     #if ENABLE_GROWTH_BYPASS
-    float bw_gamma = cool_w * (1.0 - GROWTH_APL_BYPASS * smoothed_growth_mode);
+    float bw_gamma = cool_w * (1.0 - GROWTH_APL_BYPASS * sh_growth_mode);
     #else
     float bw_gamma = cool_w;
     #endif
@@ -4640,7 +4677,7 @@ vec4 hook() {
     // Flat scenes get softer expansion, dramatic scenes get punchier.
     #if ENABLE_DYNAMIC_INTENSITY
     {
-        float dyn_factor = smoothstep(DYN_CONTRAST_LOW, DYN_CONTRAST_HIGH, smoothed_contrast);
+        float dyn_factor = smoothstep(DYN_CONTRAST_LOW, DYN_CONTRAST_HIGH, sh_contrast);
         float dyn_intensity = mix(DYN_INTENSITY_LOW, DYN_INTENSITY_HIGH, dyn_factor);
         expansion = 1.0 + (expansion - 1.0) * dyn_intensity;
     }
@@ -4681,7 +4718,7 @@ vec4 hook() {
         // loses a small amount of dark-bias boost, which is the right
         // tradeoff (the spatial curve already handles dark-scene boost).
         #if ENABLE_GROWTH_BYPASS
-        apl_factor = mix(apl_factor, 1.0, GROWTH_APL_BYPASS * smoothed_growth_mode);
+        apl_factor = mix(apl_factor, 1.0, GROWTH_APL_BYPASS * sh_growth_mode);
         #endif
         expansion = 1.0 + (expansion - 1.0) * apl_factor;
     }
@@ -4905,10 +4942,10 @@ vec4 hook() {
         // see PASS 5's PUMP_MASK_SOFTEN). It rounds the bilinear diamond and
         // fills a large event's under-driven bright body. The raw env
         // (pump_env_cell) stays the dynamics state.
-        float m00 = pump_mask_cell[pi0.y * 16 + pi0.x];
-        float m10 = pump_mask_cell[pi0.y * 16 + pi1.x];
-        float m01 = pump_mask_cell[pi1.y * 16 + pi0.x];
-        float m11 = pump_mask_cell[pi1.y * 16 + pi1.x];
+        float m00 = sh_pump_mask_cell[pi0.y * 16 + pi0.x];
+        float m10 = sh_pump_mask_cell[pi0.y * 16 + pi1.x];
+        float m01 = sh_pump_mask_cell[pi1.y * 16 + pi0.x];
+        float m11 = sh_pump_mask_cell[pi1.y * 16 + pi1.x];
         pump_mask = mix(mix(m00, m10, pgf.x), mix(m01, m11, pgf.x), pgf.y);
         #if SPATIAL_PUMP_ADDITIVE
         // ADDITIVE: the mask (per-cell established-gated brightening env) is the
@@ -4920,7 +4957,7 @@ vec4 hook() {
         // light's strength or rhythm. The guarded local amplitude is mask ×
         // cover. A cell's bounded post-proof maintenance credit is already
         // folded into mask.
-        float pump_local = pump_mask * pump_cover_gate;
+        float pump_local = pump_mask * sh_pump_cover_gate;
         #else
         // SUBTRACTIVE: the mask (per-cell "is this region brightening" ∈[0,1]) only
         // SUPPRESSES the global scalar pump — it can't add pump. pump_env already
@@ -4928,10 +4965,10 @@ vec4 hook() {
         // A brightening region has mask→1 (keeps the scalar); a static/darkening one
         // decays to 0 (suppressed). A reveal/pan/occluder-wake can't manufacture pump:
         // no global event ⇒ pump_env ~0 ⇒ product ~0 regardless of any local rise.
-        float pump_local = pump_env * pump_mask;
+        float pump_local = sh_pump_env * pump_mask;
         #endif
         #else
-        float pump_local = pump_env;
+        float pump_local = sh_pump_env;
         #endif
         // Down-gate where growth-mode is already restoring expansion (a fireball
         // triggers both): keeps pump + growth-bypass + spec from stacking the
@@ -4944,7 +4981,7 @@ vec4 hook() {
         // expansion 1.0 it would still lift without this). PUMP_GAIN_CEIL is
         // NOT scaled: it's the safety roof, not a taste knob.
         float pump_str = PUMP_STRENGTH * cf_pump * cf_strength
-                       * (1.0 - PUMP_GROWTH_DAMP * smoothed_growth_mode);
+                       * (1.0 - PUMP_GROWTH_DAMP * sh_growth_mode);
         pump_gain = min(pump_local * pump_str * pump_w, PUMP_GAIN_CEIL);
         expansion *= 1.0 + pump_gain;
     }
@@ -5080,7 +5117,7 @@ vec4 hook() {
             #endif
             float ps_cos_dh = (oklab_orig.y * PS_HUE_COS + oklab_orig.z * PS_HUE_SIN) * inv_chroma;
             float ps_hue_w = pow(max(ps_cos_dh, 0.0), PS_HUE_POWER);
-            float ps_gate = smoothstep(PS_BRIGHT_FRAC_LOW, PS_BRIGHT_FRAC_HIGH, smoothed_bright_frac);
+            float ps_gate = smoothstep(PS_BRIGHT_FRAC_LOW, PS_BRIGHT_FRAC_HIGH, sh_bright_frac);
             float ps_chroma_w = smoothstep(0.015, 0.06, chroma_orig)
                               * (1.0 - smoothstep(0.04, PS_CHROMA_CEIL + 0.04, chroma_orig));
             float ps_bright_w = smoothstep(PS_BRIGHT_FLOOR, PS_BRIGHT_FLOOR + 0.15, Y_decision);
@@ -5181,4 +5218,40 @@ vec4 hook() {
     // Alpha out is a clean 1.0 on every production path — color.a held
     // PASS 1's encoded decision luma, which must not leak past this pass.
     return vec4(rgb_pq, 1.0);
+}
+
+void hook() {
+    // State snapshot — must stay the first statements of hook(), before any
+    // data-dependent return (the shared block above has the whole story).
+    if (gl_LocalInvocationIndex == 0u) {
+        sh_spec_flagship = smoothed_spec_flagship;
+        sh_spec_signal   = smoothed_spec_signal;
+        sh_bright_frac   = smoothed_bright_frac;
+        sh_growth_mode   = smoothed_growth_mode;
+        sh_log_avg       = smoothed_log_avg;
+        sh_top_frac      = smoothed_top_frac;
+        sh_contrast      = smoothed_contrast;
+        #if ENABLE_LIGHT_PUMP
+        sh_pump_env        = pump_env;
+        sh_pump_cover_gate = pump_cover_gate;
+        #endif
+    }
+    // One cell per lane — the COMPUTE directive must keep >= 144 lanes per
+    // group (16x16 = 256 shipped; measured faster than 32x32 here — this TU
+    // is register-heavy, the opposite of Match Grain's light composite).
+    #if ENABLE_LIGHT_PUMP && ENABLE_SPATIAL_PUMP
+    if (gl_LocalInvocationIndex < 144u)
+        sh_pump_mask_cell[gl_LocalInvocationIndex] =
+            pump_mask_cell[gl_LocalInvocationIndex];
+    #endif
+    barrier();
+
+    vec4 c = cf_shade();
+    // The block dispatch rounds up past the frame edge; padding lanes still
+    // shade (their clamped samples are harmless and they must reach the
+    // barrier), they just never store. Same guard idiom as the grain
+    // shaders' fixed-grid passes.
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(gid, ivec2(HOOKED_size))))
+        imageStore(out_image, gid, c);
 }

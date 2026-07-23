@@ -2064,8 +2064,10 @@ void hook() {
 // unchanged. MUST equal this pass's WIDTH/HEIGHT directives above (960 x 540)
 // Same translation unit, no compile guard. This is not a picture resolution:
 // template is a reusable vocabulary on the current synthesis lattice, not a
-// picture resolution. The composite derives its dims from imageSize(GRAIN_FIELD) so it
-// can't desync; only these two same-file sites are hand-kept in lockstep.
+// picture resolution. THREE same-file sites are hand-kept in lockstep: the
+// TEXTURE SIZE directive, this define, and the composite's const gsize (it
+// hardcodes the dims too since the 2026-07-23 perf round — constant divisors
+// let its wrap mods strength-reduce; it no longer reads imageSize).
 // (Directive prefix omitted here on purpose: the parser splits sections on
 // that marker even inside a comment.)
 #define GEN_GRID ivec2(960, 540)
@@ -2484,6 +2486,35 @@ const vec3 field_var = vec3(0.08318138 * 0.08318138,
                             0.06602582 * 0.06602582,
                             0.04909565 * 0.04909565);
 
+// Workgroup snapshot of every GRAIN_STATE scalar the live path reads. On the
+// NVIDIA Vulkan driver the per-pixel SSBO loads in this pass measured
+// ~0.75 ms/present at 4K — 6x the entire remaining pass — while the same
+// code through SPIRV-Cross/FXC on d3d11 shows no such cost (mechanism
+// unproven; end-to-end probes in win-harness results-0723-matchgrain-audit).
+// One lane loads the state, a
+// barrier publishes it, and every pixel reads shared memory instead. The
+// values are the same fp32 bits, so output is bit-identical. The barrier
+// sits in uniform control flow BEFORE every data-dependent return below,
+// which keeps FXC/D3D11 X3663-legal (no barrier is ever reached in varying
+// flow; this pass has no other barriers).
+shared float s_state_magic;
+shared float s_state_epoch;
+shared float s_field_valid;
+shared float s_eff_render;
+shared float s_source_aspect;
+shared float s_active_inset_x;
+shared float s_active_inset_y;
+shared float s_arr_seed;
+shared float s_shot_restore_boost;
+shared float s_field_var_r;
+shared float s_field_var_g;
+shared float s_field_var_b;
+shared float s_field_cov_rg;
+shared float s_field_cov_rb;
+shared float s_field_cov_gb;
+shared float s_char_p[8];
+shared float s_restore_p[8];
+
 // --- HDR (PQ BT.2020 output) domain bridge, grain_hdr=1. The grain model is
 // measured on gamma-encoded SDR source codes at LUMA, but whenever the player
 // target is PQ (target-trc=pq, or an HDR-signalled display) the OUTPUT pixels
@@ -2535,12 +2566,12 @@ float matched_grain_scale(float lum, float hdr_mode) {
                     0.0, float(MP_TONE_BINS_OUT - 1));
     int i0 = int(floor(p));
     int i1 = min(i0 + 1, MP_TONE_BINS_OUT - 1);
-    float char_p = mix(m_char_p[i0], m_char_p[i1], fract(p));
-    float restore_p = mix(m_restore_p[i0], m_restore_p[i1], fract(p));
+    float char_p = mix(s_char_p[i0], s_char_p[i1], fract(p));
+    float restore_p = mix(s_restore_p[i0], s_restore_p[i1], fract(p));
     // Keep this expression identical to PASS 1's p_total accounting.
     // The retained boost lane is neutral in the current estimator; keep this
     // arithmetic synchronized with PASS 1 for state compatibility.
-    float boost_q = clamp(m_shot_restore_boost - 1.0, 0.0, 1.0);
+    float boost_q = clamp(s_shot_restore_boost - 1.0, 0.0, 1.0);
     float effective_restore = (restore_gain <= 2.0)
                             ? mix(restore_gain,
                                   min(2.0, 2.0 * restore_gain), boost_q)
@@ -2608,16 +2639,16 @@ float density_colour_energy_cap(vec3 carrier) {
     if (neutral_level <= 1.0e-8)
         return 1.0;
     vec3 q = luma_coeff * carrier;
-    vec3 cap_field_var = vec3(m_field_var_r, m_field_var_g, m_field_var_b);
+    vec3 cap_field_var = vec3(s_field_var_r, s_field_var_g, s_field_var_b);
     float carrier_var = dot(q * q, cap_field_var)
-        + 2.0 * (q.r * q.g * m_field_cov_rg
-               + q.r * q.b * m_field_cov_rb
-               + q.g * q.b * m_field_cov_gb);
+        + 2.0 * (q.r * q.g * s_field_cov_rg
+               + q.r * q.b * s_field_cov_rb
+               + q.g * q.b * s_field_cov_gb);
     float neutral_var = neutral_level * neutral_level * (
           dot(luma_coeff * luma_coeff, cap_field_var)
-        + 2.0 * (luma_coeff.r * luma_coeff.g * m_field_cov_rg
-               + luma_coeff.r * luma_coeff.b * m_field_cov_rb
-               + luma_coeff.g * luma_coeff.b * m_field_cov_gb));
+        + 2.0 * (luma_coeff.r * luma_coeff.g * s_field_cov_rg
+               + luma_coeff.r * luma_coeff.b * s_field_cov_rb
+               + luma_coeff.g * luma_coeff.b * s_field_cov_gb));
     if (carrier_var <= neutral_var * 1.0001)
         return 1.0;
     return min(sqrt(max(neutral_var, 0.0)
@@ -2632,7 +2663,11 @@ float density_colour_energy_cap(vec3 carrier) {
 // half-texel cell boundaries.
 vec3 grain_point(vec2 fpos, ivec2 g) {
     ivec2 i = ivec2(floor(fpos));
-    ivec2 a = (i % g + g) % g;                  // component-wise wrap
+    // Callers guarantee a non-negative coordinate (tpl_sample adds one
+    // template extent for exactly this reason), so a single mod is
+    // wrap-identical — and with the compile-time g it strength-reduces to
+    // multiply/shift instead of a per-tap integer divide.
+    ivec2 a = i % g;                            // component-wise wrap
     return imageLoad(GRAIN_FIELD, a).rgb;
 }
 
@@ -2650,10 +2685,11 @@ uint pcg_hash(uint s) {
 // and the flip can go one period negative, bounded by -TPL_OV). One template
 // extent is added before the fetch so the coordinate reaching grain_point's
 // integer wrap is ALWAYS non-negative: GLSL leaves % formally undefined on
-// negative operands, and while every real backend folds it correctly through
-// the double-mod, the D3D11/SPIRV-Cross path is unvalidated — one vec2 add
-// buys spec-clean portability (audit 2026-07-10). Wrap-equivalent, so output
-// is bit-identical. Each block shows a randomized (integer offset + H/V
+// negative operands, and since the 2026-07-23 perf round grain_point uses a
+// SINGLE mod — this add IS the correctness guarantee, not a spec nicety.
+// Removing it would feed negative coords to the wrap (worst case intra
+// >= -TPL_OV on flipped neighbour-overlap samples) and break the torus.
+// Each block shows a randomized (integer offset + H/V
 // flip) window of the toroidal template, re-hashed per visible tick.
 vec3 tpl_sample(vec2 b, vec2 pos, float vseed, ivec2 g) {
     vec2 intra = pos - b * TPL_BLOCK;
@@ -2717,8 +2753,16 @@ vec3 picture_linear(vec2 pos, float vseed, ivec2 g) {
 //    < 1: tent reconstruction between canonical samples
 //  1..1.25: the same tent is the deterministic narrow-footprint integral
 //   > 1.25: stratified integration, growing the grid with footprint span
-// Adjacent estimators crossfade over a quarter-texel transition so changing
-// window height cannot produce a visible grain-power step.
+// Adjacent estimators crossfade over a short transition so changing window
+// height cannot produce a visible grain-power step. The transitions are
+// deliberately NARROW (0.05 step-units, was 0.25): inside a blend every
+// pixel pays BOTH estimators, and common scope presentations sit statically
+// right in the old tent+grid2 band (2.39:1 on a 16:9 display = step 1.34 ->
+// 8 evaluations/pixel, measured 2.8x the flat-content composite). A narrow
+// blend keeps resize continuity while static content lands on one 4-tap
+// estimator; per-tick re-arrangement makes the estimator handoff itself
+// statistically invisible (perf audit 2026-07-23, results-0723-matchgrain-
+// audit).
 // The footprint average deliberately loses only power the output grid cannot
 // resolve; it is not RMS-renormalized. A source/output gain would make the
 // grain a property of the user's scaler instead of the title.
@@ -2765,22 +2809,22 @@ vec3 picture_pixel(vec2 centre, float output_step, float vseed, ivec2 g) {
     // evaluator count. Four per axis is the deliberate portability ceiling;
     // very small outputs remain an approximation rather than compiling large
     // dynamic loops into every backend.
-    if (output_step < 1.5) {
-        float t = smoothstep(1.25, 1.5, output_step);
+    if (output_step < 1.30) {
+        float t = smoothstep(1.25, 1.30, output_step);
         return mix(picture_linear(centre, vseed, g),
                    picture_grid2(centre, output_step, vseed, g), t);
     }
     if (output_step < 2.25)
         return picture_grid2(centre, output_step, vseed, g);
-    if (output_step < 2.5) {
-        float t = smoothstep(2.25, 2.5, output_step);
+    if (output_step < 2.30) {
+        float t = smoothstep(2.25, 2.30, output_step);
         return mix(picture_grid2(centre, output_step, vseed, g),
                    picture_grid3(centre, output_step, vseed, g), t);
     }
     if (output_step < 3.25)
         return picture_grid3(centre, output_step, vseed, g);
-    if (output_step < 3.5) {
-        float t = smoothstep(3.25, 3.5, output_step);
+    if (output_step < 3.30) {
+        float t = smoothstep(3.25, 3.30, output_step);
         return mix(picture_grid3(centre, output_step, vseed, g),
                    picture_grid4(centre, output_step, vseed, g), t);
     }
@@ -2788,6 +2832,32 @@ vec3 picture_pixel(vec2 centre, float output_step, float vseed, ivec2 g) {
 }
 
 void hook() {
+    // Publish the per-frame state snapshot before any return: the barrier
+    // must dominate every exit path (FXC uniformity), and mpv dispatches
+    // whole workgroups, so every lane reaches it.
+    if (gl_LocalInvocationIndex == 0u) {
+        s_state_magic = m_state_magic;
+        s_state_epoch = m_state_epoch;
+        s_field_valid = m_field_valid;
+        s_eff_render = m_eff_render;
+        s_source_aspect = m_source_aspect;
+        s_active_inset_x = m_active_inset_x;
+        s_active_inset_y = m_active_inset_y;
+        s_arr_seed = m_arr_seed;
+        s_shot_restore_boost = m_shot_restore_boost;
+        s_field_var_r = m_field_var_r;
+        s_field_var_g = m_field_var_g;
+        s_field_var_b = m_field_var_b;
+        s_field_cov_rg = m_field_cov_rg;
+        s_field_cov_rb = m_field_cov_rb;
+        s_field_cov_gb = m_field_cov_gb;
+        for (int i = 0; i < 8; i++) {
+            s_char_p[i] = m_char_p[i];
+            s_restore_p[i] = m_restore_p[i];
+        }
+    }
+    barrier();
+
     vec4 color = HOOKED_tex(HOOKED_pos);
 
     // State-validity guard: on RGB / no-LUMA sources PASS 1 never runs, so
@@ -2795,9 +2865,9 @@ void hook() {
     // not guaranteed; NaN m_eff_render would pass a <=0 gate as false). An
     // unvalidated state must passthrough unconditionally — including debug,
     // whose rows would render garbage.
-    if (!(abs(m_state_magic - MP_STATE_MAGIC_OUT) < 0.0001
-          && abs(m_state_epoch - state_epoch) < 0.5
-          && m_field_valid > 0.5)) {
+    if (!(abs(s_state_magic - MP_STATE_MAGIC_OUT) < 0.0001
+          && abs(s_state_epoch - state_epoch) < 0.5
+          && s_field_valid > 0.5)) {
         imageStore(out_image, ivec2(gl_GlobalInvocationID), color);
         return;
     }
@@ -2805,7 +2875,7 @@ void hook() {
     // Real zero path: avoid template reads and, in HDR mode, avoid a decode/encode
     // round trip. PASS 1 still observes, so later evidence opens without a toggle-
     // induced reset or stale EMA.
-    if ((grain_gain <= 0.0 || match_grain <= 0.0 || m_eff_render <= 0.0)
+    if ((grain_gain <= 0.0 || match_grain <= 0.0 || s_eff_render <= 0.0)
         && debug_match <= 0.5) {
         imageStore(out_image, ivec2(gl_GlobalInvocationID), color);
         return;
@@ -2816,10 +2886,14 @@ void hook() {
     // then nest the committed baked-picture rectangle inside it. Neither kind
     // of matte may resize or rephase the field.
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 gsize = imageSize(GRAIN_FIELD);
+    // Compile-time template dims: constant divisors let every wrap mod below
+    // strength-reduce to multiply/shift instead of a hardware integer divide
+    // per tap. MUST equal the GRAIN_FIELD SIZE directive and PASS 2's
+    // GEN_GRID (960 x 540) — same hand-kept lockstep rule, no compile guard.
+    ivec2 gsize = ivec2(960, 540);
     vec2 canvas = HOOKED_size;
-    float source_aspect = (m_source_aspect > 0.01)
-                        ? m_source_aspect
+    float source_aspect = (s_source_aspect > 0.01)
+                        ? s_source_aspect
                         : canvas.x / max(canvas.y, 1.0);
     float canvas_aspect = canvas.x / max(canvas.y, 1.0);
     vec2 raster_size = canvas;
@@ -2831,7 +2905,7 @@ void hook() {
         raster_size.y = canvas.x / source_aspect;
         raster_origin.y = 0.5 * (canvas.y - raster_size.y);
     }
-    vec2 baked_inset = clamp(vec2(m_active_inset_x, m_active_inset_y),
+    vec2 baked_inset = clamp(vec2(s_active_inset_x, s_active_inset_y),
                              vec2(0.0), vec2(0.24));
     vec2 active_origin = raster_origin + baked_inset * raster_size;
     vec2 active_size = (vec2(1.0) - 2.0 * baked_inset) * raster_size;
@@ -2886,7 +2960,7 @@ void hook() {
     // Continuity: at u == 0 the sample IS the neighbour's (weight 1) and
     // ramps out by u == TPL_OV. Outside the bands it is a single exact
     // texel fetch at gscale == 1.0, as before.
-    float vseed = m_arr_seed;
+    float vseed = s_arr_seed;
     uint j0 = pcg_hash(uint(vseed) * 2246822519u + 3u);
     vec2 fj = fpos + vec2(float(j0 % 64u), float((j0 >> 8) % 64u));
     vec3 vsum = picture_pixel(fj, gscale, vseed, gsize);
@@ -3037,7 +3111,7 @@ void hook() {
             else if (row == 7)  v = m_shot_conf * 65000.0;
             else if (row == 8)  v = m_loss_mix * 65000.0;
             else if (row == 9)  v = m_tone_conf * 65000.0;
-            else if (row == 10) v = m_eff_render * 30000.0;
+            else if (row == 10) v = s_eff_render * 30000.0;
             else if (row == 11) v = m_structure_ratio * 1000000.0;
             else if (row == 12) v = m_coverage * 65000.0;
             else if (row == 13) v = m_motion * 30000.0;
@@ -3049,13 +3123,13 @@ void hook() {
             else if (row == 19) v = m_gen_frame;
             else if (row < 28)  v = sqrt(max(m_master_p[row - 20], 0.0))
                                       * 2000000.0;
-            else if (row < 36)  v = sqrt(max(m_restore_p[row - 28], 0.0))
+            else if (row < 36)  v = sqrt(max(s_restore_p[row - 28], 0.0))
                                       * 2000000.0;
             else if (row < 44)  v = sqrt(max(m_shot_obs_p[row - 36]
                                       * m_shot_obs_w[row - 36], 0.0))
                                       * 2000000.0;
-            else if (row == 44) v = m_active_inset_x * 200000.0;
-            else if (row == 45) v = m_active_inset_y * 200000.0;
+            else if (row == 44) v = s_active_inset_x * 200000.0;
+            else if (row == 45) v = s_active_inset_y * 200000.0;
             else if (row == 46) v = m_pending_inset_x * 200000.0;
             else if (row == 47) v = m_pending_inset_y * 200000.0;
             else if (row == 48) v = max(m_geom_streak, m_geom_streak_y);

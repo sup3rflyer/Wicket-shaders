@@ -1,7 +1,10 @@
 // Small-template (TPL) architecture since 2026-07-10: grain is generated into
-// a 960x540 toroidal template (texels represent 2160-line scan texels) and the
-// composite assembles a picture-relative 2160-line scan from per-block randomized
-// template windows, AV1-FGS style. This file is CANONICAL and hand-maintained;
+// a 960x540 toroidal vocabulary and assembled in normalized active-picture
+// space from per-block randomized template windows, AV1-FGS style. The current
+// 2160-sample picture-height lattice is an implementation bandwidth/calibration
+// choice, not a film format or a "grain resolution": source-matched correlation
+// length stays picture-relative at every source/output resolution. This file is
+// CANONICAL and hand-maintained;
 // the pre-TPL full-field A/B build is archived outside the public release repo.
 // Copyright (C) 2026 Ágúst Ari
 // Licensed under GPL-3.0 — see LICENSE
@@ -30,10 +33,11 @@
 //            source raster with a fixed cut/matte probe, remaps the grain
 //            observer into the committed active picture, and writes only
 //            GRAIN_STATE.
-//   PASS 2 - Compute 32x32 at LUMA: regenerates the persistent 960x540 grain
-//            template on source-grain ticks and refreshes composite scalars.
-//   PASS 3 - Compute 32x32 at OUTPUT: assembles the picture-relative virtual
-//            field from randomized template windows and composites it only
+//   PASS 2 - Compute 32x32 at LUMA: conditionally regenerates the persistent
+//            960x540 grain vocabulary; skipped ticks retain it while PASS 3
+//            still chooses a fresh arrangement.
+//   PASS 3 - Compute 32x32 at OUTPUT: assembles the picture-space field from
+//            randomized template windows and composites it only
 //            inside the committed active picture.
 //
 // Runtime params. Only match_grain / debug_match / value_warp are on keys (F3 / Ctrl+F3 /
@@ -45,8 +49,10 @@
 //  == CONTROL ===============================================================
 //   match_grain      0 = no synthetic output, 1 = Match Grain+; observation
 //                    continues so live A/B does not cold-start.                [F3]
-//   debug_match      compact 51-row machine-readable posterior/geometry overlay. [Ctrl+F3]
+//   debug_match      compact 52-row machine-readable posterior/geometry overlay. [Ctrl+F3]
 //   state_epoch      harness reset token; bump once per source file.
+//   grain_pause      machine-owned pause input; freezes temporal state; baked
+//                    look edits may rebuild the standing field in place.
 //
 //  == GRAIN LOOK (the dials to tune by eye) =================================
 //   grain_gain       overall grain AMOUNT/strength (1 = calibrated; up to 12).
@@ -57,17 +63,22 @@
 //                    = bimodal/high-per-grain-contrast (CyberCity "harsh"). Amplitude-
 //                    preserving; the value-domain cousin of grain_contrast.    [Alt+F3]
 //   grain_sharpness  measured-size influence: 0.3 = default, 1 = literal read.
-//   grain_rate       temporal cadence: fraction of SOURCE frames that re-seed the
-//                    grain (1 = fresh grain every source frame / "on ones", the
-//                    default; 0.5 = every 2nd source frame / "on twos"). Seeded
-//                    from m_gen_frame so it's display-refresh independent.
+//   grain_rate       visible temporal cadence: fraction of SOURCE frames that
+//                    choose a fresh on-screen arrangement (1 = on ones; 0.5 =
+//                    on twos). Source-locked and display-refresh independent.
+//   grain_gen_rate   template-vocabulary regeneration rate as a fraction of
+//                    visible grain ticks. 1 = every tick; 0.25 = every fourth.
+//                    Arrangement still rehashes on every visible tick, so this
+//                    is a small performance option, not a boil-speed control.
 //   grain_base_sat   explicit per-channel generator prior. 0.25 = calibrated
 //                    look; 0 = true mono. Off-default values drift per-channel
 //                    grain RMS by a few percent.
 //
 //  == RESTORATION (how much grain to rebuild on degraded sources) ===========
 //   restore_gain     missing-power lane only: 0 = character complement C,
-//                    1 = inferred target, >1 = explicit amplitude override.
+//                    1 = inferred target, >1 = explicit amplitude override;
+//                    values near 5 are aggressive shot-specific overrides,
+//                    not a preset; 6 is the expert ceiling.
 //
 //  == PIPELINE / SIZING =====================================================
 //   density_combine  0 = additive, 1 = multiplicative density.
@@ -96,8 +107,9 @@
 //                    expanded highlights (0 under CelFlare).
 //   grain_fade       where grain fades to white: the work-domain luma at
 //                    which grain reaches zero. ONE knob for every chain --
-//                    below the fade the amount follows the title's own
-//                    rendition curve (no aesthetic shoulder). Clip-limited
+//                    below 0.5 it also widens the rise out of black; between
+//                    that toe and the upper fade, amount follows the title's
+//                    own rendition curve (no aesthetic shoulder). Clip-limited
 //                    chains (grain_hdr = 0, or grain_headroom = 0) cap the
 //                    effective top at 0.95 (the near-clip dead zone), so
 //                    the 1.10 default is stock on every chain; with
@@ -106,7 +118,8 @@
 //                    eye, per source if needed. Below ref white the knob
 //                    moves the LUMA fade only: the per-channel grain bound
 //                    stays floored at ref white (overshoot physics), so
-//                    bright saturated channels keep their grain.
+//                    bright saturated channels keep their grain. Values near
+//                    0.2-0.3 aggressively confine grain to low luminance.
 //   grain_ref_white  the nit level the chain anchors SDR white to; the bridge
 //                    divides by it, so it is DESCRIPTIVE -- it must equal what
 //                    the chain actually did, not what we would prefer. Plain
@@ -143,6 +156,8 @@
 //@shampv input sdr
 //@shampv ref-white-param grain_ref_white
 //@shampv target-trc-param grain_hdr
+//@shampv pause-param grain_pause
+//@shampv epoch-param state_epoch
 //@shampv toggle match_grain grain_hdr grain_headroom debug_match density_combine
 //@shampv measures LUMA
 
@@ -154,7 +169,7 @@
 1.0
 
 //!PARAM debug_match
-//!DESC Debug overlay (toggle). 1 = compact 51-row Match Grain+ posterior/geometry readout · 0 = normal output.
+//!DESC Debug overlay (toggle). 1 = compact 52-row Match Grain+ posterior/geometry readout · 0 = normal output.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
@@ -165,6 +180,13 @@
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 65535.0
+0.0
+
+//!PARAM grain_pause
+//!DESC Machine-owned pause state. 1 freezes observation, cadence and arrangement so redraws of a paused frame are bit-stable; baked look edits may rebuild the standing field once. shampv mirrors mpv pause automatically.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
 0.0
 
 //!PARAM grain_gain
@@ -203,7 +225,14 @@
 0.3
 
 //!PARAM grain_rate
-//!DESC Temporal cadence in SOURCE frames. 1 = fresh grain every frame / on ones · 0.5 = on twos. ↓ slows the boil. Display-refresh independent.
+//!DESC Visible arrangement cadence in SOURCE frames. 1 = fresh arrangement every frame / on ones · 0.5 = on twos. ↓ slows the boil. Display-refresh independent.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.1
+//!MAXIMUM 1.0
+1.0
+
+//!PARAM grain_gen_rate
+//!DESC Template-vocabulary regeneration rate as a fraction of visible grain ticks. 1 = every tick (default) · 0.25 = every fourth tick. Block arrangement still rehashes every visible tick, but finite-vocabulary reuse can change higher-order temporal correlation; lower values are an optional small performance trade, not an identical fast path.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.1
 //!MAXIMUM 1.0
@@ -217,10 +246,10 @@
 0.25
 
 //!PARAM restore_gain
-//!DESC Missing-power authority. 0 = complement only (C) · 1 = inferred missing-power target · >1 = explicit restoration override.
+//!DESC Missing-power authority. 0 = complement only (C) · 1 = inferred missing-power target · >1 = manual amplitude override for known-damaged material · near 5 is aggressive and shot-specific, not a preset · 6 is the expert ceiling · above 2 restored power rises roughly with the square and can severely overgrain intact material.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
-//!MAXIMUM 4.0
+//!MAXIMUM 6.0
 1.0
 
 //!PARAM density_combine
@@ -245,9 +274,9 @@
 1.0
 
 //!PARAM grain_fade
-//!DESC Where grain fades to white — work-domain luma of full fade-out, one knob for every chain. Default 1.10 = stock top end (clip-limited chains cap the effective top at 0.95) · with grain_headroom = 1 it is the above-ref-white reach — tune to the upstream expansion by eye · below ref white the knob moves the fade only (the per-channel grain bound stays floored at ref white) · below the fade, amount follows the title's rendition curve only.
+//!DESC Where grain fades to white — work-domain luma of full fade-out, one knob for every chain. Default 1.10 = stock top end (clip-limited chains cap the effective top at 0.95) · 0.2-0.3 confines grain to low luminance and widens its rise out of black · with grain_headroom = 1 it is the above-ref-white reach — tune to the upstream expansion by eye · below ref white the knob moves the luma envelope only (the per-channel grain bound stays floored at ref white) · between the shadow toe and upper fade, amount follows the title's rendition curve.
 //!TYPE DYNAMIC float
-//!MINIMUM 0.5
+//!MINIMUM 0.2
 //!MAXIMUM 2.5
 1.10
 
@@ -291,7 +320,23 @@
 //!VAR float m_shot_obs_w[8]
 //!VAR float m_char_p[8]
 //!VAR float m_restore_p[8]
+//!VAR float m_arr_seed
 //!VAR float m_field_seed
+//!VAR float m_regen
+//!VAR float m_regen_pending
+//!VAR float m_field_valid
+//!VAR float m_field_cov_rg
+//!VAR float m_field_cov_rb
+//!VAR float m_field_cov_gb
+//!VAR float m_field_var_r
+//!VAR float m_field_var_g
+//!VAR float m_field_var_b
+//!VAR float m_baked_grain_size
+//!VAR float m_baked_grain_contrast
+//!VAR float m_baked_value_warp
+//!VAR float m_baked_grain_base_sat
+//!VAR float m_baked_grain_sharpness
+//!VAR float m_baked_match_grain
 //!VAR float prev_grid[4096]
 //!VAR float prev_grid_off[4096]
 //!VAR float m_source_aspect
@@ -307,6 +352,7 @@
 //!VAR float m_geom_blackout_y
 //!VAR float m_geom_changed
 //!VAR float prev_probe[4096]
+//!VAR float m_pan_px
 //!STORAGE
 
 //!TEXTURE GRAIN_FIELD
@@ -334,6 +380,13 @@
 #define MP_HP_TO_SOURCE        1.7888544
 #define MP_MEDABS_TO_STD       1.4826022
 #define MP_COMPLEMENT_POWER    0.150
+// Normalized picture-space calibration density. Distances below are physical
+// fractions of active picture height expressed on this finite synthesis
+// lattice. Raising output resolution reveals the same grain more faithfully;
+// it does not make the source's grains smaller or redefine their identity.
+#define MP_PICTURE_DENSITY     2160.0
+// MUST equal PICTURE_DENSITY / PICTURE_DENSITY_OUT in PASS 2 / PASS 3.
+// These are separate translation units and have no compile-time cross-check.
 // Surviving delivered grain is DAMAGED evidence — clumped, blocked,
 // DCT-mushed — so it counts against the restoration deficit at its
 // fidelity, never at its raw energy (author spec 2026-07-17: the shader
@@ -348,7 +401,7 @@
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
 #define MP_FIELD_STD           0.0185
-#define MP_STATE_MAGIC         0.942451
+#define MP_STATE_MAGIC         0.949451
 #define MP_MIN_BIN_SAMPLES     24u
 // Film-plausible evidence band. Per-frame sigma above this band is not
 // photographic grain (fireworks, confetti, dense near-field rain, damage):
@@ -377,6 +430,27 @@
 #define MP_BLACKOUT_LATCH_MAX  4.0
 #define MP_GEOM_X_BOOTSTRAP    24.0
 #define MP_GEOM_Y_BOOTSTRAP    3.0
+// S4 evidence veto -- global-translation (pan/shake) gate. A translating
+// texture is a per-frame grain twin: it decorrelates band0 while q_still's
+// absolute per-point threshold stays blind on dark content and q_random's
+// innovation/spatial ratio lands in the grain band (measured: Odyssey
+// 160-330 s, m_motion 0.0 throughout the shake, eff 2.64x staircase). A
+// grid-level single-step Lucas-Kanade translation estimate is the tell:
+// grain decorrelates across grid neighbours so its g*d products average
+// to ~0 over the lattice, while a coherent camera translation correlates
+// (proven lineage: the old build's pan-freeze gate). Magnitude is EMA'd,
+// so alternating-direction SHAKE holds it elevated like a sustained pan.
+// The veto only REDUCES learning authority (rise lanes); down-reads stay
+// live because translation decorrelation can only INFLATE sigma -- a
+// sub-master read under motion remains a valid one-sided bound. PAN_LO/HI
+// are in picture-lattice samples/frame and are calibrated on the PC harness
+// decode at MP_PICTURE_DENSITY
+// (row 51): they must sit above the static-grain floor read on ground
+// truth (Golden Spurtle) so legitimate grain never freezes.
+#define MP_LK_SCALE            2.0e5
+#define MP_LK_CLAMP            1.0e6
+#define MP_PAN_LO              0.35
+#define MP_PAN_HI              1.00
 
 // Flattened for conservative SPIRV-Cross/D3D11 lowering.
 shared uint s_hist[MP_TONE_BINS * MP_BANDS * AMP_BINS];
@@ -422,6 +496,14 @@ shared uint s_mid_energy;
 shared uint s_coarse_energy;
 shared uint s_structure_fine;
 shared uint s_structure_broad;
+shared uint s_lk_gxx;
+shared uint s_lk_gyy;
+shared uint s_lk_gxy_p;
+shared uint s_lk_gxy_n;
+shared uint s_lk_bx_p;
+shared uint s_lk_bx_n;
+shared uint s_lk_by_p;
+shared uint s_lk_by_n;
 
 float measure_luma(vec2 uv) {
     return HOOKED_tex(uv).r;
@@ -477,7 +559,23 @@ void lean_observe() {
             m_prev_ready = 0.0;
             m_measured = 0.0;
             m_gen_frame = 0.0;
+            m_arr_seed = 0.0;
             m_field_seed = 0.0;
+            m_regen = 1.0;
+            m_regen_pending = 1.0;
+            m_field_valid = 0.0;
+            m_field_cov_rg = 0.0;
+            m_field_cov_rb = 0.0;
+            m_field_cov_gb = 0.0;
+            m_field_var_r = 0.0;
+            m_field_var_g = 0.0;
+            m_field_var_b = 0.0;
+            m_baked_grain_size = -1.0;
+            m_baked_grain_contrast = -1.0;
+            m_baked_value_warp = -1.0;
+            m_baked_grain_base_sat = -1.0;
+            m_baked_grain_sharpness = -1.0;
+            m_baked_match_grain = -1.0;
             m_source_aspect = HOOKED_size.x / max(HOOKED_size.y, 1.0);
             m_active_inset_x = 0.0;
             m_active_inset_y = 0.0;
@@ -495,6 +593,7 @@ void lean_observe() {
             m_coverage = 0.0;
             m_motion = 0.0;
             m_cut_score = 0.0;
+            m_pan_px = 0.0;
             m_temporal_support = 0.0;
             m_title_conf = 0.0;
             m_title_power = MP_PRIOR_SIGMA * MP_PRIOR_SIGMA;
@@ -540,6 +639,49 @@ void lean_observe() {
         m_geom_blackout_y = 0.0;
     }
     barrier();
+
+    // mpv may redraw a paused frame without advancing source PTS. The shader
+    // cannot infer that distinction from pixels, so shampv supplies this
+    // machine-owned uniform. A newly loaded/inserted shader observes its held
+    // source frame once after reset, so it can initialize without waiting for
+    // unpause; established paused frames cannot train any posterior, advance
+    // cadence, or alter their arrangement. Baked
+    // look edits are the sole exception: rebuild the standing vocabulary once
+    // under the same seed so pause-and-tune remains useful without animating.
+    // The PARAM-conditioned return is dispatch-uniform and precedes all later
+    // barriers, which is legal on FXC/D3D11.
+    if (grain_pause > 0.5 && state_ok) {
+        if (lid == 0u) {
+            bool baked_params_changed =
+                   abs(m_baked_grain_size - grain_size) > 1.0e-6
+                || abs(m_baked_grain_contrast - grain_contrast) > 1.0e-6
+                || abs(m_baked_value_warp - value_warp) > 1.0e-6
+                || abs(m_baked_grain_base_sat - grain_base_sat) > 1.0e-6
+                || abs(m_baked_grain_sharpness - grain_sharpness) > 1.0e-6
+                || abs(m_baked_match_grain - match_grain) > 1.0e-6;
+            m_regen = 0.0;
+            if (baked_params_changed) {
+                m_baked_grain_size = grain_size;
+                m_baked_grain_contrast = grain_contrast;
+                m_baked_value_warp = value_warp;
+                m_baked_grain_base_sat = grain_base_sat;
+                m_baked_grain_sharpness = grain_sharpness;
+                m_baked_match_grain = match_grain;
+                m_regen_pending = 1.0;
+            }
+            // A baked edit may have arrived while the generator was disabled.
+            // Consume that sticky request as soon as gain/debug makes PASS 2
+            // active, even if the baked cache already matches by then.
+            bool gen_active = (grain_gain > 0.0 && match_grain > 0.0)
+                           || debug_match > 0.5;
+            if (gen_active && m_regen_pending > 0.5) {
+                m_regen = 1.0;
+                m_regen_pending = 0.0;
+            }
+            imageStore(out_image, ivec2(0), vec4(0.0));
+        }
+        return;
+    }
 
     // A fixed full-raster probe discovers centred baked mattes and keeps cut
     // history independent of the active-picture mapping used by the grain
@@ -1070,6 +1212,14 @@ void lean_observe() {
         s_coarse_energy = 0u;
         s_structure_fine = 0u;
         s_structure_broad = 0u;
+        s_lk_gxx = 0u;
+        s_lk_gyy = 0u;
+        s_lk_gxy_p = 0u;
+        s_lk_gxy_n = 0u;
+        s_lk_bx_p = 0u;
+        s_lk_bx_n = 0u;
+        s_lk_by_p = 0u;
+        s_lk_by_n = 0u;
     }
     for (uint k = lid;
          k < uint(MP_TONE_BINS * MP_BANDS * AMP_BINS); k += nthreads)
@@ -1078,15 +1228,17 @@ void lean_observe() {
         s_content_hist[k] = 0u;
     barrier();
 
-    // Offsets are picture-height-relative virtual-4K coordinates. Derive the
+    // Offsets are normalized picture-height coordinates expressed on the
+    // finite MP_PICTURE_DENSITY analysis lattice. Derive the
     // horizontal UV pitch from the actual LUMA raster aspect so the crosses
     // remain isotropic on 4:3, scope and portrait sources instead of silently
-    // assuming 3840x2160. Three nested crosses provide a compact spectral body.
+    // source-raster mapping from the active picture rather than assuming an
+    // output resolution. Three nested crosses provide a compact spectral body.
     vec2 active_inset = vec2(s_active_inset_x, s_active_inset_y);
     vec2 active_extent = vec2(1.0) - 2.0 * active_inset;
     float uvx_per_vtex = active_extent.y * HOOKED_size.y
-                       / max(HOOKED_size.x * 2160.0, 1.0);
-    float uvy_per_vtex = active_extent.y / 2160.0;
+                       / max(HOOKED_size.x * MP_PICTURE_DENSITY, 1.0);
+    float uvy_per_vtex = active_extent.y / MP_PICTURE_DENSITY;
     vec2 dx1 = vec2(2.0 * uvx_per_vtex, 0.0);
     vec2 dy1 = vec2(0.0, 2.0 * uvy_per_vtex);
     vec2 dx3 = vec2(6.0 * uvx_per_vtex, 0.0);
@@ -1128,6 +1280,54 @@ void lean_observe() {
         int now_lb = tone_bin(c);
         if (s_history_ready != 0u && abs(c - prev_c) > 0.018)
             atomicAdd(s_changed_count, 1u);
+
+        // Grid global-translation (single-step Lucas-Kanade) accumulation --
+        // see the S4 veto note at the PAN defines. Gradients are taken at
+        // +/-1 grid cell: at that spacing grain and fine texture alias away
+        // and decorrelate, so their g*d products cancel across the lattice
+        // while a coherent camera translation correlates. Runs before the
+        // flat gate (the pan signal lives in coarse structure, edges
+        // included). The border ring is skipped so no tap crosses into
+        // mattes/bars and dilutes the fit. Signed sums split into +/- uint
+        // pairs; the per-point clamp keeps 4096 x MP_LK_CLAMP inside uint32.
+        uint lk_kx = uint(k) % uint(MP_GRID_W);
+        uint lk_ky = uint(k) / uint(MP_GRID_W);
+        if (s_history_ready != 0u && c > 0.002 && c < 0.985
+            && lk_kx > 0u && lk_kx < uint(MP_GRID_W - 1)
+            && lk_ky > 0u && lk_ky < uint(MP_GRID_H - 1)) {
+            vec2 lk_step = active_extent
+                         / vec2(float(MP_GRID_W), float(MP_GRID_H));
+            float lk_gx = 0.5 * (measure_luma(uv + vec2(lk_step.x, 0.0))
+                               - measure_luma(uv - vec2(lk_step.x, 0.0)));
+            float lk_gy = 0.5 * (measure_luma(uv + vec2(0.0, lk_step.y))
+                               - measure_luma(uv - vec2(0.0, lk_step.y)));
+            float lk_d = c - prev_c;
+            float lk_gxy = lk_gx * lk_gy;
+            float lk_bx = -lk_gx * lk_d;
+            float lk_by = -lk_gy * lk_d;
+            atomicAdd(s_lk_gxx,
+                      uint(min(lk_gx * lk_gx * MP_LK_SCALE, MP_LK_CLAMP)));
+            atomicAdd(s_lk_gyy,
+                      uint(min(lk_gy * lk_gy * MP_LK_SCALE, MP_LK_CLAMP)));
+            if (lk_gxy >= 0.0)
+                atomicAdd(s_lk_gxy_p,
+                          uint(min(lk_gxy * MP_LK_SCALE, MP_LK_CLAMP)));
+            else
+                atomicAdd(s_lk_gxy_n,
+                          uint(min(-lk_gxy * MP_LK_SCALE, MP_LK_CLAMP)));
+            if (lk_bx >= 0.0)
+                atomicAdd(s_lk_bx_p,
+                          uint(min(lk_bx * MP_LK_SCALE, MP_LK_CLAMP)));
+            else
+                atomicAdd(s_lk_bx_n,
+                          uint(min(-lk_bx * MP_LK_SCALE, MP_LK_CLAMP)));
+            if (lk_by >= 0.0)
+                atomicAdd(s_lk_by_p,
+                          uint(min(lk_by * MP_LK_SCALE, MP_LK_CLAMP)));
+            else
+                atomicAdd(s_lk_by_n,
+                          uint(min(-lk_by * MP_LK_SCALE, MP_LK_CLAMP)));
+        }
 
         // One continuous delivery-rolloff observation over all content. This is
         // deliberately not a classifier: it merely records how much of the local
@@ -1241,6 +1441,34 @@ void lean_observe() {
         bool shot_boundary = !prev_ready || hard_cut;
         bool geometry_only = m_geom_changed > 0.5 && !shot_boundary;
 
+        // Global-translation magnitude from the LK normal equations (2x2
+        // solve). The shift is in grid-cell units; convert per axis to
+        // picture-lattice samples so the measure is resolution-independent.
+        // Magnitude
+        // (not the vector) is EMA'd: alternating shake must hold the level.
+        // Update skips boundary frames -- a same-geometry hard cut leaves
+        // s_history_ready set while prev_grid holds pre-cut luma, so keying
+        // the skip on shot_boundary keeps that garbage frame out of the EMA.
+        float lk_Gxx = float(s_lk_gxx) / MP_LK_SCALE;
+        float lk_Gyy = float(s_lk_gyy) / MP_LK_SCALE;
+        float lk_Gxy = (float(s_lk_gxy_p) - float(s_lk_gxy_n)) / MP_LK_SCALE;
+        float lk_BX = (float(s_lk_bx_p) - float(s_lk_bx_n)) / MP_LK_SCALE;
+        float lk_BY = (float(s_lk_by_p) - float(s_lk_by_n)) / MP_LK_SCALE;
+        float lk_det = lk_Gxx * lk_Gyy - lk_Gxy * lk_Gxy;
+        float pan_px_inst = 0.0;
+        if (lk_det > 1.0e-7) {
+            float lk_sx = (lk_Gyy * lk_BX - lk_Gxy * lk_BY) / lk_det;
+            float lk_sy = (lk_Gxx * lk_BY - lk_Gxy * lk_BX) / lk_det;
+            float lk_cellx = (active_extent.x / float(MP_GRID_W))
+                           / max(uvx_per_vtex, 1.0e-9);
+            float lk_celly = MP_PICTURE_DENSITY / float(MP_GRID_H);
+            pan_px_inst = sqrt(lk_sx * lk_sx * lk_cellx * lk_cellx
+                             + lk_sy * lk_sy * lk_celly * lk_celly);
+        }
+        if (!shot_boundary && !geometry_only && s_history_ready != 0u)
+            m_pan_px = (m_measured < 1.5) ? pan_px_inst
+                     : mix(m_pan_px, pan_px_inst, 0.30);
+
         // Temporal similarity supplies authority, not amount. It gates title
         // learning and shot refinement but never provides a master-power target.
         float q_amp = smoothstep(0.00018, 0.00080, observed);
@@ -1248,8 +1476,16 @@ void lean_observe() {
         float q_random = 1.0 - smoothstep(0.35, 0.90,
                                           abs(log2(max(temporal_ratio, 0.01))));
         float q_still = 1.0 - smoothstep(0.03, 0.18, changed);
-        float static_gate = (s_history_ready != 0u && !hard_cut)
-                          ? q_cov * q_random * q_still : 0.0;
+        // S4 evidence-quality veto. Applied as a SEPARATE factor on the
+        // rise-capable lanes only -- never folded into q_cov/q_random/
+        // q_still themselves, because spatial_reliability (the reduce-only
+        // survivor lane) consumes the raw q_cov and vetoing a reduce-only
+        // lane would RAISE rendered power on moving textured content.
+        float q_source = 1.0 - smoothstep(MP_PAN_LO, MP_PAN_HI, m_pan_px);
+        float static_gate_raw = (s_history_ready != 0u && !hard_cut)
+                              ? q_cov * q_random * q_still : 0.0;
+        float static_gate = static_gate_raw * q_source;
+        float evidence_raw = q_amp * static_gate_raw;
         float evidence = q_amp * static_gate;
 
         // Estimate shot sensitivity after dividing out the title's luma curve.
@@ -1292,7 +1528,7 @@ void lean_observe() {
         // steeper confidence curve: once temporal behaviour is convincingly
         // stochastic, amplitude comes from measured power, not from how far
         // inside the authenticity band this frame happened to land.
-        float shot_auth = gain_weight_support * q_cov * q_still
+        float shot_auth = gain_weight_support * q_cov * q_still * q_source
                         * smoothstep(0.02, 0.15, q_random);
 
         // Title character is a hidden posterior. It only learns from stable,
@@ -1303,13 +1539,18 @@ void lean_observe() {
             m_title_size = mix(m_title_size, frame_size, a_title);
             m_title_hardness = mix(m_title_hardness, frame_hardness, a_title);
             m_title_conf += 0.005 * evidence * (1.0 - m_title_conf);
-        } else {
+        } else if (evidence_raw <= 0.0) {
             // Staleness: title confidence is re-earned across scenes (tau
             // ~4.6 min at 24p), never session-permanent. Odyssey benchmark:
             // conf saturated at 0.975 and held full learned authority plus a
             // 4x-annealed drain for the rest of the session. Decay can only
             // REDUCE authority, so motion/quiet stretches stay charter-safe;
             // a grainy title re-earns 0->0.5 in ~6 s of good evidence.
+            // Freeze-not-drain: when the S4 veto is the ONLY suppressor
+            // (evidence exists but is motion-poisoned) confidence HOLDS --
+            // a continuously handheld grainy title must not bleed authority
+            // for the length of the film. Decay is reserved for genuinely
+            // evidence-free stretches.
             m_title_conf *= (1.0 - 1.5e-4);
         }
 
@@ -1334,8 +1575,9 @@ void lean_observe() {
             float amp_r = smoothstep(0.00012, 0.00070, sigma0);
             float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
                                            MP_SIGMA_PLAUS_HI, sigma0);
+            // Presence is a rise-only lane: the S4 veto applies in full.
             float reliability = count_r * amp_r * plaus
-                              * q_cov * q_random * q_still;
+                              * q_cov * q_random * q_still * q_source;
             float master_auth = smoothstep(0.10, 0.35, m_master_w[b])
                               * smoothstep(0.08, 0.20, m_title_conf);
             if (reliability > 0.0 && master_auth > 0.0) {
@@ -1468,7 +1710,8 @@ void lean_observe() {
             float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
                                            MP_SIGMA_PLAUS_HI, sigma0);
             float spatial_reliability = count_r * amp_r * plaus * q_cov;
-            float reliability = spatial_reliability * q_random * q_still;
+            float reliability_raw = spatial_reliability * q_random * q_still;
+            float reliability = reliability_raw * q_source;
 
             // Best-preserved evidence updates the absolute title master curve.
             // Downward evidence is deliberately much slower because delivery
@@ -1478,7 +1721,7 @@ void lean_observe() {
             // sensitivity into the persistent curve and, via presence, the
             // title-wide base. The absolute ceiling is the film-plausible
             // roof for sustained band-edge evidence the soft reject passes.
-            if (reliability > 0.0) {
+            if (reliability_raw > 0.0) {
                 // Sensitivity normalization deflates hot shots only. Dividing
                 // by gain < 1 INFLATES the learned target, and an over-learned
                 // master reads exactly as gain < 1 at the next cut -- the
@@ -1496,9 +1739,14 @@ void lean_observe() {
                 // reads here carry measurable grain (amp_r > 0), unlike the
                 // clean lane's censored flats. Calibration point for the
                 // ProRes ground-truth pass.
-                float master_rate = (clipped > m_master_p[b]) ? 0.003 : 0.001;
+                // The S4 veto gates the RISE and the authority earn only:
+                // translation decorrelation can only INFLATE sigma, so a
+                // sub-master read under motion is a valid one-sided bound
+                // and keeps walking the level down (reversibility).
+                float master_rate = (clipped > m_master_p[b])
+                                  ? 0.003 * q_source : 0.001;
                 m_master_p[b] = mix(m_master_p[b], clipped,
-                                    master_rate * reliability);
+                                    master_rate * reliability_raw);
                 m_master_w[b] += 0.005 * reliability
                                * (1.0 - m_master_w[b]);
 
@@ -1506,7 +1754,9 @@ void lean_observe() {
                 // Staleness: per-bin authority is re-earned, not permanent.
                 // Evidence-free stretches relax local_q back toward the title
                 // curve (tau ~4.6 min at 24p). The learned LEVEL stays --
-                // absence is not evidence of a clean master.
+                // absence is not evidence of a clean master. Keyed on RAW
+                // evidence: motion-vetoed frames HOLD authority rather than
+                // drain it (freeze-not-drain, S4).
                 m_master_w[b] *= (1.0 - 1.5e-4);
             }
 
@@ -1523,8 +1773,11 @@ void lean_observe() {
                 m_shot_obs_w[b] = 0.0;
             } else {
                 bool acquire = m_shot_age < 4.0 && !geometry_only;
+                // Survivor tracking is reduce-only, so it stays on RAW
+                // reliability -- the S4 veto never withholds evidence that
+                // can only reduce restoration.
                 float obs_support = acquire ? spatial_reliability
-                                            : reliability;
+                                            : reliability_raw;
                 if (obs_support > 0.0) {
                     float obs_rate = acquire ? 0.35 * obs_support
                                              : 0.0020 * obs_support;
@@ -1574,7 +1827,8 @@ void lean_observe() {
             float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
                                            MP_SIGMA_PLAUS_HI, sigma0);
             float spatial_reliability = count_r * amp_r * plaus * q_cov;
-            float reliability = spatial_reliability * q_random * q_still;
+            float reliability_raw = spatial_reliability * q_random * q_still;
+            float reliability = reliability_raw * q_source;
             float shape = prior_tone_shape(b);
             float title_curve = m_title_power * shape * shape * m_shot_gain;
             float learned_master = m_master_p[b] * m_shot_gain;
@@ -1612,7 +1866,8 @@ void lean_observe() {
                 // shedding stays motion-ungated — disappearing proof must
                 // revoke toward the title baseline even inside a moving cut.
                 char_up_rate = 0.20 * evidence;
-                char_down_rate = 0.50 * max(m_shot_obs_w[b], reliability);
+                char_down_rate = 0.50 * max(m_shot_obs_w[b],
+                                            reliability_raw);
                 restore_up_rate = 0.35 * reliability;
                 restore_down_rate = 0.50 * max(m_shot_obs_w[b],
                                                spatial_reliability);
@@ -1660,8 +1915,11 @@ void lean_observe() {
         m_loss_conf = clamp(target_missing_sum
                           / max(title_sum, 1.0e-12), 0.0, 1.0);
         m_est_missing = sqrt(max(restore_sum / float(MP_TONE_BINS), 0.0));
-        m_eff_render = match_grain * grain_gain * sqrt(max(p_total, 0.0))
-                     / MP_FIELD_STD;
+        // Underlying renderable power, deliberately independent of live
+        // gain/match knobs. OUTPUT gates and scales those controls directly;
+        // caching them here made pause-time off->on toggles inherit a stale
+        // zero until playback resumed.
+        m_eff_render = sqrt(max(p_total, 0.0)) / MP_FIELD_STD;
         m_eff_render = clamp(m_eff_render, 0.0, 0.75);
         m_observed = observed;
         m_temporal_support = temporal;
@@ -1673,8 +1931,61 @@ void lean_observe() {
         m_shot_age = min(m_shot_age + 1.0, 65535.0);
         m_measured = min(m_measured + 1.0, 65535.0);
         m_prev_ready = 1.0;
+
+        // Two clocks, two jobs. m_arr_seed is the visible arrangement and
+        // follows grain_rate; m_field_seed is the standing template vocabulary
+        // and follows grain_gen_rate. A skipped template tick therefore still
+        // presents a fresh block layout/jitter whenever the visible clock ticks.
+        float prev_gen_frame = m_gen_frame;
+        // Float SSBO counters stop accepting +1 at 2^24. Wrap well before
+        // that boundary; the seed hash intentionally tolerates this roughly
+        // four-day cycle at 24p, while the cadence clock keeps advancing.
         m_gen_frame += 1.0;
-        m_field_seed = floor(m_gen_frame * grain_rate);
+        if (m_gen_frame >= 8388608.0) m_gen_frame = 0.0;
+        float visible_seed = floor(m_gen_frame * grain_rate);
+        float prev_visible_seed = floor(prev_gen_frame * grain_rate);
+        bool visible_tick = visible_seed != prev_visible_seed;
+        if (visible_tick)
+            m_arr_seed = visible_seed;
+
+        bool scheduled_regen = visible_tick
+            && floor(visible_seed * grain_gen_rate)
+             != floor(prev_visible_seed * grain_gen_rate);
+        bool baked_params_changed =
+               abs(m_baked_grain_size - grain_size) > 1.0e-6
+            || abs(m_baked_grain_contrast - grain_contrast) > 1.0e-6
+            || abs(m_baked_value_warp - value_warp) > 1.0e-6
+            || abs(m_baked_grain_base_sat - grain_base_sat) > 1.0e-6
+            || abs(m_baked_grain_sharpness - grain_sharpness) > 1.0e-6
+            || abs(m_baked_match_grain - match_grain) > 1.0e-6;
+        // Size/hardness are baked into GRAIN_FIELD. Keep their fast post-cut
+        // acquisition responsive even at a reduced steady-state gen rate.
+        bool fast_character = shot_boundary
+            || (!geometry_only && m_shot_age <= 4.0 && evidence > 0.0);
+        if (scheduled_regen || fast_character || baked_params_changed) {
+            if (visible_tick)
+                m_field_seed = m_arr_seed;
+            m_regen_pending = 1.0;
+        }
+        if (baked_params_changed) {
+            m_baked_grain_size = grain_size;
+            m_baked_grain_contrast = grain_contrast;
+            m_baked_value_warp = value_warp;
+            m_baked_grain_base_sat = grain_base_sat;
+            m_baked_grain_sharpness = grain_sharpness;
+            m_baked_match_grain = match_grain;
+        }
+
+        // PASS 2 can be disabled by its PARAM-only WHEN. Snapshot a sticky
+        // request only when that pass will execute; it must never clear this
+        // value itself because its workgroups have no global ordering.
+        bool gen_active = (grain_gain > 0.0 && match_grain > 0.0)
+                       || debug_match > 0.5;
+        m_regen = 0.0;
+        if (gen_active && m_regen_pending > 0.5) {
+            m_regen = 1.0;
+            m_regen_pending = 0.0;
+        }
         // OUTPUT is the full presentation canvas after placement. Preserve the
         // source raster aspect so its active destination rectangle can be
         // recovered independently of window/display aspect ratio.
@@ -1704,12 +2015,14 @@ void hook() {
 // @120Hz and audio sync, 2026-07-06). The OUTPUT composite (redraw group,
 // per-present) just fetches GRAIN_FIELD, so re-presents cost ~nothing and
 // grain cadence can't ride the display refresh. TPL ARCHITECTURE
-// (2026-07-10): the grain "scan" is a virtual 2160-line picture-relative field,
+// (2026-07-10): grain is a normalized active-picture field represented on the
+// current 2160-sample implementation lattice,
 // whose width follows the committed active-picture aspect, but this
 // pass only generates the physical 960x540 TEMPLATE — the composite
-// assembles the virtual scan from per-block randomized template windows
+// assembles the picture field from per-block randomized template windows
 // (AV1-FGS style; see the block shuffle there). Template texels REPRESENT
-// 4K-scan texels, so every sigma below stays in 4K-reference units and
+// picture-lattice samples, so every sigma below is calibrated in normalized
+// active-picture-height units and
 // generation cost scales with TEMPLATE area (~0.2 ms vs 3.4 at full size;
 // 960x540 = the measured quality/perf knee, dev grain-genrate README).
 //
@@ -1733,12 +2046,15 @@ void hook() {
 // are parametrized on MAX_TAPS so the support can never drift out of sync.
 #define MAX_TAPS 4
 
-// Crisp NEUTRAL render sigma scale (the no-fire 4K-film-scan default). 0.75 puts the
-// green-channel sigma at ~0.75 px @4K = a 35mm scan (matched to the real grain
-// plates; holds broadband energy to Nyquist instead of the old soft-Gaussian
-// crater at sigma 1.0). The grain-stock probe found film spans ~0.75 (35mm) .. 1.5
-// (16mm) @4K; the per-source map nudges around this neutral by measured gauge.
-#define K_NEUTRAL    0.75
+// Neutral correlation-length calibration. The physical quantity is this sigma
+// divided by PICTURE_DENSITY: a fraction of active picture height. K=0.75 was
+// calibrated against real grain plates and retains broadband energy to the
+// current lattice Nyquist. Source-matched size is therefore independent of
+// master and output raster dimensions.
+#define PICTURE_DENSITY 2160.0
+// MUST equal MP_PICTURE_DENSITY / PICTURE_DENSITY_OUT in PASS 1 / PASS 3.
+#define K_NEUTRAL_NORM (0.75 / 2160.0)
+#define K_NEUTRAL (K_NEUTRAL_NORM * PICTURE_DENSITY)
 // Physical TEMPLATE dims. The noise seed wraps on these so the template is
 // TOROIDAL: the composite's per-block window fetches (offset + flip + overlap
 // halo) wrap on the template extent and must not show a seam. Wrapping the
@@ -1746,15 +2062,15 @@ void hook() {
 // wraps too (each workgroup regenerates its halo from global coords), so the
 // seam is continuous. In-range coords (the whole template interior) are
 // unchanged. MUST equal this pass's WIDTH/HEIGHT directives above (960 x 540)
-// — same translation unit, no compile guard. NOT the 4K scan size: the scan
-// is virtual (GRAIN_RES_REF anchors it); template texels represent 4K-scan
-// texels. The composite derives its dims from imageSize(GRAIN_FIELD) so it
+// Same translation unit, no compile guard. This is not a picture resolution:
+// template is a reusable vocabulary on the current synthesis lattice, not a
+// picture resolution. The composite derives its dims from imageSize(GRAIN_FIELD) so it
 // can't desync; only these two same-file sites are hand-kept in lockstep.
 // (Directive prefix omitted here on purpose: the parser splits sections on
 // that marker even inside a comment.)
 #define GEN_GRID ivec2(960, 540)
 // Per-channel render-sigma cap. The 9-tap support holds a Gaussian cleanly to ~1.5;
-// beyond that it would truncate. The coarse extreme (low-fineR firing) and >4K
+// beyond that it would truncate. The coarse extreme and a higher-density future
 // res-scaling can push a channel past it, so cap GRACEFULLY (slightly finer than
 // ideal at that extreme) rather than ripple the spectrum. The actual film range
 // (fine digital .. ~16mm) stays under it, so this never touches normal operation.
@@ -1818,12 +2134,13 @@ void hook() {
     uint num_threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
 
     // The observer already produced the complete amount and character record.
-    // Generation is source-locked and always refreshes on a source frame.
+    // Generation is source-locked; m_regen is this frame's immutable request.
     uint frame_seed = uint(max(0.0, m_field_seed));
+    bool regenerate = m_regen > 0.5;
     if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u)
         imageStore(out_image, ivec2(0), vec4(0.0));
 
-    // Param-off skip only. m_eff_render may NOT join this guard: it is an SSBO
+    // PARAM-uniform skips only. m_eff_render may NOT join this guard: it is an SSBO
     // read, and an early return conditioned on buffer data puts every barrier
     // below into varying control flow for FXC (D3D11 X3663 -- the same class
     // the unconditional outer blur already works around; params are cbuffer
@@ -1833,8 +2150,9 @@ void hook() {
     if ((grain_gain <= 0.0 || match_grain <= 0.0) && debug_match <= 0.5)
         return;
 
-    // Grain is generated in virtual-4K texels. Shot character is committed from
-    // the persistent title posterior at cuts, then moves only imperceptibly.
+    // Grain is generated on the picture-space implementation lattice. Shot
+    // character is committed from the persistent title posterior at cuts,
+    // then moves only imperceptibly.
     float k_neutral = K_NEUTRAL;
     float observed_size = mix(1.35, 0.65,
                               smoothstep(0.20, 0.85, m_shot_size));
@@ -1867,7 +2185,7 @@ void hook() {
     // re-normalizes RMS, so the cap only limits how much DC the hardest
     // settings strip.
     bp_alpha = min(bp_alpha, 0.95);
-    if (lid < uint(2 * MAX_TAPS + 1)) {
+    if (regenerate && lid < uint(2 * MAX_TAPS + 1)) {
         int idx = int(lid);
         float dx = float(idx - MAX_TAPS);
         float s1r = mix(0.78, 1.02, soften_eff) * k_size;
@@ -1881,7 +2199,7 @@ void hook() {
         dyn_wb2[idx] = gaussian_weight(dx, min(s1b * BP_RATIO, SIGMA_MAX));
     }
     barrier();
-    if (lid == 0u) {
+    if (regenerate && lid == 0u) {
         float nr = 0.0, ng = 0.0, nb = 0.0, nr2 = 0.0, ng2 = 0.0, nb2 = 0.0;
         for (int i = 0; i < 2 * MAX_TAPS + 1; i++) {
             nr += dyn_wr[i]; ng += dyn_wg[i]; nb += dyn_wb[i];
@@ -1918,12 +2236,100 @@ void hook() {
         vsum_sigma[0] = GRAIN_STD.x * s1c[0];
         vsum_sigma[1] = GRAIN_STD.y * s1c[1];
         vsum_sigma[2] = GRAIN_STD.z * s1c[2];
-        // Canonical absolute RMS at the neutral 4K kernel (k=0.75). Without
+        // Canonical absolute RMS at the neutral picture-space kernel. Without
         // this normalization coarse kernels render less power and fine kernels
         // more power even when the observer requested the same sigma_plus.
         field_norm[0] = 0.08318138 / max(vsum_sigma[0], 1.0e-6);
         field_norm[1] = 0.06602582 / max(vsum_sigma[1], 1.0e-6);
         field_norm[2] = 0.04909565 / max(vsum_sigma[2], 1.0e-6);
+
+        // Analytic pre-warp RGB covariance of the field this dispatch builds.
+        // H.274/AV1 model grain per colour component, and the generator's
+        // channel-specific size/RMS is intentional character. Keep it; carry
+        // its six covariance terms so OUTPUT can prevent multiplicative
+        // RGB compositing from turning that character into extra LUMA energy on
+        // saturated colours. For separable 2-D kernels, every cross inner
+        // product is the square of its 1-D inner product. value_warp is a
+        // monotone marginal transform; the private empirical sweep finds that
+        // combined legal artistic-override residuals stay within ~5%, so no fitted warp
+        // heuristic belongs in this physical covariance record.
+        if (gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) {
+        vec3 d11 = vec3(0.0), d12 = vec3(0.0);
+        vec3 d21 = vec3(0.0), d22 = vec3(0.0);
+        for (int i = 0; i < 2 * MAX_TAPS + 1; i++) {
+            d11 += vec3(dyn_wr[i]  * dyn_wg[i],
+                        dyn_wr[i]  * dyn_wb[i],
+                        dyn_wg[i]  * dyn_wb[i]);
+            d12 += vec3(dyn_wr[i]  * dyn_wg2[i],
+                        dyn_wr[i]  * dyn_wb2[i],
+                        dyn_wg[i]  * dyn_wb2[i]);
+            d21 += vec3(dyn_wr2[i] * dyn_wg[i],
+                        dyn_wr2[i] * dyn_wb[i],
+                        dyn_wg2[i] * dyn_wb[i]);
+            d22 += vec3(dyn_wr2[i] * dyn_wg2[i],
+                        dyn_wr2[i] * dyn_wb2[i],
+                        dyn_wg2[i] * dyn_wb2[i]);
+        }
+        float a2 = bp_alpha * bp_alpha;
+        vec3 cross_energy = d11 * d11
+                          - bp_alpha * (d12 * d12 + d21 * d21)
+                          + a2 * d22 * d22;
+        vec3 self_energy = vec3(
+            s1c[0]*s1c[0] - 2.0*bp_alpha*s12c[0]*s12c[0] + a2*s2c[0]*s2c[0],
+            s1c[1]*s1c[1] - 2.0*bp_alpha*s12c[1]*s12c[1] + a2*s2c[1]*s2c[1],
+            s1c[2]*s1c[2] - 2.0*bp_alpha*s12c[2]*s12c[2] + a2*s2c[2]*s2c[2]);
+        vec3 filter_corr = cross_energy * inversesqrt(max(
+            vec3(self_energy.x * self_energy.y,
+                 self_energy.x * self_energy.z,
+                 self_energy.y * self_energy.z), vec3(1.0e-12)));
+
+        const vec3 base_luma = vec3(0.299, 0.587, 0.114);
+        const vec3 noise_scale = vec3(RED_VARIANCE_SCALE,
+                                      GREEN_VARIANCE_SCALE,
+                                      BLUE_VARIANCE_SCALE);
+        vec3 lum_mix = base_luma * noise_scale;
+        vec3 sat = vec3(RED_SATURATION, GREEN_SATURATION,
+                        BLUE_SATURATION) * grain_base_sat;
+        vec3 mix_r = mix(lum_mix, vec3(noise_scale.r, 0.0, 0.0), sat.r);
+        vec3 mix_g = mix(lum_mix, vec3(0.0, noise_scale.g, 0.0), sat.g);
+        vec3 mix_b = mix(lum_mix, vec3(0.0, 0.0, noise_scale.b), sat.b);
+        vec3 base_corr = vec3(dot(mix_r, mix_g),
+                              dot(mix_r, mix_b),
+                              dot(mix_g, mix_b)) * inversesqrt(max(vec3(
+            dot(mix_r, mix_r) * dot(mix_g, mix_g),
+            dot(mix_r, mix_r) * dot(mix_b, mix_b),
+            dot(mix_g, mix_g) * dot(mix_b, mix_b)), vec3(1.0e-12)));
+        // field_norm uses the historical calibrated GRAIN_STD constants. The
+        // base mix's true marginal standard deviation drifts when base_sat is
+        // changed (and blue is slightly below the calibration even at the
+        // default), so derive cap-only live diagonals from the actual mix. Do
+        // not feed these into the established log-normal mean correction.
+        const float TRIANGULAR_STD = 0.612 / sqrt(6.0);
+        vec3 mix_std = TRIANGULAR_STD * sqrt(vec3(
+            dot(mix_r, mix_r), dot(mix_g, mix_g), dot(mix_b, mix_b)));
+        vec3 cap_field_std = vec3(0.08318138, 0.06602582, 0.04909565)
+                           * mix_std / GRAIN_STD;
+        vec3 cap_field_var = cap_field_std * cap_field_std;
+        // Schur product of two Gram matrices is PSD algebraically. Project the
+        // third correlation into the valid interval implied by the first two;
+        // this removes tiny float32 cancellation excursions at coarse/clamped
+        // kernel corners without the non-PSD risk of three independent clamps.
+        vec3 field_corr = base_corr * filter_corr;
+        float corr_rg = clamp(field_corr.x, -1.0, 1.0);
+        float corr_rb = clamp(field_corr.y, -1.0, 1.0);
+        float corr_gb_mid = corr_rg * corr_rb;
+        float corr_gb_span = sqrt(max((1.0 - corr_rg * corr_rg)
+                                    * (1.0 - corr_rb * corr_rb), 0.0));
+        float corr_gb = clamp(field_corr.z,
+                              corr_gb_mid - corr_gb_span,
+                              corr_gb_mid + corr_gb_span);
+        m_field_cov_rg = corr_rg * cap_field_std.r * cap_field_std.g;
+        m_field_cov_rb = corr_rb * cap_field_std.r * cap_field_std.b;
+        m_field_cov_gb = corr_gb * cap_field_std.g * cap_field_std.b;
+        m_field_var_r = cap_field_var.r;
+        m_field_var_g = cap_field_var.g;
+        m_field_var_b = cap_field_var.b;
+        }
         if (value_warp > 0.05) {
             float num = 0.0, den = 0.0;
             for (int j = -16; j <= 16; j++) {
@@ -1940,7 +2346,7 @@ void hook() {
     barrier();
 
     // --- inner blur(s1): generate noise -> separable blur -> vsum1 ---
-    for (uint i = lid; i < isize.y * isize.x; i += num_threads) {
+    if (regenerate) for (uint i = lid; i < isize.y * isize.x; i += num_threads) {
         uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
         ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy)
                              + ivec2(local_pos) - ivec2(MAX_TAPS);
@@ -1956,7 +2362,7 @@ void hook() {
         grain_b[local_pos.y][local_pos.x] = mix(grain_lum, g_b, BLUE_SATURATION * grain_base_sat);
     }
     barrier();
-    for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
+    if (regenerate) for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
         float hsum_r = 0.0, hsum_g = 0.0, hsum_b = 0.0;
         for (int x = 0; x < 2 * MAX_TAPS + 1; x++) {
             hsum_r += dyn_wr[x] * grain_r[y][gl_LocalInvocationID.x + x];
@@ -1969,7 +2375,7 @@ void hook() {
     }
     barrier();
     float vsum1_r = 0.0, vsum1_g = 0.0, vsum1_b = 0.0;
-    for (int y = 0; y < 2 * MAX_TAPS + 1; y++) {
+    if (regenerate) for (int y = 0; y < 2 * MAX_TAPS + 1; y++) {
         vsum1_r += dyn_wr[y] * grain_r[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
         vsum1_g += dyn_wg[y] * grain_g[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
         vsum1_b += dyn_wb[y] * grain_b[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
@@ -1982,7 +2388,7 @@ void hook() {
     float vsum2_r = 0.0, vsum2_g = 0.0, vsum2_b = 0.0;
     barrier();
     {
-        for (uint i = lid; i < isize.y * isize.x; i += num_threads) {
+        if (regenerate) for (uint i = lid; i < isize.y * isize.x; i += num_threads) {
             uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
             ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy)
                                  + ivec2(local_pos) - ivec2(MAX_TAPS);
@@ -1998,7 +2404,7 @@ void hook() {
             grain_b[local_pos.y][local_pos.x] = mix(grain_lum, g_b, BLUE_SATURATION * grain_base_sat);
         }
         barrier();
-        for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
+        if (regenerate) for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
             float hsum_r = 0.0, hsum_g = 0.0, hsum_b = 0.0;
             for (int x = 0; x < 2 * MAX_TAPS + 1; x++) {
                 hsum_r += dyn_wr2[x] * grain_r[y][gl_LocalInvocationID.x + x];
@@ -2010,42 +2416,40 @@ void hook() {
             grain_b[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_b;
         }
         barrier();
-        for (int y = 0; y < 2 * MAX_TAPS + 1; y++) {
+        if (regenerate) for (int y = 0; y < 2 * MAX_TAPS + 1; y++) {
             vsum2_r += dyn_wr2[y] * grain_r[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
             vsum2_g += dyn_wg2[y] * grain_g[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
             vsum2_b += dyn_wb2[y] * grain_b[gl_LocalInvocationID.y + y][gl_LocalInvocationID.x + MAX_TAPS];
         }
     }
 
-    // Bandpass combine (DoG = blur(s1) - a*blur(s2)), RMS-normalized so
-    // strength holds as measured hardness changes.
-    float vsum_r = bp_norm[0] * (vsum1_r - bp_alpha * vsum2_r);
-    float vsum_g = bp_norm[1] * (vsum1_g - bp_alpha * vsum2_g);
-    float vsum_b = bp_norm[2] * (vsum1_b - bp_alpha * vsum2_b);
+    if (regenerate) {
+        // Bandpass combine (DoG = blur(s1) - a*blur(s2)), RMS-normalized so
+        // strength holds as measured hardness changes.
+        float vsum_r = bp_norm[0] * (vsum1_r - bp_alpha * vsum2_r);
+        float vsum_g = bp_norm[1] * (vsum1_g - bp_alpha * vsum2_g);
+        float vsum_b = bp_norm[2] * (vsum1_b - bp_alpha * vsum2_b);
 
-    // VALUE-DOMAIN contrast (value_warp): tanh the grain toward a bimodal/high-per-grain-
-    // contrast marginal -- the CyberCity "harsh" character (negative excess-kurtosis).
-    // Per channel: warped = sigma*renorm*tanh(warp * vsum / sigma) -> reshapes the value
-    // distribution while preserving RMS (sigma + renorm computed above). value_warp=0 is
-    // skipped -> BIT-IDENTICAL (A/B-safe). The value-domain cousin of grain_contrast.
-    if (value_warp > 0.05) {
-        vsum_r = vsum_sigma[0] * warp_renorm * tanh(value_warp * vsum_r / max(vsum_sigma[0], 1e-6));
-        vsum_g = vsum_sigma[1] * warp_renorm * tanh(value_warp * vsum_g / max(vsum_sigma[1], 1e-6));
-        vsum_b = vsum_sigma[2] * warp_renorm * tanh(value_warp * vsum_b / max(vsum_sigma[2], 1e-6));
+        // VALUE-DOMAIN contrast (value_warp): tanh the grain toward a
+        // bimodal/high-per-grain-contrast marginal while preserving RMS.
+        if (value_warp > 0.05) {
+            vsum_r = vsum_sigma[0] * warp_renorm * tanh(value_warp * vsum_r / max(vsum_sigma[0], 1e-6));
+            vsum_g = vsum_sigma[1] * warp_renorm * tanh(value_warp * vsum_g / max(vsum_sigma[1], 1e-6));
+            vsum_b = vsum_sigma[2] * warp_renorm * tanh(value_warp * vsum_b / max(vsum_sigma[2], 1e-6));
+        }
+        vsum_r *= field_norm[0];
+        vsum_g *= field_norm[1];
+        vsum_b *= field_norm[2];
+
+        // Final field store. The trigger dispatch rounds 540 up to 544 rows,
+        // so guard the four out-of-range rows explicitly.
+        ivec2 gpos = ivec2(gl_GlobalInvocationID.xy);
+        if (all(lessThan(gpos, imageSize(GRAIN_FIELD)))) {
+            imageStore(GRAIN_FIELD, gpos, vec4(vsum_r, vsum_g, vsum_b, 0.0));
+            if (all(equal(gpos, ivec2(0))))
+                m_field_valid = 1.0;
+        }
     }
-    vsum_r *= field_norm[0];
-    vsum_g *= field_norm[1];
-    vsum_b *= field_norm[2];
-
-    // Final field store. rgb = the finished signed grain (bandpass + warp).
-    // Write the finished template into the PERSISTENT storage texture (survives
-    // across presents). The trigger dispatch rounds 540 up to 544 rows (COMPUTE 32),
-    // so guard against the 4 out-of-range rows: an OOB imageStore is a spec-legal
-    // silent no-op on both Vulkan and D3D11, but gate it explicitly rather than lean
-    // on backend drop behavior (no barrier follows, so the divergent branch is safe).
-    ivec2 gpos = ivec2(gl_GlobalInvocationID.xy);
-    if (all(lessThan(gpos, imageSize(GRAIN_FIELD))))
-        imageStore(GRAIN_FIELD, gpos, vec4(vsum_r, vsum_g, vsum_b, 0.0));
 }
 
 //!HOOK OUTPUT
@@ -2063,15 +2467,22 @@ void hook() {
 // source-locked gen pass via GRAIN_STATE / GRAIN_FIELD.
 #define DENSITY_GAIN 1.0
 #define DENSITY_SHADOW_FLOOR 0.015
-#define TPL_BLOCK 64.0   // shuffle tile size in 4K-scan texels
-#define TPL_OV    8.0    // overlap-blend band width past each block boundary
+#define PICTURE_DENSITY_OUT 2160.0
+// MUST equal MP_PICTURE_DENSITY / PICTURE_DENSITY in PASS 1 / PASS 2.
+#define TPL_BLOCK_NORM (64.0 / 2160.0) // active-picture-height fraction
+#define TPL_OV_NORM    (8.0 / 2160.0)  // active-picture-height fraction
+#define TPL_BLOCK (TPL_BLOCK_NORM * PICTURE_DENSITY_OUT)
+#define TPL_OV    (TPL_OV_NORM * PICTURE_DENSITY_OUT)
 #define MP_TONE_BINS_OUT 8
 #define MP_FIELD_STD_OUT 0.0185
 // MUST equal PASS 1's MP_STATE_MAGIC (same translation-unit-sync rule as
 // MP_TONE_BINS_OUT / MP_FIELD_STD_OUT — no compile guard exists).
-#define MP_STATE_MAGIC_OUT 0.942451
+#define MP_STATE_MAGIC_OUT 0.949451
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
+const vec3 field_var = vec3(0.08318138 * 0.08318138,
+                            0.06602582 * 0.06602582,
+                            0.04909565 * 0.04909565);
 
 // --- HDR (PQ BT.2020 output) domain bridge, grain_hdr=1. The grain model is
 // measured on gamma-encoded SDR source codes at LUMA, but whenever the player
@@ -2138,27 +2549,35 @@ float matched_grain_scale(float lum, float hdr_mode) {
     float sigma = grain_gain * match_grain * sqrt(max(power, 0.0));
     float black_lo = mix(0.0010, 0.00025, hdr_mode);
     float black_hi = mix(0.0120, 0.00600, hdr_mode);
-    float black_gate = smoothstep(black_lo, black_hi, lum);
     // ONE fade-to-white envelope for every chain (author decree 2026-07-19,
-    // resolving charter-audit P2): below the fade, amount follows the
-    // rendition curve only -- no aesthetic shoulder. grain_fade sets the
-    // work-domain luma where grain reaches zero. Clip-limited chains (plain
+    // resolving charter-audit P2): between the shadow toe and upper fade,
+    // amount follows the rendition curve -- no aesthetic shoulder.
+    // grain_fade sets the work-domain luma where grain reaches zero.
+    // Clip-limited chains (plain
     // SDR, or SDR in a PQ container) cap the top at 0.95: waiting for
     // mathematical 1.0 leaves a tiny moving tail in perceptual whites --
     // temporal playback reveals it and channel clipping makes it one-sided
     // (the 2026-07-15 live-white finding). With headroom the top is the
     // user's above-ref-white reach; we cannot know the upstream expansion's
     // tuning. The 0.96/1.10 start/top ratio is the retained stock geometry.
+    // Aggressive low fades need a matching shadow toe: the stock black gate
+    // reaches full grain almost immediately, which makes a 0.2 fade read as a
+    // hard band. Below 0.5, widen the rise and shorten its full-strength shelf;
+    // at 0.5 and above every edge is exactly the stock expression.
     // OUTPUT's symmetric room clamp and flash-guard ceiling key on the same
     // top; the black gate stays container-keyed on hdr_mode.
     float white_hdr = hdr_mode * step(0.5, grain_headroom);
     // Floored at the declared PARAM minimum: a degenerate override would
     // collapse the smoothstep edges below (NaN through the whole tone scale).
-    float fade_user = max(grain_fade, 0.5);
+    float fade_user = max(grain_fade, 0.2);
     float fade_top = mix(min(fade_user, 0.95), fade_user, white_hdr);
-    float white_fade = 1.0 - smoothstep(fade_top * (0.96 / 1.10),
-                                        fade_top, lum);
-    float protection = black_gate * white_fade;
+    float stock_start = fade_top * (0.96 / 1.10);
+    float low_fade_q = 1.0 - smoothstep(0.30, 0.50, fade_top);
+    float toe_hi = mix(black_hi, max(black_hi, 0.45 * fade_top), low_fade_q);
+    float fade_start = mix(stock_start, 0.60 * fade_top, low_fade_q);
+    float shadow_toe = smoothstep(black_lo, toe_hi, lum);
+    float white_fade = 1.0 - smoothstep(fade_start, fade_top, lum);
+    float protection = shadow_toe * white_fade;
     float scale = sigma / MP_FIELD_STD_OUT * protection;
     // Density multiplication contributes one factor of luma. Divide it back
     // out so the absolute master-power curve survives into shadows; the small
@@ -2168,10 +2587,47 @@ float matched_grain_scale(float lum, float hdr_mode) {
     return min(scale, 8.0);
 }
 
+// Multiplicative RGB density is not automatically colour-energy neutral. The
+// small-signal working-code luma perturbation is
+//   dY = scale * (luma_coeff * carrier_rgb)^T * grain_rgb,
+// so its variance is q^T C q. On a neutral at the same luma q is simply the
+// neutral level times luma_coeff. Because this generator intentionally gives
+// red the strongest/finer component, the old path made equal-luma saturated
+// red ~1.24x neutral RMS at defaults (up to ~1.42x at grain_base_sat=1).
+// Carry the generator's current covariance and reduce only chromaticities above
+// the neutral reference. Never boost a quiet direction: H.274/AV1 permit real
+// per-component grain character, and this correction removes compositing bias
+// rather than flattening that character. Signed-gamma out-of-709 intermediates
+// in the PQ bridge must stay signed: their cancellation is part of the actual
+// BT.709-domain luma perturbation, while the downward-only cap cannot amplify it.
+// The covariance describes the canonical 2160-sample field; OUTPUT footprint
+// filtering can make lower-density presentations more conservative, so this is
+// a no-excess cap rather than a claim of resolution-wide exact normalization.
+float density_colour_energy_cap(vec3 carrier) {
+    float neutral_level = max(dot(luma_coeff, carrier), 0.0);
+    if (neutral_level <= 1.0e-8)
+        return 1.0;
+    vec3 q = luma_coeff * carrier;
+    vec3 cap_field_var = vec3(m_field_var_r, m_field_var_g, m_field_var_b);
+    float carrier_var = dot(q * q, cap_field_var)
+        + 2.0 * (q.r * q.g * m_field_cov_rg
+               + q.r * q.b * m_field_cov_rb
+               + q.g * q.b * m_field_cov_gb);
+    float neutral_var = neutral_level * neutral_level * (
+          dot(luma_coeff * luma_coeff, cap_field_var)
+        + 2.0 * (luma_coeff.r * luma_coeff.g * m_field_cov_rg
+               + luma_coeff.r * luma_coeff.b * m_field_cov_rb
+               + luma_coeff.g * luma_coeff.b * m_field_cov_gb));
+    if (carrier_var <= neutral_var * 1.0001)
+        return 1.0;
+    return min(sqrt(max(neutral_var, 0.0)
+                  / max(carrier_var, 1.0e-12)), 1.0);
+}
+
 // Wrapped point fetch of the toroidal grain template. GRAIN_FIELD is a
 // persistent storage image, so every filtered read below is assembled from
-// explicit imageLoads. Coordinates are virtual-4K texel coordinates, with
-// texel i centred at i+0.5. Exact 2160-line samples therefore retain the
+// explicit imageLoads. Coordinates are implementation-lattice samples, with
+// sample i centred at i+0.5. Exact-density samples therefore retain the
 // historical one-load path, while arbitrary footprint taps use the correct
 // half-texel cell boundaries.
 vec3 grain_point(vec2 fpos, ivec2 g) {
@@ -2188,7 +2644,7 @@ uint pcg_hash(uint s) {
     return (word >> 22u) ^ word;
 }
 
-// One block's grain sample for an arbitrary virtual-scan position pos. b is
+// One block's grain sample for an arbitrary picture-lattice position pos. b is
 // the block index doing the presenting (possibly a neighbour of pos's own
 // block, when evaluating the overlap bands — intra then exceeds [0,BLOCK)
 // and the flip can go one period negative, bounded by -TPL_OV). One template
@@ -2212,11 +2668,11 @@ vec3 tpl_sample(vec2 b, vec2 pos, float vseed, ivec2 g) {
                        + vec2(float(h0 % uint(g.x)), float(h1 % uint(g.y))), g);
 }
 
-// Evaluate one point of the ASSEMBLED virtual scan. Filtering must call this
+// Evaluate one point of the assembled picture-space field. Filtering must call this
 // complete evaluator for every tap: filtering only the physical template and
 // reusing the centre pixel's block weights would crossfade the wrong shuffled
 // windows at block boundaries.
-vec3 virtual_point(vec2 pos, float vseed, ivec2 g) {
+vec3 picture_point(vec2 pos, float vseed, ivec2 g) {
     vec2 b = floor(pos / TPL_BLOCK);
     vec2 u = pos - b * TPL_BLOCK;
     float wxp = 0.0, wxc = 1.0, wyp = 0.0, wyc = 1.0;
@@ -2242,23 +2698,23 @@ vec3 virtual_point(vec2 pos, float vseed, ivec2 g) {
 }
 
 // Tent reconstruction of the canonical field for outputs denser than its
-// virtual-4K lattice. This reveals the same finite-bandwidth field at more
-// sample points instead of repeating virtual texels. At an exact sample centre
-// fract() is zero and the result is exactly virtual_point(base).
-vec3 virtual_linear(vec2 pos, float vseed, ivec2 g) {
+// picture-space lattice. This reveals the same finite-bandwidth field at more
+// sample points instead of repeating lattice samples. At an exact sample centre
+// fract() is zero and the result is exactly picture_point(base).
+vec3 picture_linear(vec2 pos, float vseed, ivec2 g) {
     vec2 base = floor(pos - 0.5) + 0.5;
     vec2 f = pos - base;
-    vec3 c00 = virtual_point(base, vseed, g);
-    vec3 c10 = virtual_point(base + vec2(1.0, 0.0), vseed, g);
-    vec3 c01 = virtual_point(base + vec2(0.0, 1.0), vseed, g);
-    vec3 c11 = virtual_point(base + vec2(1.0, 1.0), vseed, g);
+    vec3 c00 = picture_point(base, vseed, g);
+    vec3 c10 = picture_point(base + vec2(1.0, 0.0), vseed, g);
+    vec3 c01 = picture_point(base + vec2(0.0, 1.0), vseed, g);
+    vec3 c11 = picture_point(base + vec2(1.0, 1.0), vseed, g);
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
 }
 
-// Sample the continuous virtual scan through one output-pixel footprint.
-// output_step is the output pixel width in virtual-4K texels:
-//   == 1: exact historical one-point path (2160-high active picture)
-//    < 1: tent reconstruction between canonical samples (>2160 output)
+// Sample the continuous picture field through one output-pixel footprint.
+// output_step is the output pixel width in implementation-lattice samples:
+//   == 1: one point per lattice sample
+//    < 1: tent reconstruction between canonical samples
 //  1..1.25: the same tent is the deterministic narrow-footprint integral
 //   > 1.25: stratified integration, growing the grid with footprint span
 // Adjacent estimators crossfade over a quarter-texel transition so changing
@@ -2266,44 +2722,44 @@ vec3 virtual_linear(vec2 pos, float vseed, ivec2 g) {
 // The footprint average deliberately loses only power the output grid cannot
 // resolve; it is not RMS-renormalized. A source/output gain would make the
 // grain a property of the user's scaler instead of the title.
-vec3 virtual_grid2(vec2 centre, float output_step, float vseed, ivec2 g) {
+vec3 picture_grid2(vec2 centre, float output_step, float vseed, ivec2 g) {
     vec2 d = vec2(0.25 * output_step);
     return 0.25 * (
-          virtual_point(centre + vec2(-d.x, -d.y), vseed, g)
-        + virtual_point(centre + vec2( d.x, -d.y), vseed, g)
-        + virtual_point(centre + vec2(-d.x,  d.y), vseed, g)
-        + virtual_point(centre + vec2( d.x,  d.y), vseed, g));
+          picture_point(centre + vec2(-d.x, -d.y), vseed, g)
+        + picture_point(centre + vec2( d.x, -d.y), vseed, g)
+        + picture_point(centre + vec2(-d.x,  d.y), vseed, g)
+        + picture_point(centre + vec2( d.x,  d.y), vseed, g));
 }
 
-vec3 virtual_grid3(vec2 centre, float output_step, float vseed, ivec2 g) {
+vec3 picture_grid3(vec2 centre, float output_step, float vseed, ivec2 g) {
     vec3 integrated = vec3(0.0);
     for (int y = 0; y < 3; ++y) {
         for (int x = 0; x < 3; ++x) {
             vec2 q = (vec2(float(x), float(y)) + 0.5) / 3.0 - 0.5;
-            integrated += virtual_point(centre + q * output_step, vseed, g);
+            integrated += picture_point(centre + q * output_step, vseed, g);
         }
     }
     return integrated * (1.0 / 9.0);
 }
 
-vec3 virtual_grid4(vec2 centre, float output_step, float vseed, ivec2 g) {
+vec3 picture_grid4(vec2 centre, float output_step, float vseed, ivec2 g) {
     vec3 integrated = vec3(0.0);
     for (int y = 0; y < 4; ++y) {
         for (int x = 0; x < 4; ++x) {
             vec2 q = (vec2(float(x), float(y)) + 0.5) / 4.0 - 0.5;
-            integrated += virtual_point(centre + q * output_step, vseed, g);
+            integrated += picture_point(centre + q * output_step, vseed, g);
         }
     }
     return integrated * (1.0 / 16.0);
 }
 
-vec3 virtual_pixel(vec2 centre, float output_step, float vseed, ivec2 g) {
+vec3 picture_pixel(vec2 centre, float output_step, float vseed, ivec2 g) {
     if (abs(output_step - 1.0) < 0.000001)
-        return virtual_point(centre, vseed, g);
+        return picture_point(centre, vseed, g);
     if (output_step < 1.25)
-        return virtual_linear(centre, vseed, g);
+        return picture_linear(centre, vseed, g);
 
-    // Keep the sample pitch near one virtual-4K texel as the output gets
+    // Keep the sample pitch near one implementation-lattice sample as output gets
     // smaller. The grid grows while output pixel count falls by the same
     // square factor, so 720p/540p gain accuracy without an exploding total
     // evaluator count. Four per axis is the deliberate portability ceiling;
@@ -2311,24 +2767,24 @@ vec3 virtual_pixel(vec2 centre, float output_step, float vseed, ivec2 g) {
     // dynamic loops into every backend.
     if (output_step < 1.5) {
         float t = smoothstep(1.25, 1.5, output_step);
-        return mix(virtual_linear(centre, vseed, g),
-                   virtual_grid2(centre, output_step, vseed, g), t);
+        return mix(picture_linear(centre, vseed, g),
+                   picture_grid2(centre, output_step, vseed, g), t);
     }
     if (output_step < 2.25)
-        return virtual_grid2(centre, output_step, vseed, g);
+        return picture_grid2(centre, output_step, vseed, g);
     if (output_step < 2.5) {
         float t = smoothstep(2.25, 2.5, output_step);
-        return mix(virtual_grid2(centre, output_step, vseed, g),
-                   virtual_grid3(centre, output_step, vseed, g), t);
+        return mix(picture_grid2(centre, output_step, vseed, g),
+                   picture_grid3(centre, output_step, vseed, g), t);
     }
     if (output_step < 3.25)
-        return virtual_grid3(centre, output_step, vseed, g);
+        return picture_grid3(centre, output_step, vseed, g);
     if (output_step < 3.5) {
         float t = smoothstep(3.25, 3.5, output_step);
-        return mix(virtual_grid3(centre, output_step, vseed, g),
-                   virtual_grid4(centre, output_step, vseed, g), t);
+        return mix(picture_grid3(centre, output_step, vseed, g),
+                   picture_grid4(centre, output_step, vseed, g), t);
     }
-    return virtual_grid4(centre, output_step, vseed, g);
+    return picture_grid4(centre, output_step, vseed, g);
 }
 
 void hook() {
@@ -2339,7 +2795,9 @@ void hook() {
     // not guaranteed; NaN m_eff_render would pass a <=0 gate as false). An
     // unvalidated state must passthrough unconditionally — including debug,
     // whose rows would render garbage.
-    if (!(abs(m_state_magic - MP_STATE_MAGIC_OUT) < 0.0001)) {
+    if (!(abs(m_state_magic - MP_STATE_MAGIC_OUT) < 0.0001
+          && abs(m_state_epoch - state_epoch) < 0.5
+          && m_field_valid > 0.5)) {
         imageStore(out_image, ivec2(gl_GlobalInvocationID), color);
         return;
     }
@@ -2393,9 +2851,10 @@ void hook() {
         imageStore(out_image, gid, color);
         return;
     }
-    // gscale maps to the VIRTUAL 4K scan, not the physical template extent;
+    // gscale maps normalized picture coordinates onto the finite synthesis
+    // lattice, not the physical template extent;
     // gsize only wraps each shuffled template-window fetch.
-    float gscale = 2160.0 / max(active_size.y, 1.0);
+    float gscale = PICTURE_DENSITY_OUT / max(active_size.y, 1.0);
     vec2 fpos = (pixel_centre - active_origin) * gscale;
     // KNOWN LIMIT (audit 2026-07-10): the overlap blend preserves variance
     // exactly (weights' squares sum to 1) but not DISTRIBUTION SHAPE — a
@@ -2407,11 +2866,11 @@ void hook() {
     // in adversarial freeze-frames at gain 12; accepted freeze-frame-only
     // limitation rather than restructuring warp to post-blend.
     // TPL BLOCK SHUFFLE (small-template architecture, AV1-FGS style).
-    // Each TPL_BLOCK-sized tile of the virtual 4K scan presents a per-tile
+    // Each normalized TPL_BLOCK-sized tile of the picture field presents a per-tile
     // randomized (integer offset + H/V flip) window of the physical
     // template, re-hashed every visible tick (see tpl_sample above).
     // Per-grain statistics are the template's texels (same DoG/warp
-    // pipeline at 4K-scan texel scale); only the long-range arrangement
+    // pipeline at the implementation-lattice scale); only the long-range arrangement
     // reuses template windows. The per-tick rehash supersedes the
     // full-size build's whole-field recycle transform. Two seam defenses,
     // both empirically required (dev/grain-genrate/README):
@@ -2427,10 +2886,10 @@ void hook() {
     // Continuity: at u == 0 the sample IS the neighbour's (weight 1) and
     // ramps out by u == TPL_OV. Outside the bands it is a single exact
     // texel fetch at gscale == 1.0, as before.
-    float vseed = floor(m_gen_frame * grain_rate);
+    float vseed = m_arr_seed;
     uint j0 = pcg_hash(uint(vseed) * 2246822519u + 3u);
     vec2 fj = fpos + vec2(float(j0 % 64u), float((j0 >> 8) % 64u));
-    vec3 vsum = virtual_pixel(fj, gscale, vseed, gsize);
+    vec3 vsum = picture_pixel(fj, gscale, vseed, gsize);
 
     // grain_hdr bridge: work in the measured SDR domain (see helpers above).
     // Clamp the PQ input codes — YUV->RGB overshoot above 1.0 explodes the
@@ -2459,17 +2918,6 @@ void hook() {
     vec3 pre_grain = work_rgb;
     vec3 grain_delta;
     if (density_combine > 0.5) {
-        vec3 field_var = vec3(0.08318138 * 0.08318138,
-                              0.06602582 * 0.06602582,
-                              0.04909565 * 0.04909565);
-        vec3 x = DENSITY_GAIN * vsum * scale_vec;
-        // Canonical-field log-normal bias correction. Footprint filtering
-        // changes covariance, so non-2160 presentations retain a very small
-        // conservative bias rather than pretending sum(weights^2) is exact
-        // for the correlated DoG field.
-        vec3 density_delta = exp(x - 0.5 * DENSITY_GAIN * DENSITY_GAIN
-                               * tone_scale * tone_scale * field_var) - 1.0;
-        grain_delta = work_rgb * density_delta;
         // Density multiplication cannot express an absolute noise floor below
         // the 0.015 divisor. Extend only picture-bearing near-black values with
         // the same zero-mean RGB perturbation; literal black/mattes stay exact.
@@ -2482,7 +2930,20 @@ void hook() {
         float pedestal_signal = max(DENSITY_SHADOW_FLOOR
                                   - max(color_luma, 0.0), 0.0)
                               * pedestal_gate;
+        vec3 x = DENSITY_GAIN * vsum * scale_vec;
+        // Canonical-field log-normal bias correction. Footprint filtering
+        // changes covariance, so non-native-density presentations retain a very small
+        // conservative bias rather than pretending sum(weights^2) is exact
+        // for the correlated DoG field.
+        vec3 density_delta = exp(x - 0.5 * DENSITY_GAIN * DENSITY_GAIN
+                               * tone_scale * tone_scale * field_var) - 1.0;
+        grain_delta = work_rgb * density_delta;
         grain_delta += vec3(pedestal_signal) * density_delta;
+        // One post-density scalar preserves channel log-normal shapes, their
+        // zero-mean correction, hue speckle, and spatial/RMS ratios exactly.
+        // At a neutral carrier the cap is identically one.
+        grain_delta *= density_colour_energy_cap(
+            work_rgb + vec3(pedestal_signal));
     } else {
         grain_delta = vsum * scale_vec;
     }
@@ -2560,7 +3021,7 @@ void hook() {
 
     if (debug_match > 0.5) {
         const int X_OFF = 24, Y_OFF = 400, BW = 10, BH = 10;
-        const int ANCHOR = 10, NBITS = 16, NROWS = 51;
+        const int ANCHOR = 10, NBITS = 16, NROWS = 52;
         ivec2 gid = ivec2(gl_GlobalInvocationID.xy) - ivec2(X_OFF, Y_OFF);
         if (gid.x >= 0 && gid.y >= 0
             && gid.x < ANCHOR + NBITS * BW && gid.y < NROWS * BH) {
@@ -2599,7 +3060,8 @@ void hook() {
             else if (row == 47) v = m_pending_inset_y * 200000.0;
             else if (row == 48) v = max(m_geom_streak, m_geom_streak_y);
             else if (row == 49) v = min(m_geom_known, m_geom_known_y) * 65000.0;
-            else                v = m_geom_changed * 65000.0;
+            else if (row == 50) v = m_geom_changed * 65000.0;
+            else                v = m_pan_px * 2000.0;
             uint val = uint(clamp(v, 0.0, 65535.0));
             if (gid.x < ANCHOR)
                 color.rgb = vec3(1.0);

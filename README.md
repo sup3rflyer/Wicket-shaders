@@ -216,18 +216,24 @@ HDR-signal-safe: never clamps the backbuffer. Works on SDR (sRGB), HDR10 (PQ BT.
 
 **Adaptive grain restoration.** Instead of applying a fixed tier, it *measures* the source's own surviving film grain and auto-tunes the grain model to restore it. Compression and intermediates smooth camera-original grain unevenly; this reads what survived and rebuilds a fuller, source-matched grain rather than laying a generic overlay on top.
 
-Two-stage compute pipeline: grain character is measured on the `LUMA` plane (pre-scale, where the signal survives), and grain is rendered on `OUTPUT` (native display resolution, so grain is crisp and display-native regardless of source resolution), with a persistent buffer carrying the measured state between stages. Grain re-seeds on a **source-frame counter**, so its temporal cadence is locked to the content and independent of the display refresh rate (`grain_rate` means the same thing on any panel). Per source it adapts grain **amplitude** (how much survived, extrapolated up toward the original), **tone** (which luminance range the grain occupies), and **sharpness/size** (fine "sandpaper" vs soft grain, held to a constant visual angle so it reads like a 4K film scan on any display) — with motion-, cut-, and pan-aware gating so static texture, smoke, and busy detail aren't mistaken for grain.
+Three-stage compute pipeline: grain character is measured on the `LUMA` plane, a persistent 960×540 toroidal vocabulary is generated on source ticks, and `OUTPUT` assembles that vocabulary into a continuous active-picture field. Grain size is defined as a fraction of picture height, not as grain “at 4K”: scanning or displaying the same source at higher resolution reveals the same grain with greater sampling fidelity. The current 2160-sample synthesis lattice is a finite implementation bandwidth, not the grain's identity.
+
+The density compositor retains the generator's unequal, correlated RGB grain character, but normalizes its luma energy downward when a saturated carrier would otherwise make the same measured grain look stronger than it does on an equal-luma neutral. This is covariance-aware rather than a generic saturation reduction: quiet chromatic directions are left alone, neutral pixels are unchanged, and additive mode is untouched.
+
+Visible arrangement cadence is source-locked and display-refresh independent. `grain_rate` controls the boil cadence; `grain_gen_rate` may retain the standing vocabulary for several visible ticks while block windows and jitter still rehash every tick. Paused redraws freeze the observer, vocabulary, and arrangement when the companion shampv script supplies the machine-owned pause signal; paused seeks/frame-steps participate in normal source cadence for their new frame, then refreeze (so “on twos” still intentionally shares an arrangement). Editing a generator-baked look control while paused rebuilds the standing vocabulary once under the same seed, so tuning remains live without starting the temporal observer. A shader first enabled while paused initializes once from the held source frame. shampv also changes `state_epoch` once per file so title state cannot bleed across a playlist; standalone integrations must do the same.
 
 Runtime controls (live-toggleable via `glsl-shader-opts`):
 
 | Param | Effect |
 |-------|--------|
-| `match_grain` | 0 = bit-identical to the fixed Light tier, 1 = matched. `mix()` between, so A/B is non-destructive. |
-| `grain_sharpness` | Global crispness dial (1 = crisp 4K-scan default, 0 = a softer look). |
-| `grain_rate` | Grain animation cadence, as a fraction of *source* frames (default 1 = fresh grain every source frame; 0.5 = every 2nd source frame, "on twos"). Display-refresh independent. |
+| `match_grain` | 0 = no synthetic output while observation remains live; 1 = full Match Grain+. Intermediate values are valid evaluation amounts. |
+| `grain_sharpness` | Measured-size influence (1 = literal compact-observer estimate; 0 = neutral generator). |
+| `grain_rate` | Visible arrangement cadence as a fraction of *source* frames (default 1 = on ones; 0.5 = on twos). Display-refresh independent. |
+| `grain_gen_rate` | Template-vocabulary regeneration rate relative to visible ticks (default 1 = every tick; 0.25 = every fourth). Arrangement still refreshes each visible tick; the saving is modest because OUTPUT dominates cost, and finite-vocabulary reuse can change higher-order temporal correlation. |
 | `grain_base_sat` | Per-channel independence of the base grain — the subtle baked-in hue speckle (default 0.25 = calibrated look; 0 = mono grain). |
-| `restore_gain` | How far to extrapolate past the surviving grain toward the camera original. |
-| `density_combine` | 0 = additive, 1 = multiplicative density (grain rides the tone/bloom gradients). |
+| `restore_gain` | How far to extrapolate past the surviving grain toward the camera original. Default 1 follows the inferred target; >1 is a manual override for known-damaged material. Values near 5 are aggressive and shot-specific, not a preset; 6 is the expert ceiling. Above 2, restored power rises roughly with the square and can heavily overgrain intact material. |
+| `grain_fade` | Work-domain luma where grain reaches zero. Default 1.10 preserves the stock top end; 0.2-0.3 confines grain to low luminance with a widened shadow toe so the grain rises gradually out of black. Below-reference-white values only move the luma envelope; the per-channel safety ceiling stays at reference white. |
+| `density_combine` | 0 = additive; 1 = multiplicative density (grain rides tone/bloom gradients, with neutral-referenced chromatic luma-energy protection). |
 | `grain_hdr` | 1 = PQ BT.2020 output chain (e.g. CelFlare): grain is keyed and applied in the measured SDR domain via a per-pixel PQ bridge, fading out shortly above reference white. 0 = plain SDR (exact prior behavior). |
 | `grain_ref_white` | SDR reference white in nits for the HDR bridge — match `hdr-reference-white`. |
 | `debug_match` | Machine-readable state overlay for tuning. |

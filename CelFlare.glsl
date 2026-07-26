@@ -177,7 +177,7 @@
 1
 
 //!PARAM cf_debug
-//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars, 9 = motion prev-offset, 10 = motion evidence, 11 = motion residual, 12 = additive proof (R established, G emission ratio, B persistence).
+//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars, 9 = motion prev-offset, 10 = motion evidence, 11 = motion residual, 12 = additive proof (R established, G applied route = emission x excursion x source-rise, B persistence).
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 12
@@ -1236,8 +1236,10 @@ void hook() {
 // the frame's illum-V statistic: a moderate-alpha fast lane minus a slow
 // baseline lane. The difference is positive only during a multi-frame RISE
 // (so the pump tracks and augments the source's own attack), ≈0 at steady
-// state, and self-releases once brightness plateaus (fast lane catches the
-// slow one). The moderate fast alpha is what rejects 2-3 frame flashes
+// state. Note the DRIVE self-releases at plateau (fast catches slow) but the
+// held ENV does not: it max-holds and relaxes only via PUMP_ADAPT_FLOOR (the
+// deliberate ~30 s eye-adaptation clock) plus velocity-matched release on
+// actual falls. The moderate fast alpha is what rejects 2-3 frame flashes
 // (lightning, muzzle): they reverse before the fast lane builds, so drive
 // stays under the onset.
 // PUMP_ALPHA_FAST is the primary flash-vs-sustained dial: LOWER = more flash
@@ -1336,6 +1338,16 @@ void hook() {
 // 0.02/0.18 were for the deleted sharp MID driver). Values absorb the former
 // 0.01 dead-zone shift (0.04/0.14 + 0.01 — same mask response, deadzone-free).
 // A/B LOW 0.04-0.06, HIGH 0.11-0.17.
+// CALIBRATION (2026-07-26, closed-form; three audits mis-derived it): a ramp of
+// rate rho/frame reaches steady-state d = rho*((1-as)/as - (1-af)/af) = 19.4*rho,
+// so the 0.05 knee = a ~0.06 V/s opening floor at 24p — the charter's gentle
+// sustained brighten sits ON the knee by design. Faces ramping into key light
+// run 2-3x faster; NO value of this knee separates them (both bracket it) —
+// that separation is the excursion gate's job (ADD_EXCURSION_LO/HI), not this.
+// Note the excursion floor makes the slow-sustained class additionally wait
+// for ACCUMULATED delta: ~+1-6 s extra onset at 0.1-0.3 V/s (measured
+// 2026-07-26) — the two gates are near-redundant at proof time and only
+// become orthogonal axes over ~1 s.
 #define PUMP_CELL_DRIVE_LOW  0.05   // per-cell band-pass onset (mask starts opening — region is brightening)
 #define PUMP_CELL_DRIVE_HIGH 0.15   // per-cell saturation (mask fully open — region clearly brightening)
 // ESTABLISHED-LEVEL GATE (2026-07-02, from dissecting the killer reveal clip —
@@ -1479,7 +1491,10 @@ void hook() {
 // rise survives a cubic sample at the refined previous offset: transport loses
 // most of its fast-lane rise; emission retains it. Using the pump's fast lane
 // instead of one-frame raw V lets a slow/held source keep proving itself while
-// its EMA catches up. The proof is deliberately seven
+// its EMA catches up — but the fast lane also keeps rising 4-5 frames past a
+// source peak, so proof frames additionally require a not-falling SOURCE
+// (ADD_SRC_FALL_DZ) and a real excursion above the cell's own very-slow
+// baseline (ADD_EXCURSION_LO/HI). The proof is deliberately seven
 // COMPLETE routed frames (2-6-frame flow-error bursts stay shut) and its credit
 // follows a moving event through the grid. No frame-global fast lane exists.
 #define ADD_VSLOW_ALPHA          0.01
@@ -1495,6 +1510,20 @@ void hook() {
 #define ADD_MAINT_ENV_LO         0.02
 #define ADD_MAINT_ENV_HI         0.10
 #define ADD_ATTACK_STEP          0.25
+// Sustain hardening (2026-07-26 false-positive round). Excursion: an opening
+// must stand this far above the cell's OWN very-slow baseline. The drive band
+// cannot make this separation — a face ramping into key light measures ~0.15
+// excursion at proof time, an ignition >=0.4, and both clear the drive knee.
+// EFFECTIVE floor is the LO/HI midpoint ~0.31 (route must clear
+// ADD_PERSIST_ROUTE_MIN 0.5) — do not lower LO expecting a 0.22 floor. A
+// monotone rise of any duration with total sigma80-V delta >=0.45 still opens
+// (big slow dissolves are the accepted residual; face ramp 0.15 / face
+// dissolve 0.29 stay shut). Sim-verified: tunnel/explosion/spell keep full
+// amplitude at ~0.3 s later onset. Fall deadzone: gates AMPLITUDE
+// (proved_open), deliberately NOT the persist counter — see the loop-2 note.
+#define ADD_EXCURSION_LO         0.22
+#define ADD_EXCURSION_HI         0.40
+#define ADD_SRC_FALL_DZ          0.01
 #define ADD_VFLOW_COST_MAX       0.03
 #define ADD_VFLOW_SAD_CAP        0.10
 #define ADD_VFLOW_BIAS           0.0001
@@ -2964,6 +2993,14 @@ void hook() {
                 // maps to exactly 0 (the former dead-zone shift is folded into
                 // PUMP_CELL_DRIVE_LOW/HIGH — see the knob block).
                 float a = smoothstep(PUMP_CELL_DRIVE_LOW, PUMP_CELL_DRIVE_HIGH, d);
+                #if ADDITIVE_OPEN_GUARD
+                // Set by the proof block below: 1 only on a route-authorized
+                // (proved) frame. A frame authorized ONLY by maintenance
+                // credit may sustain the existing amplitude, never grow it —
+                // ungated growth is what delivered a proved event's deferred
+                // amplitude onto its own decay (the end-of-event pop).
+                float add_attack_gate = 0.0;
+                #endif
 #if MC_RESIDUAL_GATE
                 // === MOTION-COMPENSATED RESIDUAL GATE (subtractive) ===
                 // The mask opens only where current V exceeds the previous field
@@ -3023,6 +3060,42 @@ void hook() {
                         }
                         float routed_open = inb
                             ? add_established * effective_ratio_route : 0.0;
+                        // Excursion floor: the opening must stand a STEP above
+                        // this cell's own frozen very-slow baseline. The
+                        // established gate is neighbour-relative only — a lit
+                        // face on a dimmer surround passes it forever — and
+                        // the drive band admits any rise above its ~0.06 V/s
+                        // knee (dissolves, AE ramps, push-ins run 0.15-1.0).
+                        // Excursion separates by ACCUMULATED AMPLITUDE: at
+                        // ADD_PERSIST_ROUTE_MIN the effective floor is the
+                        // LO/HI midpoint ≈0.31 sigma80-V, which also implies a
+                        // minimum emitter size (~1.3 cells at full scale — a
+                        // sub-160px ignition stays cell-shut; accepted trade,
+                        // measured 2026-07-26). A monotone
+                        // rise of ANY duration with total delta >=0.45 still
+                        // opens — the residual FP class is big slow dissolves,
+                        // not faces (face ramp 0.15 / dissolve 0.29 both shut).
+                        float exc_gate = smoothstep(ADD_EXCURSION_LO,
+                                                    ADD_EXCURSION_HI,
+                                                    f - s_pump_snap_vs[i]);
+                        routed_open *= exc_gate;
+                        // Source-velocity anchor: no AUTHORIZED AMPLITUDE while
+                        // the source itself falls. Without it a 5-9 frame flash
+                        // banked its final proof frames on the fast lane's
+                        // post-peak overshoot and the pump landed counter-
+                        // directionally on the decay. Deliberately NOT folded
+                        // into routed_open: the persist counter hard-resets
+                        // below ADD_PERSIST_ROUTE_MIN, so a velocity term there
+                        // makes proof demand 7 consecutive near-monotone
+                        // frames — flame/plasma flicker (±0.01-0.06 sigma80-V,
+                        // temporal, which the spatial blur cannot average) then
+                        // never matures (P(open)~P(no fall)^7; sim: 100% dead).
+                        // Gating proved_open instead lets proof mature through
+                        // flicker while a falling source still gets zero new
+                        // amplitude — which is all the end-of-event fix needs.
+                        float src_rise_gate = 1.0 - smoothstep(0.0,
+                            ADD_SRC_FALL_DZ,
+                            -(s_illum_v[i] - s_prev_v[i]));
                         #if PUMP_EDGE_ESTABLISH
                         // Edge/influx authority is part of the persisted route,
                         // not a later output debit. Hidden edge credit therefore
@@ -3082,7 +3155,15 @@ void hook() {
                         pump_open_persist_cell[i] = persist;
                         float persist_gate = smoothstep(ADD_PERSIST_BASE - 1.0,
                                                         ADD_PERSIST_BASE, persist);
-                        float proved_open = routed_open * persist_gate;
+                        float proved_open = routed_open * persist_gate
+                                          * src_rise_gate;
+                        // Growth only on a fully route-authorized, non-falling
+                        // frame; a maintenance frame (or a mature cell whose
+                        // route degraded into (0, ROUTE_MIN)) may sustain
+                        // amplitude but never grow it.
+                        add_attack_gate =
+                            (routed_open >= ADD_PERSIST_ROUTE_MIN
+                             && proved_open > 0.0) ? 1.0 : 0.0;
                         // Maintenance preserves a still-live established mask;
                         // spent credit cannot resurrect a cell whose amplitude
                         // already released to zero, even if another object rises
@@ -3091,8 +3172,12 @@ void hook() {
                             ? maintenance_env : 0.0;
                         fresh_ease = max(proved_open, maintained_open);
                         #if cf_debug == 12
+                        // G carries the FULL applied route product — a cell
+                        // held shut by the excursion or source-rise gate must
+                        // read dark here, not masquerade as route-open.
                         motion_trust_cell[i] = add_established;
-                        motion_mc_local_cell[i] = effective_ratio_route;
+                        motion_mc_local_cell[i] = effective_ratio_route
+                                                * exc_gate * src_rise_gate;
                         motion_mc_effective_cell[i] = persist_gate;
                         #endif
                         #else
@@ -3188,16 +3273,28 @@ void hook() {
                 // damped by an EMA. Pre-proof stays exact zero, while source
                 // fall/release below remains unslewed.
                 #if ADDITIVE_OPEN_GUARD
-                a = min(a, pump_env_cell[i] + ADD_ATTACK_STEP);
+                a = min(a, pump_env_cell[i] + ADD_ATTACK_STEP * add_attack_gate);
                 #endif
-                // Velocity-matched release: when the negative band-pass region
-                // is still falling THIS frame, follow its frame-to-frame fast
-                // level. The ratios telescope across a real fade instead of
-                // repeatedly compounding the same fast-vs-slow deficit. A
-                // rebound below the slow lane holds rather than continuing to
-                // erase the mask. Max-held + adapt floor.
+                // Velocity-matched release: follow the source's frame-to-frame
+                // fast level while it falls. The ratios telescope across a
+                // real fade instead of repeatedly compounding the same
+                // fast-vs-slow deficit; a rebound (f rising) gives r = 1 and
+                // holds. Max-held + adapt floor. The two arms below differ in
+                // ARMING only: additive arms on the fast lane's own turnover,
+                // subtractive keeps the verified band-pass-negative arming.
+                #if ADDITIVE_OPEN_GUARD
+                // Release arms as soon as the fast lane itself turns over.
+                // The d<0 conjunct deferred arming ~10 more frames (slow-lane
+                // catch-up), which held a mistimed opening at full strength
+                // while its source died. max(·, a) below still restores
+                // anything the drive re-earns, so a held light only sheds
+                // wobble-sized amounts it immediately recovers.
+                float r = (f < cf && cf > 1e-3)
+                    ? clamp(f / cf, 0.0, 1.0) : 1.0;
+                #else
                 float r = (d < 0.0 && f < cf && cf > 1e-3)
                     ? clamp(f / cf, 0.0, 1.0) : 1.0;
+                #endif
                 float e = max(pump_env_cell[i] * r * PUMP_ADAPT_FLOOR, a);
                 pump_env_cell[i] = e;
                 // Post-update env stash for the softening pass below. Reusing
@@ -3631,7 +3728,15 @@ void hook() {
 #define PUMP_STRENGTH       0.6      // gain per unit pump_env at full pixel weight. At = CEIL the response is
                                    // PROPORTIONAL (peak reserved for full-detection events, not roof-pinned);
                                    // > CEIL slams moderate events to the roof (aggressive); subtle ≈ 0.4
-#define PUMP_Y_LOW          0.35   // per-pixel weight onset — low/broad so the whole bright region lifts (not a pinpoint)
+#define PUMP_Y_LOW          0.62   // per-pixel weight onset. 0.62 (2026-07-26): midtones hold the SDR grade —
+                                   // a lit face at Y_gamma 0.70 drops ~5x (0.56->0.11) while a near-clip event
+                                   // body at 0.95 keeps ~0.95 (0.80 drops 1.7x — the trim is midtone-selective).
+                                   // The old 0.35 pumped midtones adjacent to any authorized cell. A/B watch:
+                                   // a SATURATED colored event (blue/purple spell, V_gamma~0.9 / Y_gamma~0.45)
+                                   // now scores 0 here. If one visibly regresses, do NOT switch to plain
+                                   // max(Y,V) — V reads skin ~0.16 hotter than Y and that re-admits the face
+                                   // leak wholesale. The correct bridge is chroma-qualified V (high V AND high
+                                   // saturation), tuned against the face clips. And don't lower this back.
 #define PUMP_GAIN_CEIL      1.5    // hard cap on the pump multiplier (safety against runaway expansion)
 #define PUMP_GROWTH_DAMP    0.6    // down-gate pump where growth-mode already lifts expansion (anti double-stack on fireballs)
 // Spatial pump. Single-sourced from the top-of-file cf_spatial_pump toggle —

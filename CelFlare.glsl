@@ -271,8 +271,21 @@
 // fell back to raw Y there. PASS 6 decodes with a plain * 2.0. Assumes a
 // float intermediate FBO for MAIN (true under gpu-next fp16); a unorm FBO
 // would clamp at Y=2.0 instead of 1.0 — strictly more headroom than before.
-#define STABILIZE_OPACITY   0.85
-#define GRAIN_THRESHOLD     0.28
+// OPACITY 0.85 -> 1.0 and THRESHOLD 0.28 -> 0.35 (2026-07-26, coarse-grain
+// audit on a heavy-grain 90s film remux): the 15% deliberate leak-through and
+// the bilateral down-weighting of ±0.10+ grain excursions together left ~35%
+// of source grain in the decision field, which the expansion ramp then
+// amplified super-proportionally (measured hf excess 1.11-1.32x on faces).
+// NOTE the pair shifts more than "15%" reads: the decision's effective
+// self-weight drops ~20% -> ~6% (the center seeds blurred at 1/19), i.e. the
+// decision is now essentially the 18px bright-asymmetric neighbourhood level.
+// Full opacity is a flat win at zero regional-lift cost; 0.35 keeps most of
+// the grain win while halving the cel-edge footprint 0.45 showed on clean
+// digital content (at 0.35: ~1% of px change >2 nits, p99.9 ~5.6 nits, all
+// at line-art edges, direction toward the source). Numbers + A/B ledger in
+// the dev-notes grain-speckle audit.
+#define STABILIZE_OPACITY   1.0
+#define GRAIN_THRESHOLD     0.35
 #define GRAIN_BLUR_RADIUS   18     // 9 px inner / 18 px outer — stays inside one patch
 #define GRAIN_RANGE_MIN     0.35
 #define GRAIN_RANGE_MAX     0.95   // established upper fade: signed stabilization releases to raw by clip
@@ -5139,7 +5152,19 @@ vec4 cf_shade() {
             float chw = smoothstep(0.015, 0.06, cr_dbg)
                       * (1.0 - smoothstep(0.04, PS_CHROMA_CEIL + 0.04, cr_dbg));
             #if ENABLE_GRAIN_STABLE
-            float Yd = eotf_gamma(color.a * 2.0);
+            // Mirrors the production ps_bright_in 5-tap cross median. The
+            // view stays deliberately unconditional (no Oklab-bypass or
+            // expansion gate), so it shows the gate VALUE everywhere, not
+            // where the apply path actually applies it.
+            #define S2(x,y) { float t = min(x,y); y = max(x,y); x = t; }
+            float m0 = color.a;
+            float m1 = HOOKED_texOff(vec2( 2.0,  0.0)).a;
+            float m2 = HOOKED_texOff(vec2(-2.0,  0.0)).a;
+            float m3 = HOOKED_texOff(vec2( 0.0,  2.0)).a;
+            float m4 = HOOKED_texOff(vec2( 0.0, -2.0)).a;
+            S2(m0,m1); S2(m3,m4); S2(m0,m3); S2(m1,m4); S2(m1,m2); S2(m2,m3); S2(m1,m2);
+            float Yd = eotf_gamma(m2 * 2.0);
+            #undef S2
             #else
             float Yd = get_luma(rl_dbg);
             #endif
@@ -5216,17 +5241,48 @@ vec4 cf_shade() {
             #if ENABLE_GRAIN_STABLE
             // Y_decision_gamma == color.a * 2.0 on this path — reuse it so the
             // alpha-protocol decode lives at one production site (the debug WP
-            // block keeps its own copy by design; it is self-contained).
+            // block keeps its own mirrored copy; it is self-contained).
             float Y_decision = eotf_gamma(Y_decision_gamma);
+            // Brightness gate from a 5-tap cross MEDIAN of the DECISION luma
+            // (2026-07-26 coarse-grain audit). PS_BRIGHT_FLOOR's smoothstep
+            // spans 0.50..0.65 LINEAR light — 58..75 nits at ref white 116,
+            // exactly where lit skin sits — so its steep slope multiplied
+            // whatever luma ripple survived stabilization straight into the
+            // PS_LIFT multiplier: the dominant face-speckle route on grainy
+            // film (~43% of the excess on high-key faces). PASS 1 publishes
+            // the decision luma in alpha, so the neighbourhood costs four
+            // fetches, no new pass or state. Only the GATE input is averaged;
+            // every applied quantity stays per-pixel. Lives inside this
+            // branch because alpha only carries a decision luma when the
+            // stabilizer ran — with cf_grain_stab=0 there is nothing to read.
+            // Median commutes with the monotone EOTF, so ranking in the gamma
+            // domain and linearizing once is exact and costs four fewer
+            // eotf_gamma calls than the mean form. 7-comparator sorting
+            // network; m2 is the median. Unlike the mean, a single deviant
+            // tap cannot move the result at all, and an edge tap cannot drag
+            // the gate across a dark line — the rank statistic sits on
+            // whichever side holds the majority of the cross (the mean form
+            // withdrew up to ~1% of the lift in a 1-3 px rim along lineart;
+            // the median measured <=0.25% with identical grain rejection).
+            #define S2(x,y) { float t = min(x,y); y = max(x,y); x = t; }
+            float m0 = Y_decision_gamma * 0.5;
+            float m1 = HOOKED_texOff(vec2( 2.0,  0.0)).a;
+            float m2 = HOOKED_texOff(vec2(-2.0,  0.0)).a;
+            float m3 = HOOKED_texOff(vec2( 0.0,  2.0)).a;
+            float m4 = HOOKED_texOff(vec2( 0.0, -2.0)).a;
+            S2(m0,m1); S2(m3,m4); S2(m0,m3); S2(m1,m4); S2(m1,m2); S2(m2,m3); S2(m1,m2);
+            float ps_bright_in = eotf_gamma(m2 * 2.0);
+            #undef S2
             #else
             float Y_decision = get_luma(rgb_linear);
+            float ps_bright_in = Y_decision;
             #endif
             float ps_cos_dh = (oklab_orig.y * PS_HUE_COS + oklab_orig.z * PS_HUE_SIN) * inv_chroma;
             float ps_hue_w = pow(max(ps_cos_dh, 0.0), PS_HUE_POWER);
             float ps_gate = smoothstep(PS_BRIGHT_FRAC_LOW, PS_BRIGHT_FRAC_HIGH, sh_bright_frac);
             float ps_chroma_w = smoothstep(0.015, 0.06, chroma_orig)
                               * (1.0 - smoothstep(0.04, PS_CHROMA_CEIL + 0.04, chroma_orig));
-            float ps_bright_w = smoothstep(PS_BRIGHT_FLOOR, PS_BRIGHT_FLOOR + 0.15, Y_decision);
+            float ps_bright_w = smoothstep(PS_BRIGHT_FLOOR, PS_BRIGHT_FLOOR + 0.15, ps_bright_in);
             float ps_w = ps_hue_w * ps_chroma_w * ps_bright_w * ps_gate;
             #if ENABLE_PS_COMPRESS
             expansion = mix(expansion, 1.0, PS_COMPRESS * ps_w);
@@ -5234,8 +5290,10 @@ vec4 cf_shade() {
             float ps_sat = PS_SAT_BOOST * ps_w;
             // Skin lift (see PS_LIFT block): wider chroma window than the
             // sat boost, scene-cooling weighted. Multiplicative on
-            // expansion and its gates rise with Y (ps_bright_w) or vary in
-            // chroma, not Y — composite curve stays monotone per pixel.
+            // expansion; its gates vary in chroma or in NEIGHBOURHOOD luma
+            // (ps_bright_w reads the 5-tap decision median, constant to
+            // first order across one pixel) — composite curve stays monotone
+            // per pixel.
             float psl_chroma_w = smoothstep(0.015, 0.05, chroma_orig)
                                * (1.0 - smoothstep(PS_LIFT_CHROMA_HI, PS_LIFT_CHROMA_CEIL, chroma_orig));
             float psl_w = ps_hue_w * psl_chroma_w * ps_bright_w * ps_gate

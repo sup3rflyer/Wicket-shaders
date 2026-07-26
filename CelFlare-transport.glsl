@@ -66,7 +66,7 @@
 //!DESC Expansion ramp shape. ↓ <1 = gentle broad lift · ↑ >1 = punch on brightest pixels. Peak unchanged. Default 1.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.6
-//!MAXIMUM 1.8
+//!MAXIMUM 2.0
 1.0
 
 //!PARAM cf_shoulder
@@ -3632,7 +3632,8 @@ vec4 hook() {
     // SPEC_Y_LOW_MID_BUMP parabola — is deliberate: its perturbation peaks at
     // t=2/3 (Y≈0.81-0.88) and has quadratic contact at the knee, so faces are
     // untouched and the composite curve's inflection stays at Y≥0.82 at
-    // default gamma (worst corner s=1 + cf_curve=0.6: Y≈0.66, band edge; the
+    // default gamma (worst corner s=1 + cf_curve=0.6: Y≈0.66, band edge —
+    // cf_curve's MINIMUM 0.6 IS this guard, don't lower it; the
     // symmetric bump planted it at Y≈0.47, mid-face — audit-caught).
     // Monotonicity: d/dt [t + s·t²·(1-t)] = 1 + s(2t - 3t²) >= 1 - s >= 0 —
     // the PARAM's MAXIMUM 1.0 IS the proof bound, don't widen it. Peak is

@@ -3,6 +3,15 @@
 //@shampv input hdr
 //@shampv toggle nitmeter_display_clip
 //@shampv active-if nitmeter_mode 4 nitmeter_display_clip nitmeter_display_rx nitmeter_display_ry nitmeter_display_gx nitmeter_display_gy nitmeter_display_bx nitmeter_display_by
+//@shampv choice nitmeter_corner top-left top-right bottom-left bottom-right
+//@shampv step nitmeter_pct 0.0001
+//@shampv step nitmeter_reset 1
+//@shampv step nitmeter_display_rx 0.005
+//@shampv step nitmeter_display_ry 0.005
+//@shampv step nitmeter_display_gx 0.005
+//@shampv step nitmeter_display_gy 0.005
+//@shampv step nitmeter_display_bx 0.005
+//@shampv step nitmeter_display_by 0.005
 //@shampv measures MAIN
 //
 // Companion dev tool for CelFlare: decodes the PQ frame and displays

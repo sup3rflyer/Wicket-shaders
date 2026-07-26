@@ -158,7 +158,8 @@
 //@shampv target-trc-param grain_hdr
 //@shampv pause-param grain_pause
 //@shampv epoch-param state_epoch
-//@shampv toggle match_grain grain_hdr grain_headroom debug_match density_combine
+//@shampv toggle match_grain grain_hdr grain_headroom debug_match density_combine grain_pause
+//@shampv step grain_gain 0.05
 //@shampv measures LUMA
 
 //!PARAM match_grain
@@ -183,7 +184,7 @@
 0.0
 
 //!PARAM grain_pause
-//!DESC Machine-owned pause state. 1 freezes observation, cadence and arrangement so redraws of a paused frame are bit-stable; baked look edits may rebuild the standing field once. shampv mirrors mpv pause automatically.
+//!DESC Machine-owned pause mirror — 1 freezes observation, cadence and arrangement so paused redraws are bit-stable. shampv writes it from mpv pause.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
@@ -225,14 +226,14 @@
 0.3
 
 //!PARAM grain_rate
-//!DESC Visible arrangement cadence in SOURCE frames. 1 = fresh arrangement every frame / on ones · 0.5 = on twos. ↓ slows the boil. Display-refresh independent.
+//!DESC Visible arrangement cadence in SOURCE frames. 1 = fresh arrangement every frame / on ones · 0.5 = on twos. ↓ slows the boil. Display-refresh independent. 0.333 ≈ on-threes.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.1
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grain_gen_rate
-//!DESC Template-vocabulary regeneration rate as a fraction of visible grain ticks. 1 = every tick (default) · 0.25 = every fourth tick. Block arrangement still rehashes every visible tick, but finite-vocabulary reuse can change higher-order temporal correlation; lower values are an optional small performance trade, not an identical fast path.
+//!DESC Template regeneration rate as a fraction of visible grain ticks. 1 = every tick (default) · 0.25 = every fourth. Arrangement still rehashes per tick; lower = cheaper, not identical.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.1
 //!MAXIMUM 1.0
@@ -246,7 +247,7 @@
 0.25
 
 //!PARAM restore_gain
-//!DESC Missing-power authority. 0 = complement only (C) · 1 = inferred missing-power target · >1 = manual amplitude override for known-damaged material · near 5 is aggressive and shot-specific, not a preset · 6 is the expert ceiling · above 2 restored power rises roughly with the square and can severely overgrain intact material.
+//!DESC Missing-power authority. 0 = complement only · 1 = inferred missing-power target · above 2 restored power rises ~quadratically and can overgrain intact material · 6 = expert ceiling.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 6.0
@@ -267,14 +268,14 @@
 0.0
 
 //!PARAM grain_headroom
-//!DESC Content headroom above ref white — only used when grain_hdr = 1. 1 = upstream SDR→HDR expansion: highlights extend past ref white, grain fades just above it · 0 = plain SDR in a PQ container: ref white is the clip ceiling, SDR clip fade + near-clip channel clamp apply.
+//!DESC Content headroom above ref white (grain_hdr = 1 only). 1 = upstream SDR→HDR expansion, grain fades just above ref white · 0 = SDR in a PQ container, ref white is the clip ceiling.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grain_fade
-//!DESC Where grain fades to white — work-domain luma of full fade-out, one knob for every chain. Default 1.10 = stock top end (clip-limited chains cap the effective top at 0.95) · 0.2-0.3 confines grain to low luminance and widens its rise out of black · with grain_headroom = 1 it is the above-ref-white reach — tune to the upstream expansion by eye · below ref white the knob moves the luma envelope only (the per-channel grain bound stays floored at ref white) · between the shadow toe and upper fade, amount follows the title's rendition curve.
+//!DESC Work-domain luma of full fade-out. 1.10 = stock top (clip-limited chains cap at 0.95) · 0.2-0.3 confines grain low · with grain_headroom = 1 it is the above-ref-white reach — by eye.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.2
 //!MAXIMUM 2.5

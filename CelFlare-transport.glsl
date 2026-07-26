@@ -35,6 +35,9 @@
 //@shampv input sdr
 //@shampv output trc=pq primaries=bt.2020
 //@shampv ref-white-param cf_ref_white
+//@shampv choice cf_debug off bypass illum expand spatial spec pump warm-skin stats mv-offset mv-evidence mv-residual
+//@shampv active-if cf_spec_bonus 1 cf_spec cf_spec_stab
+//@shampv active-if cf_light_pump 1 cf_pump
 
 // =============================================================================
 //  USER TUNING
@@ -133,7 +136,7 @@
 1
 
 //!PARAM cf_debug
-//!DESC Debug views: 0 = off, 1 = bypass, 2 = illumination field, 3 = expansion heat map, 4 = spatial/per-pixel detail, 5 = specular, 6 = pump, 7 = warm-shift/skin, 8 = stats bars, 9 = motion prev-offset (R/G = +x/+y source offset; right/down image motion is negative), 10 = motion evidence (R = match cost, G = tile RMS contrast, B = research trust), 11 = motion residual (R = local-flow emit, G = dominant-borrow emit, B = research trust).
+//!DESC Debug view selector (recompiles). Cycles: off, bypass, illum, expand, spatial, spec, pump, warm/skin, stats, mv-offset, mv-evidence, mv-residual.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 11

@@ -232,6 +232,8 @@
 
 // ---- shampv shader API (plain comments to libplacebo) ----
 //@shampv input any
+//@shampv choice db_debug off bypass correction-x32 luma-gate chroma-gate v2-fields grid-evidence v3-recon
+//@shampv step db_flat_c 0.25
 
 // =============================================================================
 //  USER TUNING
@@ -250,7 +252,7 @@
 1.0
 
 //!PARAM db_thr
-//!DESC Banding step-size ceiling (8-bit codes) — drives the amplitude gate, snap reach and envelope. ↑ = bigger steps (2 = typical web, 4 = brutal) · ↓ = gentler. Default 1.5 protects faint soft structure (defocused lines); raise per-source for rough encodes.
+//!DESC Banding step-size ceiling in 8-bit codes — drives the amplitude gate, snap reach and envelope. 1.5 protects faint soft structure; 2 = typical web, 4 = brutal encodes.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.5
 //!MAXIMUM 4.0
@@ -306,21 +308,21 @@
 1.0
 
 //!PARAM db_block
-//!DESC Grid-deblock evidence (AVC web-dl). 1 = absorb 16px DCT blocking (shipped) · 0 = bit-exact v2.1, also the escape for deliberate 16px pixel-art/screentone. Shifts texture/aniso/snap knees by measured grid excess.
+//!DESC Grid-deblock evidence weight (AVC web-dl). 1 = absorb 16px DCT blocking (shipped) · 0 = bit-exact v2.1, the escape for deliberate 16px pixel-art/screentone.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM db_curve
-//!DESC Curved-shading reconstructor (v3.0). 1 = on curved banding (vignettes, glow domes) blend the plane fit toward a bounded lowpass a plane can't reach (shipped) · 0 = v2.2 (bit-exact via DB2_CURVE_PATH). Evidence-bounded by the full gate tower.
+//!DESC Curved-shading reconstructor (v3.0). 1 = blend the plane fit toward a bounded lowpass on vignettes/glow domes (shipped) · 0 = v2.2 bit-exact. Evidence-bounded.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM db_fsnap
-//!DESC Floor-adaptive dither snap (v3.1). 1 = snap knees track the frame's measured flat-field dither level, absorbing heavy encode dither (BD remux) · 0 = static v3.0 knees. Quiet sources unaffected either way (shift 0 below the hinge).
+//!DESC Floor-adaptive dither snap (v3.1). 1 = snap knees track the frame's measured flat-field dither (BD remux) · 0 = static v3.0 knees. Quiet sources unaffected.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0

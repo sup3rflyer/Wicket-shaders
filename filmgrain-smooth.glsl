@@ -31,6 +31,7 @@
 //@shampv target-trc-param grain_hdr
 //@shampv choice grain_preset custom light medium heavy
 //@shampv active-if grain_preset 0 grain_intensity grain_saturation grain_mid grain_steepness
+//@shampv step grain_steepness 0.1
 
 //!PARAM grain_preset
 //!DESC Baked look. 0 = custom (grain_* knobs) · 1 light · 2 medium · 3 heavy. Presets set intensity/saturation/mid/steepness; size/rate/hdr/ref_white stay live.
@@ -82,14 +83,14 @@
 1.0
 
 //!PARAM grain_hdr
-//!DESC Output transfer. Set to match mpv's target-trc. 1 = output is PQ BT.2020 (target-trc=pq, or an HDR-signalled display): keys/applies grain in SDR via a per-pixel PQ bridge, fades out above ref white · 0 = plain SDR output (bit-identical).
+//!DESC Output transfer — match mpv's target-trc (shampv syncs it). 1 = PQ BT.2020 out: grain keyed/applied in SDR via a PQ bridge, fades above ref white · 0 = plain SDR (bit-identical).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 
 //!PARAM grain_ref_white
-//!DESC SDR reference white (nits) for the HDR bridge — the level the output chain anchors SDR white to. Match hdr-reference-white; if an upstream shader owns the SDR→PQ encode, match its reference white instead. Only used when grain_hdr = 1.
+//!DESC SDR reference white (nits) the output anchors to — match hdr-reference-white, or the upstream shader's if one owns the SDR→PQ encode. Only used when grain_hdr = 1.
 //!TYPE DYNAMIC float
 //!MINIMUM 80.0
 //!MAXIMUM 480.0

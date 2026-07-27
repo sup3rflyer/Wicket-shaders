@@ -275,35 +275,54 @@
 // fell back to raw Y there. PASS 6 decodes with a plain * 2.0. Assumes a
 // float intermediate FBO for MAIN (true under gpu-next fp16); a unorm FBO
 // would clamp at Y=2.0 instead of 1.0 — strictly more headroom than before.
-// OPACITY 0.85 -> 1.0 and THRESHOLD 0.28 -> 0.35 (2026-07-26, coarse-grain
-// audit on a heavy-grain 90s film remux): the 15% deliberate leak-through and
-// the bilateral down-weighting of ±0.10+ grain excursions together left ~35%
-// of source grain in the decision field, which the expansion ramp then
-// amplified super-proportionally (measured hf excess 1.11-1.32x on faces).
-// NOTE the pair shifts more than "15%" reads: the decision's effective
-// self-weight drops ~20% -> ~6% (the center seeds blurred at 1/19), i.e. the
-// decision is now essentially the 18px bright-asymmetric neighbourhood level.
-// Full opacity is a flat win at zero regional-lift cost; 0.35 keeps most of
-// the grain win while halving the cel-edge footprint 0.45 showed on clean
-// digital content (at 0.35: ~1% of px change >2 nits, p99.9 ~5.6 nits, all
-// at line-art edges, direction toward the source). Numbers + A/B ledger in
-// the dev-notes grain-speckle audit.
+// OPACITY 0.85 -> 1.0 (2026-07-26, coarse-grain audit on a heavy-grain 90s
+// film remux): the 15% deliberate leak-through left ~35% of source grain in
+// the decision field, which the expansion ramp amplified super-proportionally
+// (measured hf excess 1.11-1.32x on faces). Full opacity drops the decision's
+// effective self-weight ~20% -> ~6% (the center seeds blurred at 1/19) — the
+// decision is essentially the 18px bright-asymmetric neighbourhood level.
+// THRESHOLD 0.28 -> 0.35 also landed in that audit. Reverting it was TESTED
+// and REJECTED 2026-07-27: it removes only 22% of the edge halo (vs 51% for
+// the edge-mask repair below) and costs a real slice of the coarse-grain win
+// — hf_excess +0.021 mean / +0.033 worst across that audit's 8 patches,
+// above the +-0.005..0.016 estimator floor, i.e. ~15-25% of the 07-26 gain
+// handed back. The mask repair achieves more halo reduction at +0.0013 mean
+// (below the floor, indistinguishable from zero). Both levers together are
+// 60% — the extra 9 points are not worth 20% of the grain win. Keep 0.35.
 #define STABILIZE_OPACITY   1.0
 #define GRAIN_THRESHOLD     0.35
 #define GRAIN_BLUR_RADIUS   18     // 9 px inner / 18 px outer — stays inside one patch
 #define GRAIN_RANGE_MIN     0.35
 #define GRAIN_RANGE_MAX     0.95   // established upper fade: signed stabilization releases to raw by clip
-#define GRAIN_EDGE_LOW      0.20
-#define GRAIN_EDGE_HIGH     0.45
+#define GRAIN_EDGE_LOW      0.05
+#define GRAIN_EDGE_HIGH     0.15
 // Matches the lower edge of range_mask's smoothstep; below this range_mask
 // is identically 0 so stabilization would no-op anyway.
 #define GRAIN_EARLY_EXIT    0.30
 #define BILATERAL_SHARPNESS 6.0
 #define INNER_RING_BOOST    2.0    // Inner carries 2:1 weight over outer (inner 12 : outer 6)
-// Empirical edge normalization. Brings first-moment gradient magnitude
-// (gx,gy) from ~0.4*luma_contrast into the GRAIN_EDGE_LOW..HIGH range.
-// Lower value -> more pixels marked as edges (stabilization suppressed).
-#define GRAIN_EDGE_NORM     2.7
+// Edge estimator rebuilt 2026-07-27. The original accumulated gx/gy with the
+// bright-ASYMMETRIC weight, which self-defeats: at exactly the edges the mask
+// exists to protect, asym_scale (up to 7x) crushes the dark-side taps to zero
+// weight, the antipodal difference near-cancels, and the attained `edge` never
+// reached the old 0.20 threshold on ANY content — the gate was structurally
+// dead for the pass's entire life (verified by two independent audits + a
+// tap-exact sim). gx/gy now accumulate with the SYMMETRIC weight (asym
+// removed from the gradient path only; the blur keeps its bright-asymmetric
+// tuning), NORM is retired (1.0 = raw estimator units), and LOW/HIGH are
+// calibrated from tap-exact measurement on real content at 4K geometry:
+// damaged shoulder pixels (>25 nit halo in the 16-bit PQ A/B) read p50 0.061,
+// heavy film grain (sigma 0.10) p95 0.055, smooth ramps <=0.012, undamaged
+// actives p50 0.020. smoothstep(0.05, 0.15) cuts the worst-halo pixels 51%
+// (|halo|>25 nits: 28.8 -> 14.1 mean) at a coarse-grain-film cost of +0.0013
+// hf_excess — below the estimator floor, i.e. the 07-26 win is kept intact.
+// Full damage/grain separation is structurally impossible (disc-scale grain
+// fluctuation mimics a soft edge — measured, not tunable away), so LOW is set
+// where the severe halo band starts rather than chasing the tail; there is
+// headroom below 0.05 if the author wants more, at rising grain cost.
+// Ramps stay far below LOW: decision bleed along smooth gradients is intended
+// behavior (author steer 2026-07-27 — bleed into ramps, hold edge contrast).
+#define GRAIN_EDGE_NORM     1.0
 // Ring equalizer (2026-07-16), parked after field A/B exposed a dark trough
 // around soft cloud edges. The established bright-asymmetric stabilizer still
 // serves the gentler base curve, while the flagship steep spec ramp reads raw
@@ -523,8 +542,11 @@ void hook() {
     // then inner, + before -) is preserved — bit-identical to the old
     // unrolled form. Per original tuning, the inner ring:
     //  - blur weights take INNER_RING_BOOST (inner ring carries 2:1 weight)
-    //  - gradient weights use the un-boosted w so the boost only amplifies
-    //    blur trust, not gradient estimation (grad_w += w on both rings)
+    //  - gradient weights use the un-boosted SYMMETRIC weight ws (2026-07-27):
+    //    the boost only amplifies blur trust, and the asym factor must not
+    //    reach the gradient path — asym-weighted gx/gy zero out the dark side
+    //    of every edge and the estimator goes blind exactly where the
+    //    edge_mask is needed (see the GRAIN_EDGE_NORM block)
     //  - gradient direction scaled by 2.0 to match outer-ring units
     //    (raw_diff at half radius is half the linear-gradient response;
     //    multiply back to keep gx/gy comparable across rings).
@@ -566,14 +588,14 @@ void hook() {
             float a2 = rd < 0.0 ? asym_scale_sq : 1.0;
             float tw = max(0.0, 1.0 - weight_k * rd * rd * a2);
             float w  = tw * tw;
-            blurred += s * w * boost;
-            total_w += w * boost;
-            gx += rd * w * r.x * gscale * sgn;
-            gy += rd * w * r.y * gscale * sgn;
-            grad_w += w;
-            #if GRAIN_RING_EQUALIZER
             float tws = max(0.0, 1.0 - weight_k * rd * rd);
             float ws  = tws * tws;
+            blurred += s * w * boost;
+            total_w += w * boost;
+            gx += rd * ws * r.x * gscale * sgn;
+            gy += rd * ws * r.y * gscale * sgn;
+            grad_w += ws;
+            #if GRAIN_RING_EQUALIZER
             ring_sum += s * ws;
             ring_w   += ws;
             #endif

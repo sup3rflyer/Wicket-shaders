@@ -1666,9 +1666,22 @@ void lean_observe() {
         // evidence on the boundary cannot distinguish grain from picture texture;
         // the next three frames are the sole fast refinement window for proving
         // shot-local sensitivity and character temporally.
+        // m_shot_gain is carried through this chain in a LOCAL and stored once
+        // below, deliberately. Written as the natural per-arm stores -- the
+        // boundary arm assigning the constant 1.0, the other arms
+        // read-modify-writing the same SSBO scalar -- FXC/D3D11 DROPPED the
+        // boundary arm's reset while every sibling store in that same arm
+        // (m_shot_age, m_shot_conf, m_shot_size, m_shot_hardness,
+        // m_shot_obs_w) landed correctly, so the 4-frame refinement window ran
+        // on the PREVIOUS shot's gain and the error compounded across cuts
+        // (measured 2026-07-29: 1.633 vs 1.0 at the same m_shot_age, d3d11 vs
+        // vulkan, bit-reproducible across runs; every other state scalar in the
+        // pass was bit-identical). Same NitMeter PASS 2 nm_maxcll class -- see
+        // that comment. Do not re-split this into per-arm SSBO stores.
+        float shot_gain = m_shot_gain;
         if (shot_boundary) {
+            shot_gain = 1.0;
             m_shot_age = 0.0;
-            m_shot_gain = 1.0;
             m_shot_conf = 0.0;
             m_shot_size = m_title_size;
             m_shot_hardness = m_title_hardness;
@@ -1677,7 +1690,7 @@ void lean_observe() {
         } else if (m_shot_age < 4.0 && !geometry_only) {
             float frame_gain = clamp(frame_gain_est, 0.50, 4.0);
             float gain_target = mix(1.0, frame_gain, shot_auth);
-            m_shot_gain = mix(m_shot_gain, gain_target, 0.35);
+            shot_gain = mix(shot_gain, gain_target, 0.35);
             m_shot_conf = mix(m_shot_conf, shot_auth, 0.25);
             if (evidence > 0.0) {
                 float shape_rate = 0.18 * evidence;
@@ -1687,12 +1700,14 @@ void lean_observe() {
             }
         } else if (evidence > 0.0) {
             float frame_gain = clamp(frame_gain_est, 0.50, 4.0);
-            m_shot_gain = mix(m_shot_gain, frame_gain, 0.0015 * evidence);
+            shot_gain = mix(shot_gain, frame_gain, 0.0015 * evidence);
             m_shot_conf += 0.003 * evidence * (1.0 - m_shot_conf);
             m_shot_size = mix(m_shot_size, frame_size, 0.0008 * evidence);
             m_shot_hardness = mix(m_shot_hardness, frame_hardness,
                                   0.0008 * evidence);
         }
+        // Single store; must precede the first reader below (pobs_title).
+        m_shot_gain = shot_gain;
         // Grain presence establishes amount, not proof of delivery loss. The
         // legacy boost lane remains neutral until a genuine loss estimator can
         // authorize it without counting the same grain evidence twice.

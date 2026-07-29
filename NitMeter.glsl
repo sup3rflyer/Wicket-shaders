@@ -4,6 +4,7 @@
 //@shampv toggle nitmeter_display_clip
 //@shampv active-if nitmeter_mode 4 nitmeter_display_clip nitmeter_display_rx nitmeter_display_ry nitmeter_display_gx nitmeter_display_gy nitmeter_display_bx nitmeter_display_by
 //@shampv choice nitmeter_corner top-left top-right bottom-left bottom-right
+//@shampv cycle nitmeter_mode 1 2 4
 //@shampv step nitmeter_pct 0.0001
 //@shampv step nitmeter_reset 1
 //@shampv step nitmeter_display_rx 0.005
@@ -82,9 +83,13 @@
 //   SDR content the numbers are meaningless (gamma decoded as PQ); the
 //   nitmeter_sdr_guard tripwire below blanks the panel when it detects that.
 //
-//   Convenient driving is a small lua script cycling panel -> heatmap ->
-//   Rec.709 gamut -> off on one key: it appends this file to glsl-shaders
-//   and sets the nitmeter_mode shader param via glsl-shader-opts. Manual equivalent:
+//   Convenient driving is one key cycling panel -> heatmap -> Rec.709 gamut
+//   -> off. shampv does this from the cycle declaration at the top of this
+//   file: bind key_cycle in script-opts/shampv.conf (or send the
+//   shampv-cycle script-message) and it appends this file to glsl-shaders
+//   and steps nitmeter_mode. Mode 3 is deliberately not in the cycle - it
+//   is a capture mode, not a viewing mode; reach it from the shampv panel.
+//   Manual equivalent:
 //     change-list glsl-shader-opts append nitmeter_mode=2
 //     change-list glsl-shaders append "~~/shaders/NitMeter.glsl"
 //
@@ -685,10 +690,9 @@ void hook() {
         // across N-key cycles), so session semantics need a real edge.
         // Also self-heals first-load garbage if a backend ever hands us a
         // non-zeroed buffer (reset fires because nm_reset_seen mismatches).
-        if (nitmeter_reset != nm_reset_seen) {
+        bool session_reset = nitmeter_reset != nm_reset_seen;
+        if (session_reset) {
             nm_reset_seen = nitmeter_reset;
-            nm_maxcll   = 0.0;
-            nm_maxfall  = 0.0;
             nm_hold     = 0.0;
             nm_hold_age = 0.0;
             // expire the P/9/A sample-and-hold too, or the first frames of
@@ -785,12 +789,21 @@ void hook() {
 #if nitmeter_sdr_guard
         tripped = nm_sdr > 0.5;
 #endif
-        // session maxima (MaxCLL/MaxFALL semantics; reset on the
-        // nitmeter_reset edge above). Reset while the tripwire is engaged
-        // so SDR garbage can't poison them.
+        // session maxima (MaxCLL/MaxFALL semantics; cleared on the
+        // nitmeter_reset edge above, which still lets THIS frame seed them).
+        // Zeroed while the tripwire is engaged so SDR garbage can't poison them.
+        // ONE store each, deliberately: written as the natural if/else — one
+        // arm storing 0.0, the other read-modify-writing the same SSBO scalar —
+        // FXC/D3D11 returns 0 for the else arm's load of nm_maxcll, so MaxCLL
+        // tracked the live frame peak instead of holding. Silent, d3d11-only
+        // (vulkan and MoltenVK were both correct), and nm_maxfall on the very
+        // next line was unaffected. Load, select, store once; do not re-split
+        // these into branches.
+        float prev_maxcll  = session_reset ? 0.0 : nm_maxcll;
+        float prev_maxfall = session_reset ? 0.0 : nm_maxfall;
+        nm_maxcll  = tripped ? 0.0 : max(prev_maxcll,  pk);
+        nm_maxfall = tripped ? 0.0 : max(prev_maxfall, nm_fall);
         if (tripped) {
-            nm_maxcll  = 0.0;
-            nm_maxfall = 0.0;
             // quarantine ALL temporal readout state while tripped, not just
             // the session maxima: the hold and P/A snapshots used to survive
             // a trip carrying garbage, so after recovery H decayed from
@@ -798,9 +811,6 @@ void hook() {
             // re-latches instantly from clean content on release.
             nm_hold     = 0.0;
             nm_hold_age = 0.0;
-        } else {
-            nm_maxcll  = max(nm_maxcll, pk);
-            nm_maxfall = max(nm_maxfall, nm_fall);
         }
 #if nitmeter_mode == 4
         // Independent 0.5 s numeric hold: the spatial mask stays live, while

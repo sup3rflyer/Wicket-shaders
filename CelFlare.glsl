@@ -1,5 +1,30 @@
-// CelFlare v5.18 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.20 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
+//
+// v5.20 hardens the scene/pump state machine against its cut detector. An
+// event-vs-cut classifier stops frame-filling in-scene brightenings — the
+// pump's own designed target — from being read as cuts and popping an applied
+// pump off in one frame; a strobe-pressure refractory keeps flash-chain
+// content from holding every EMA at the cut alpha continuously; the additive
+// cover gate's re-open is rate-clamped (the instant rise re-applied a held
+// mask amplitude in one frame); the reveal border seed follows the PICTURE
+// border on letterboxed content instead of the frame border (it was
+// structurally inert inside the bars); and growth mode now needs multi-cell
+// spec corroboration plus a real contrast-velocity onset, so a single glint
+// crossing a sample point can no longer breathe the whole base curve.
+//
+// v5.19 hardens the v5.18 spec-coherence layer against its own evidence noise
+// and weights specular pop by perceptual impact. The lock/lift evidence gates
+// widen so grain can no longer toggle full corrections per frame, the strong
+// lift is bounded at 0.2 ramp units, the outer sampling ring is hash-rotated
+// (fixed geometry let drift oscillate whole regions in phase), and frame
+// borders fall back to the raw ramp (clamp-to-edge collapsed the antipodal
+// pair geometry there). New cf_spec_floor implements impact weighting:
+// coherent highlight bodies keep full specular pop while isolated noise-scale
+// points (a 2x2 star) fade toward a floor — the least impactful spec energy
+// is also the least stabilizable. The lift gains a pair chroma-match (no more
+// luma-blind fills from colored donors) and the spec sat gate reads a bounded
+// locally-deadbanded saturation instead of raw 4:2:0 chroma.
 //
 // v5.18 stabilizes the steep ordinary-spec ramp without filtering RGB. A
 // pair-locked bilateral reference constrains same-surface outliers, while a
@@ -52,7 +77,7 @@
 //@shampv output trc=pq primaries=bt.2020
 //@shampv ref-white-param cf_ref_white
 //@shampv choice cf_debug off bypass illum expand spatial spec pump warm-skin stats mv-offset mv-evidence mv-residual additive-proof
-//@shampv active-if cf_spec_bonus 1 cf_spec cf_spec_stab
+//@shampv active-if cf_spec_bonus 1 cf_spec cf_spec_stab cf_spec_floor
 //@shampv active-if cf_light_pump 1 cf_pump
 //@shampv step cf_spec_radius 0.5
 
@@ -109,6 +134,13 @@
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
+
+//!PARAM cf_spec_floor
+//!DESC Isolated-glint spec floor (impact weighting, needs cf_spec_stab). Coherent highlight bodies always get full specular pop; tiny isolated points (2x2 stars, lone sparkles) keep this fraction of it. 1 = off (uniform spec) · 0 = isolated points get base expansion only. 0.45 shipped.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.45
 
 //!PARAM cf_spec_scene_reject
 //!DESC Broad neutral high-key shoulder rejection (experimental A/B). 1 = suppress both spec routes on admitted diffuse fields · 0 = flagship scene gate.
@@ -174,7 +206,7 @@
 1
 
 //!PARAM cf_pale_skin
-//!DESC Pale-skin protection (toggle). 1 = keep fair skin from washing out in bright scenes · 0 = off.
+//!DESC Pale-skin protection (toggle). 1 = restore skin saturation lost to expansion AND a small deliberate brightening in bright cooled scenes (Hunt-effect counter — lifted skin reads PALER against the dimmed field, not tanner) · 0 = off.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1
@@ -221,6 +253,8 @@
 //!VAR float motion_trust_cell[144]
 //!VAR float motion_mc_local_cell[144]
 //!VAR float motion_mc_effective_cell[144]
+//!VAR float cut_rate
+//!VAR float pump_drive_prev
 //!STORAGE
 
 //!TEXTURE CELFLARE_ADD_MOTION_PREV
@@ -702,8 +736,9 @@ vec4 hook() {
 // Separable Gaussian. sigma=20 at 1/4 res = effective ~80px at 1080p full
 // res. BRIGHT_BIAS must be 0 for correct separability — any nonzero value
 // makes weights data-dependent, creating visible outline artifacts at every
-// bright/dark boundary. The halo guard in the expansion pass handles
-// boundary protection instead.
+// bright/dark boundary. (Doc fix 2026-08-09: the "halo guard in the
+// expansion pass" this comment once deferred to is long deleted — the
+// symmetric field itself is the boundary story now; keep BRIGHT_BIAS 0.)
 
 //!HOOK MAIN
 //!BIND CELFLARE_DS
@@ -1254,6 +1289,53 @@ void hook() {
 #define LOCKOUT_FRAMES      6.0
 #define ILLUM_CHANGE_THRESH 0.06
 #define SCENE_CUT_PCT       0.50
+// Event-vs-cut classifier (v5.20, audit 2026-08-09). The majority-vote cut
+// test also fires on the pump's own designed target: a frame-filling in-scene
+// brightening (tunnel exit into white, explosion filling frame) moves most
+// picture cells > 0.06/frame, and the resulting transient_reset removed an
+// APPLIED pump gain in one frame + re-pinned the lanes for the rest of the
+// event (rule-2 violation at the climax; the biggest events either popped off
+// mid-rise or never pumped). Discriminator: a nearly-all-POSITIVE change
+// field while the pump was ALREADY presenting or charging (prior-frame env /
+// drive — both still pre-update at the test site) is the continuation of an
+// event, not a cut. A hard cut from a quiet scene has prior env ~ 0 and
+// still resets instantly; a cut landing DURING an active event is caught by
+// the motion-cost reset instead (textured mismatch fires it; whiteouts don't
+// — untextured cells carry no match trust). Residual accepted class: a
+// mid-scene flash's RETURN frame is all-negative and still cuts.
+#define CUT_EVENT_POS_FRAC  0.80   // >= this fraction of changed cells rising -> "same-sign rise"
+#define CUT_EVENT_ENV_MIN   0.10   // prior pump_env above: event already presenting. Review
+                                   // round: 0.05 left the arm live for ~1-2 min after an event
+                                   // whose light REMAINS (ADAPT_FLOOR is the only drain on a
+                                   // held plateau); 0.10 halves that tail while keeping
+                                   // modest-presentation late-surge protection.
+#define CUT_EVENT_DRIVE_MIN 0.015  // prior fast-slow drive above (~PUMP_DRIVE_LOW/2) AND RISING:
+                                   // event charging. The rising conjunct is load-bearing
+                                   // (review round): steady lag-drive ~ 19x the per-frame pnorm
+                                   // rate, so bare 0.015 was armed by ~0.02/s ambient drift
+                                   // (push-ins, sunrise fades) and a brighter-majority cut
+                                   // during any such stretch was suppressed — under the
+                                   // subtractive fallback that pumps the charter's forbidden
+                                   // class. An event attack grows drive frame-over-frame;
+                                   // drift sits flat and fails the conjunct.
+#define CUT_EVENT_DRIVE_EPS 0.001  // minimum frame-over-frame drive growth for "rising"
+// Strobe refractory (v5.20). Strobing content (concert lighting, lightning
+// chains) re-fired the lockout every ~7 frames, so the EMAs ran at the FAST
+// cut alpha near-continuously — the whole v5.6 pan-jitter hardening switched
+// off and scene state churned at up to 90%/frame. cut_rate is an EMA of cut
+// fires (rise 0.30/fire, decay 0.02/frame ~ 2 s): isolated cuts spike to 0.30
+// and never reach STROBE_LO; sustained strobing saturates ~0.6+ and blends
+// the lockout alpha back toward MID. ⚠ strobe_t must read the PRE-update
+// cut_rate (review round caught the post-update read: the +0.30 fire-frame
+// rise pushed the SECOND cut of any pair within ~3 s over STROBE_LO —
+// ordinary shot-reverse-shot got an undocumented lock-on softening). With
+// the pre-update read, sustained ~1 s editing sits at exactly zero damping
+// and only sub-half-second cadence saturates. Pump behavior during strobes
+// is unchanged (lanes still re-pin each pulse — conservatively dead).
+#define CUT_RATE_RISE       0.30
+#define CUT_RATE_FALL       0.02
+#define CUT_RATE_STROBE_LO  0.35
+#define CUT_RATE_STROBE_HI  0.60
 
 // Growth-mode discriminator. Detects expanding bright objects (fireball,
 // crash-zoom on backlit window) so PASS 6 can bypass the bright-scene
@@ -1265,10 +1347,23 @@ void hook() {
 #define GROWTH_SPEC_BIAS       0.4    // weight of bright_vel subtracted from spec_vel
 #define GROWTH_SIG_LOW         0.015  // smoothstep onset on (spec_vel - bias*bright_vel)
 #define GROWTH_SIG_HIGH        0.06
+#define GROWTH_C_GATE_LOW      0.05   // v5.20: contrast_vel onset (was 0). The zero
+                                      // lower edge made ANY positive contrast ripple a
+                                      // pass — under a pan, single-cell extrema motion
+                                      // kept c_gate partially open continuously, and
+                                      // shutoff-band spec velocity rode it into
+                                      // scene-wide base-curve breathing (audit finding).
 #define GROWTH_C_GATE_HIGH     0.25   // smoothstep saturation on contrast_vel
 #define GROWTH_FRAC_FLOOR_LOW  0.04   // smoothed_bright_frac required to activate
 #define GROWTH_FRAC_FLOOR_HIGH 0.10
 #define GROWTH_SHUTOFF_LIFT    0.6    // 0 = no spec_shutoff bypass during growth, 1 = full lift
+#define GROWTH_SPEC_CELLS_LO   1.0    // v5.20 corroboration: growth needs multi-cell spec
+#define GROWTH_SPEC_CELLS_HI   2.5    // evidence. A single glint sliding onto one of the
+                                      // 144 sample points steps spec_frac by 1/144 and held
+                                      // spec_vel above GROWTH_SIG_HIGH for ~90 frames — one
+                                      // bright dot could lift three dampeners scene-wide. A
+                                      // genuine growth event (fireball) crosses 2-3 cells
+                                      // within a couple frames, so the delay cost is small.
 
 // Light-pump detector — augments sudden SUSTAINED brightening (explosion
 // bloom, train exiting a tunnel, spell charge-up). Temporal band-pass on
@@ -1775,6 +1870,22 @@ void hook() {
 // is never slewed" rule — that rule predates cover feeding a held additive
 // amplitude and the engage step.
 #define PUMP_COVER_FALL     0.85
+#define PUMP_RESET_DECAY    0.4    // v5.20: transient_reset multiplies the PRESENTATION
+                                   // quantities (pump_env, cover, env/mask cells) by this
+                                   // per reset frame instead of zeroing — a 2-3 frame ease
+                                   // inside the cut-masking window (0.4^6 over a full
+                                   // lockout ~ 0.004). State lanes still hard-pin. Review
+                                   // round (devil's advocate): one constant, one site,
+                                   // de-risks every reset class at once.
+#define PUMP_COVER_RISE     0.25   // v5.20, ADDITIVE builds only: max cover rise per
+                                   // frame. The instant rise was safe under subtractive
+                                   // (it restored an already-smoothed scalar) but under
+                                   // additive the mask holds near-full amplitude while
+                                   // cover dips — an instant re-open re-applied the whole
+                                   // held gain in ONE frame (smoke clearing over fire:
+                                   // soft ratchet down, snap back up). 0.25/frame matches
+                                   // ADD_ATTACK_STEP's 4-frame timescale, so post-cut
+                                   // event onsets keep their attack envelope.
 // Optional coverage backstop for the degenerate uniform-but-high-contrast case
 // (rare). Kept for A/B; not wired by default — the contrast gate supersedes it.
 //#define PUMP_COVER_HIGH     0.62   // bright_frac above which the pump tapers
@@ -2025,10 +2136,14 @@ void hook() {
     // Scene-cut delta. Each lane reads + writes its own prev_illum slot —
     // no cross-lane SSBO traffic, so race-free even though the buffer is
     // declared coherent. The barrier below still gates s_change visibility
-    // for the reducer.
-    s_change[lid]   = (frame > 0 &&
-                      abs(Y_ill - prev_illum[lid]) > ILLUM_CHANGE_THRESH)
-                      ? 1u : 0u;
+    // for the reducer. v5.20: sign-encoded (0 = quiet, 1 = rise, 2 = fall)
+    // so the reducer's event-vs-cut classifier can tell a same-sign global
+    // brightening from a structural cut — same storage, same count semantics.
+    {
+        float d_ill = Y_ill - prev_illum[lid];
+        s_change[lid] = (frame > 0 && abs(d_ill) > ILLUM_CHANGE_THRESH)
+                        ? ((d_ill > 0.0) ? 1u : 2u) : 0u;
+    }
     prev_illum[lid] = Y_ill;
 
     barrier();
@@ -2259,6 +2374,7 @@ void hook() {
         float spec_sum          = 0.0;
         float high_sum          = 0.0;
         uint  change_count      = 0u;
+        uint  change_pos_count  = 0u;
         float bright_spec_sum   = 0.0;
         float top_sum           = 0.0;
         float top_chroma_sum    = 0.0;
@@ -2300,6 +2416,20 @@ void hook() {
                 if (run >= LB_ENGAGE_FRAMES) lb_col_mask |= 1u << uint(lb_cols[k]);
             }
         }
+        // Effective PICTURE border lines (v5.20, consumed by the border seed
+        // in the pump loop below): first live row/col when bar lines are
+        // engaged. Hoisted here — loop-invariant, and FXC re-emitted the
+        // ternaries 144x inside the unrolled seed loop (review round; PASS
+        // 8's silent FXC translation had crossed the compile-harness's old
+        // quiescence window).
+        int lb_top   = ((lb_row_mask & 1u)   != 0u)
+                     ? (((lb_row_mask & 2u)   != 0u) ? 2 : 1) : 0;
+        int lb_bot   = ((lb_row_mask & 256u) != 0u)
+                     ? (((lb_row_mask & 128u) != 0u) ? 6 : 7) : 8;
+        int lb_left  = ((lb_col_mask & 1u)   != 0u)
+                     ? (((lb_col_mask & 2u)   != 0u) ? 2 : 1) : 0;
+        int lb_right = ((lb_col_mask & 32768u) != 0u)
+                     ? (((lb_col_mask & 16384u) != 0u) ? 13 : 14) : 15;
 
         for (uint i = 0u; i < 144u; i++) {
             float yi           = s_illum[i];
@@ -2326,7 +2456,8 @@ void hook() {
             bool lb_dead = (((lb_row_mask >> (i >> 4u)) & 1u) == 1u)
                         || (((lb_col_mask >> (i & 15u)) & 1u) == 1u);
             if (lb_dead) { n_bar++; continue; }
-            change_count      += s_change[i];
+            change_count      += (s_change[i] != 0u) ? 1u : 0u;
+            change_pos_count  += (s_change[i] == 1u) ? 1u : 0u;
             illum_min          = min(illum_min, yi);
             illum_max          = max(illum_max, yi);
             illum_v_min        = min(illum_v_min, vi);
@@ -2485,9 +2616,37 @@ void hook() {
         // pump lanes never reset on them. Over n_eff the 0.50 threshold means
         // "majority of the PICTURE moved" at any aspect ratio.
         float change_pct  = float(change_count) / n_eff;
+        // Event-vs-cut classifier (v5.20, see CUT_EVENT block): a nearly-all-
+        // positive change field while the pump was already presenting or
+        // charging is an in-scene brightening — the pump's own domain — not a
+        // cut. pump_env/pump_fast/pump_slow are prior-frame values here (their
+        // updates run below), so this reads the state as of the trigger.
+        float pos_frac = (change_count > 0u)
+            ? float(change_pos_count) / float(change_count) : 0.0;
+        // Drive arm: level AND rising (see CUT_EVENT_DRIVE_MIN). prior_drive
+        // is the drive as of the previous frame's lane update; pump_drive_prev
+        // holds the frame before that (stored below, before the lanes move) —
+        // both strictly pre-trigger, so an event's own step can't arm itself.
+        float prior_drive = pump_fast - pump_slow;
+        bool drive_rising = prior_drive > pump_drive_prev + CUT_EVENT_DRIVE_EPS;
+        bool prior_event = (pump_env > CUT_EVENT_ENV_MIN)
+                        || (prior_drive > CUT_EVENT_DRIVE_MIN && drive_rising);
+        pump_drive_prev = prior_drive;
+        bool event_rise = (pos_frac >= CUT_EVENT_POS_FRAC) && prior_event;
         scene_cut_lockout = max(scene_cut_lockout - 1.0, 0.0);
-        if (change_pct > SCENE_CUT_PCT && scene_cut_lockout <= 0.0)
+        bool cut_fired = change_pct > SCENE_CUT_PCT
+                      && scene_cut_lockout <= 0.0
+                      && !event_rise;
+        if (cut_fired)
             scene_cut_lockout = LOCKOUT_FRAMES;
+        // Strobe pressure EMA (see CUT_RATE block). The alpha consumer below
+        // must see the PRE-update value — capture it before the store.
+        // Unconditional single store of a computed value — no branch-arm
+        // store asymmetry (FXC SSBO miscompile class needs
+        // store-in-one-arm + RMW-in-the-other).
+        float cut_rate_prev = cut_rate;
+        cut_rate = mix(cut_rate, cut_fired ? 1.0 : 0.0,
+                       cut_fired ? CUT_RATE_RISE : CUT_RATE_FALL);
 
         // ---- Velocity-driven adaptation ----
         // Signed velocities — instantaneous minus previous smoothed (the EMA
@@ -2513,9 +2672,17 @@ void hook() {
         // impact frame) couple ~1:1 into every EMA as a visible pulse. On the
         // cut frame itself lockout/LOCKOUT_FRAMES == 1, so the mix lands on
         // TEMPORAL_ALPHA_FAST exactly — no dedicated cut branch needed.
+        // v5.20: under sustained strobing (cut_rate high) the lockout alpha
+        // blends back toward MID — one real cut still locks on FAST (cut_rate
+        // needs 2-3 pulses to reach STROBE_LO), but a strobe run can no longer
+        // hold every EMA at the cut alpha near-continuously. Reads the
+        // PRE-update pressure (see the CUT_RATE block's read-order warning).
+        float strobe_t = smoothstep(CUT_RATE_STROBE_LO, CUT_RATE_STROBE_HI,
+                                    cut_rate_prev);
         float alpha = (scene_cut_lockout > 0.0)
-            ? mix(TEMPORAL_ALPHA_MID, TEMPORAL_ALPHA_FAST,
-                  scene_cut_lockout / LOCKOUT_FRAMES)
+            ? mix(mix(TEMPORAL_ALPHA_MID, TEMPORAL_ALPHA_FAST,
+                      scene_cut_lockout / LOCKOUT_FRAMES),
+                  TEMPORAL_ALPHA_MID, strobe_t)
             : base_alpha;
 
         // Growth-mode discriminator. Fires when:
@@ -2526,11 +2693,17 @@ void hook() {
         //   - smoothed_bright_frac above a floor (avoids fading title-card
         //     text at sub-percent pixel fractions)
         float growth_sig   = spec_vel - GROWTH_SPEC_BIAS * bright_vel;
-        float c_gate       = smoothstep(0.0, GROWTH_C_GATE_HIGH, contrast_vel);
+        float c_gate       = smoothstep(GROWTH_C_GATE_LOW, GROWTH_C_GATE_HIGH,
+                                        contrast_vel);
         float frac_floor   = smoothstep(GROWTH_FRAC_FLOOR_LOW, GROWTH_FRAC_FLOOR_HIGH,
                                         smoothed_bright_frac);
+        // v5.20 corroboration (see GROWTH_SPEC_CELLS block): the velocity
+        // signature must be backed by multi-cell spec evidence — a single
+        // glint stepping one sample point can no longer arm growth mode.
+        float growth_corrob = smoothstep(GROWTH_SPEC_CELLS_LO,
+                                         GROWTH_SPEC_CELLS_HI, spec_sum);
         float growth_mode_instant = smoothstep(GROWTH_SIG_LOW, GROWTH_SIG_HIGH, growth_sig)
-                                  * c_gate * frac_floor;
+                                  * c_gate * frac_floor * growth_corrob;
 
         // Update smoothed_growth_mode FIRST so shutoff_eff can read the
         // just-updated, temporally-smoothed value — same characteristic as
@@ -2589,8 +2762,17 @@ void hook() {
                 pump_slow_cell[i] = v;
                 pump_very_slow_cell[i] = v;
                 pump_open_persist_cell[i] = 0.0;
-                pump_env_cell[i]  = 0.0;
-                pump_mask_cell[i] = 0.0;
+                // v5.20: presentation quantities DECAY on reset instead of
+                // zeroing (state — lanes/proof/persist/seed — still hard-
+                // resets). 0.4/frame is gone in 2-3 frames, inside the cut's
+                // change-blindness window, and converts every reset
+                // consumer's one-frame pop into an ease: true cuts, flash
+                // returns, event fall-collapses and false motion-cost resets
+                // alike (rule 2). Both arms are now RMW on these vars —
+                // further from the FXC const-store/RMW miscompile shape than
+                // the old const zero.
+                pump_env_cell[i]  *= PUMP_RESET_DECAY;
+                pump_mask_cell[i] *= PUMP_RESET_DECAY;
                 #if PUMP_EDGE_ESTABLISH
                 pump_seed_cell[i] = 0.0;
                 #endif
@@ -2598,8 +2780,8 @@ void hook() {
             #endif
             pump_fast = pnorm_illum_v;
             pump_slow = pnorm_illum_v;
-            pump_env  = 0.0;
-            pump_cover_gate = 0.0;
+            pump_env  *= PUMP_RESET_DECAY;
+            pump_cover_gate *= PUMP_RESET_DECAY;
         } else {
             // Locals: the SSBO is coherent, so re-reading a lane just written
             // is a real memory round-trip — compute once, store once.
@@ -2849,7 +3031,15 @@ void hook() {
                 // global_gate disengages it. edge_seed in [0,1] debits the onset
                 // and holds the mask shut below, and seeds the fast-establish so
                 // the verdict propagates inward with the entering front.
-                bool edge_cell = (cx == 0 || cx == 15 || cy == 0 || cy == 8);
+                // v5.20: the border is the PICTURE's border, not the frame's.
+                // On letterboxed content the outer ring sits inside permanently
+                // black bars — edge_seed never armed there, so the off-screen-
+                // establishment safety was structurally inert for vertical
+                // influx (scope tilt-downs to bright sky pumped the entering
+                // band: the exact reveal class this seed exists to kill). The
+                // lb_top/bot/left/right seed lines are hoisted above the loop.
+                bool edge_cell = (cx == lb_left || cx == lb_right
+                               || cy == lb_top  || cy == lb_bot);
                 float edge_seed = (edge_cell && di > 0.0) ? (1.0 - global_gate) : 0.0;
                 // Max influx-origin marker among the ring-2 neighbours that
                 // actually gate this cell (their established level reaches it) —
@@ -3460,13 +3650,20 @@ void hook() {
             // collapses toward 0 as the field goes uniform (fade-to-white or
             // fade-to-colour). Events are never muted; fades ease out.
             float cover_raw = smoothstep(PUMP_CONTRAST_LOW, PUMP_CONTRAST_HIGH, contrast_v);
-            // Asymmetric cover envelope (see PUMP_COVER_FALL): instant rise,
-            // rate-clamped fall. pump_cover_gate doubles as the previous
-            // frame's effective cover (thread-0 read-then-write, single
-            // writer). transient_reset writes 0.0, so a cut still mutes
-            // instantly and the post-cut re-open is an instant rise.
+            // Asymmetric cover envelope (see PUMP_COVER_FALL): instant rise
+            // under subtractive, rate-clamped rise under additive (see
+            // PUMP_COVER_RISE), rate-clamped fall. pump_cover_gate doubles as
+            // the previous frame's effective cover (thread-0 read-then-write,
+            // single writer). transient_reset decays it at PUMP_RESET_DECAY
+            // — a cut mutes within 2-3 frames (inside the cut's change-
+            // blindness window) and the post-cut re-open ramps from there.
             float cover_gate = (cover_raw >= pump_cover_gate)
+            #if SPATIAL_PUMP_ADDITIVE
+                // v5.20: rate-clamped rise under additive (see PUMP_COVER_RISE).
+                ? min(cover_raw, pump_cover_gate + PUMP_COVER_RISE)
+            #else
                 ? cover_raw
+            #endif
                 : max(cover_raw, pump_cover_gate * PUMP_COVER_FALL);
             // Published for PASS 6's ADDITIVE apply: the per-cell mask carries
             // no scene guard of its own, so the additive path multiplies this
@@ -3511,6 +3708,8 @@ void hook() {
             smoothed_contrast     = contrast;
             smoothed_log_avg      = log_avg;
             scene_cut_lockout     = 0.0;
+            cut_rate              = 0.0;
+            pump_drive_prev       = 0.0;
         } else {
             // Spec-gate hardening (v5.6): the APPLIED spec gate gets its own
             // alpha that does NOT speed up with vel_mag. During a pan/tilt
@@ -3570,7 +3769,7 @@ void hook() {
 //!BIND CELFLARE_ILLUM
 //!BIND MOTION_FLOW
 //!COMPUTE 16 16
-//!DESC CelFlare v5.18 (motion-aware additive A2 + spec coherence)
+//!DESC CelFlare v5.20 (motion-aware additive A2 + impact-weighted spec)
 
 // =============================================
 //  MAIN TUNING — deep anchors. The supported user surface is the cf_* block
@@ -3672,8 +3871,25 @@ void hook() {
 // Consequence: dim saturated emissives (red LED Y~0.21) get no BASE credit
 // and — with the spec V escape gone — no per-pixel V path at all: they keep
 // their SDR level BY DESIGN (the twice-field-rejected trade).
+// 2026-08-09 retune 0.75 -> 0.50, measured on the author's Kuroneko blush
+// capture (frame 638, 16-bit raw/shaded pair + headless BASE_V_CREDIT sweep
+// at the live settings): at 0.75 the credit OVERSHOOTS preservation — blush
+// strokes got ~2% MORE expansion than adjacent skin (artist contrast
+// compressed below the SDR grade) and the chroma-bled AA/shadow band hugging
+// dark outlines ran ~8% hot vs its surround (the reported "oversaturated
+// halo around the outlines"). At 0.50 BOTH metrics land at parity on the
+// same frame (stroke ratio 1.003, outline band 0.999); at 0.0 the band
+// under-expands -9% = the original purple-bruise class, so the credit
+// itself stays. Evidence audit 2026-08-09: numbers reproduced byte-exact;
+// 0.50 is the unique tested point within ~1% of parity on BOTH metrics.
+// ⚠ The parity point rides on cf_curve: calibrated at the author's
+// cf_curve=2 preset; at default curve=1 ideal is ~0.40-0.46 (0.50 leaves a
+// +2-3% residual halo there; the 0.75 overshoot persists at BOTH curves,
+// so the retune direction is preset-independent). If the Symphogear-glass
+// bruise scene ever re-reads dark, re-sweep on that capture before raising
+// this — the parity point is also content-dependent.
 #define ENABLE_BASE_V_CREDIT 1
-#define BASE_V_CREDIT        0.75   // fraction of the Y->V gap credited at full gate
+#define BASE_V_CREDIT        0.50   // fraction of the Y->V gap credited at full gate
 #define BASE_V_SAT_LO        0.10   // sat_gamma gate (the band the deleted spec v_drive used)
 #define BASE_V_SAT_HI        0.30
 #define BASE_V_Y_LO          0.32   // luma floor fade-in: 0 at/below the early exit (KNEE)
@@ -3919,6 +4135,17 @@ void hook() {
 // pits join an admitted field; lower pixels remain exact. Thin dark structures
 // surrounded on both sides are the principal A/B risk. The clipped center and
 // super-white stay untouched; sub-clip hot values may still be range-locked.
+// v5.19 retune (audit 2026-08-09): every engagement gate below was a steep
+// smoothstep of per-frame raw-tap sums, and moderate grain (sigma 0.02-0.05)
+// sat exactly astride the old bands — the gates toggled full corrections per
+// frame on the very fields the lock targets (up to ~0.5 ramp units, tens of
+// nits). Spans widen ~1.7-2x so plausible grain rides plateaus, the strong
+// lift is bounded at 0.2 and demands ~6 of 8 coherent pairs (was 4 — thin
+// dark structures up to ~10 px filled at full strength through the radius-6
+// outer ring alone), and lift_center now spans the full SUPPORT_PAD so it is
+// continuous at the block's entry boundary. Held-back lever if flicker
+// persists: cap the range-lock correction magnitude itself (trades residual
+// speckle for a hard flicker bound).
 #define SPEC_LOCK_RADIUS       cf_spec_radius
 #define SPEC_LOCK_RANGE_LO     0.025
 #define SPEC_LOCK_RANGE_HI     0.100
@@ -3928,18 +4155,53 @@ void hook() {
 #define SPEC_LOCK_MAX_NEIGH_W (8.0 * (1.0 + SPEC_LOCK_OUTER_W))
 #define SPEC_LOCK_MAX_PAIR_W  (4.0 * (1.0 + SPEC_LOCK_OUTER_W))
 #define SPEC_LOCK_BAND         0.005
-#define SPEC_LOCK_LIFT_MAX     0.500
-#define SPEC_LOCK_SUPPORT_Y    0.025
-#define SPEC_LOCK_CONF_LO      0.35
-#define SPEC_LOCK_CONF_HI      0.70
-#define SPEC_LOCK_MASS_LO      0.30
-#define SPEC_LOCK_MASS_HI      0.60
-#define SPEC_LOCK_LIFT_MASS_LO 0.25
-#define SPEC_LOCK_LIFT_MASS_HI 0.50
-#define SPEC_LOCK_LIFT_EDGE_LO 0.025
-#define SPEC_LOCK_LIFT_EDGE_HI 0.075
+#define SPEC_LOCK_LIFT_MAX     0.200
+#define SPEC_LOCK_SUPPORT_Y    0.050
+#define SPEC_LOCK_CONF_LO      0.25
+#define SPEC_LOCK_CONF_HI      0.85
+#define SPEC_LOCK_MASS_LO      0.25
+#define SPEC_LOCK_MASS_HI      0.80
+#define SPEC_LOCK_LIFT_MASS_LO 0.45
+#define SPEC_LOCK_LIFT_MASS_HI 0.75
+#define SPEC_LOCK_LIFT_EDGE_LO 0.020
+#define SPEC_LOCK_LIFT_EDGE_HI 0.100
 #define SPEC_LOCK_HOT_LO       0.82
 #define SPEC_LOCK_HOT_HI       1.00
+// Impact weighting (v5.19): spec amplitude scales with coherent local
+// evidence, saturating fast, so any coherent body (sheens, windows, candle
+// flames at 10-30 px) rides at 1.0 while a 2x2 star (every antipodal pair
+// straddles it, all evidence ~ 0) sits at cf_spec_floor. Below-few-arcmin
+// points gain little perceived brightness from a nit boost (spatial
+// summation) but carry the shader's least stabilizable energy — de-emphasis
+// is mission, not loss (author steer 2026-08-09). The floor is the author's
+// catchlight lever: eye glints carry intermediate evidence, so the floor
+// sets how much of their pop survives. The evidence is INNER-3x3-ONLY (both
+// review lenses convicted the first cut independently): the hash-rotated
+// outer ring made a thin streak's weight per-pixel random (the along-ridge
+// inner pair lands mid-smoothstep; outer alignment is hash luck), printing
+// static ±14% dashing that crawls under drift. Inner-only is deterministic:
+// one fully-supported antipodal pair (= member of a >=3 px line or larger)
+// saturates the weight. The lift channel joins via max() so a filled pepper
+// pit keeps its body's weight — the pit's own bilateral rejects its field
+// (that is what the lift exists to bridge), and without the max the weight
+// re-darkened the just-filled pixel ~30% below its field.
+#define SPEC_IMPACT_MASS       0.25
+// Lift pair chroma-match (v5.19): the lift was luma-blind — a neutral pit
+// inside a chromatic near-clip field lifted to the field's level and then
+// escaped the sat gate (non-monotone vs its surround); in dark scenes
+// (SAT_ATTEN 0.20) colored pixels beside white fields inherited ~80% of a
+// lifted spec. Donation now also requires the pair's saturation to match the
+// center's within the band below.
+#define SPEC_SAT_MATCH_LO      0.08
+#define SPEC_SAT_MATCH_HI      0.20
+// Spec-gate saturation deadband (v5.19): the sat gate read raw per-pixel
+// 4:2:0 chroma, so chroma noise modulated spec +/-5-10% on saturated
+// near-clip fields even with a perfectly locked luma ramp. The gate now
+// reads sat pulled toward the same-surface bilateral sat reference, BOUNDED
+// at chroma-noise scale so real chroma boundaries cannot move more than LIM
+// (the GRAIN_RING_LIM philosophy — smooth the noise, never restructure).
+// Only the spec sat gate consumes this; the Oklab fast path keeps raw sat.
+#define SPEC_SAT_STAB_LIM      0.04
 // Luminance-field ring blend (2026-07-16, parked for the upper-stabilizer
 // A/B). Its support-preserving v3 form remains below for comparison, but the
 // field test needs a pure tonal path with no 9px spec operator.
@@ -4407,16 +4669,24 @@ float spec_ramp_shape(float y, float y_low, float g) {
 }
 
 // Return (luma reference, accepted-neighbour confidence, pair-supported spec
-// mass, broad positive-envelope luma), plus the independent lift support.
+// mass, broad positive-envelope luma), plus the independent lift support and
+// the same-surface bilateral saturation reference (v5.19, spec sat gate only).
 // The four inner pairs are the exact 8-neighbour 3x3 footprint. The four outer
-// pairs sit halfway between those axes (22.5° phase): interleaving the angular
-// coverage prevents both radii from reinforcing the same cardinal/diagonal
-// spokes, while preserving the same 16 fetches and affine identity. Every pair
+// pairs sit halfway between those axes (22.5° phase) and are hash-rotated per
+// pixel (v5.19): a FIXED outer geometry let drifting content sweep the
+// pair-straddle condition through whole regions in phase — coherent
+// evidence-gate oscillation. The hash is static per pixel (no temporal
+// noise), antipodal pairs stay antipodal under rotation, so the affine
+// reference identity is untouched; the inner 3x3 stays fixed. Every pair
 // shares its weaker bilateral weight: one cross-edge tap rejects the whole
 // direction, while yp+yn preserves an affine center level exactly.
-vec4 spec_local_reference(float center_y, float y_low,
-                          out float lift_support) {
+vec4 spec_local_reference(float center_y, float center_sat, float y_low,
+                          out float lift_support, out float sat_ref,
+                          out float impact_evidence) {
     float r = SPEC_LOCK_RADIUS;
+    vec2 hpx = HOOKED_pos * HOOKED_size;
+    float hang = fract(sin(dot(hpx, vec2(12.9898, 78.233))) * 43758.5453) * 6.2832;
+    float hca = cos(hang), hsa = sin(hang);
     vec2 offsets[8] = vec2[8](
         vec2(1.0, 0.0),
         vec2(0.0, 1.0),
@@ -4429,14 +4699,27 @@ vec4 spec_local_reference(float center_y, float y_low,
     );
     float y_sum = center_y * SPEC_LOCK_CENTER_W;
     float y_weight = SPEC_LOCK_CENTER_W;
+    float sat_sum = center_sat * SPEC_LOCK_CENTER_W;
     float accepted_mass = 0.0;
     float supported_mass = 0.0;
     float lift_excess = 0.0;
     float lift_mass = 0.0;
+    // Inner-3x3-only twins of supported/lift mass, feeding ONLY the impact
+    // weight (see SPEC_IMPACT_MASS block): the fixed inner geometry keeps
+    // the weight deterministic; the hash-rotated outer ring keeps serving
+    // the lock/lift reference where de-phasing helps.
+    float supported_inner = 0.0;
+    float lift_inner = 0.0;
     for (int i = 0; i < 8; i++) {
         vec2 o = offsets[i];
-        float yp = get_luma(HOOKED_texOff( o).rgb);
-        float yn = get_luma(HOOKED_texOff(-o).rgb);
+        if (i >= 4)
+            o = vec2(o.x * hca - o.y * hsa, o.x * hsa + o.y * hca);
+        vec3 cp = HOOKED_texOff( o).rgb;
+        vec3 cn = HOOKED_texOff(-o).rgb;
+        float yp = get_luma(cp);
+        float yn = get_luma(cn);
+        float sat_p = max(max(cp.r, cp.g), cp.b) - min(min(cp.r, cp.g), cp.b);
+        float sat_n = max(max(cn.r, cn.g), cn.b) - min(min(cn.r, cn.g), cn.b);
         float wp = 1.0 - smoothstep(SPEC_LOCK_RANGE_LO,
                                     SPEC_LOCK_RANGE_HI,
                                     abs(yp - center_y));
@@ -4448,16 +4731,18 @@ vec4 spec_local_reference(float center_y, float y_low,
         float wn2 = wn * wn * ring_w;
         float w = min(wp2, wn2);
 
-        // Soft support is measured directly above the luma onset. A 0.025
-        // span closely tracks the former ~0.08 ramp-support interval across
-        // the live gamma range without evaluating 16 neighbour pow() calls.
+        // Soft support is measured directly above the luma onset. The 0.05
+        // span (v5.19, was 0.025) halves the per-tap membership slope so
+        // +/-0.01 grain no longer swings a tap's support 40-100%.
         float sp = smoothstep(y_low, y_low + SPEC_LOCK_SUPPORT_Y, yp);
         float sn = smoothstep(y_low, y_low + SPEC_LOCK_SUPPORT_Y, yn);
 
         y_sum += (yp + yn) * w;
         y_weight += 2.0 * w;
+        sat_sum += (sat_p + sat_n) * w;
         accepted_mass += 2.0 * w;
         supported_mass += (sp + sn) * w;
+        if (i < 4) supported_inner += (sp + sn) * w;
         // STRONG PAIR-COHERENT LIFT. A pepper pit in a bright flat field sees
         // matching values on both sides of every axis; a real boundary makes
         // antipodal taps disagree. Pair contrast therefore gates donation
@@ -4465,22 +4750,33 @@ vec4 spec_local_reference(float center_y, float y_low,
         // range lock above. Conditional normalization supplies the bright
         // neighbour level rather than diluting it toward the onset; the fixed
         // lift-support fraction below prevents one surviving pair from acting
-        // like a complete field.
+        // like a complete field. v5.19: donation additionally requires the
+        // pair's saturation to match the center's (SPEC_SAT_MATCH block) —
+        // the lift was luma-blind and filled neutral pits from chromatic
+        // donors that then escaped the sat gate.
         float pair_y = 0.5 * (yp + yn);
         float pair_match = 1.0 - smoothstep(SPEC_LOCK_LIFT_EDGE_LO,
                                             SPEC_LOCK_LIFT_EDGE_HI,
                                             abs(yp - yn));
         float pair_spec = smoothstep(y_low, y_low + SPEC_LOCK_SUPPORT_Y,
                                      pair_y);
-        float lift_w = pair_match * pair_spec * ring_w;
+        float sat_match = 1.0 - smoothstep(SPEC_SAT_MATCH_LO,
+                                           SPEC_SAT_MATCH_HI,
+                                           abs(0.5 * (sat_p + sat_n) - center_sat));
+        float lift_w = pair_match * pair_spec * sat_match * ring_w;
         lift_excess += clamp(pair_y - y_low, 0.0, 1.0 - y_low) * lift_w;
         lift_mass += lift_w;
+        if (i < 4) lift_inner += lift_w;
     }
     float y_ref = min(y_sum / max(y_weight, 1e-6), 1.0);
     float confidence = clamp(accepted_mass / SPEC_LOCK_MAX_NEIGH_W, 0.0, 1.0);
     float support = clamp(supported_mass / SPEC_LOCK_MAX_NEIGH_W, 0.0, 1.0);
     float lift_y = min(y_low + lift_excess / max(lift_mass, 1e-6), 1.0);
     lift_support = clamp(lift_mass / SPEC_LOCK_MAX_PAIR_W, 0.0, 1.0);
+    sat_ref = sat_sum / max(y_weight, 1e-6);
+    // Inner maxima: 4 pairs x 2 taps (support) / 4 pairs x weight 1 (lift).
+    impact_evidence = max(clamp(supported_inner / 8.0, 0.0, 1.0),
+                          clamp(lift_inner / 4.0, 0.0, 1.0));
 
     return vec4(y_ref, confidence, support, lift_y);
 }
@@ -4875,8 +5171,9 @@ vec4 cf_shade() {
     // Scene gate: applied_spec_signal selects the continuously warmed flagship
     // or stabilized stats history (16×9 tier detection).
     // Per-pixel ramp: smoothstep on Y selects which pixels get boost.
-    // Y_illum modulates peak and gamma (same pattern as base curve) —
-    // adds continuous spatial variation that breaks 8-bit quantization.
+    // Scene-level apl_t modulates peak and gamma (doc fix 2026-08-09: an
+    // earlier per-pixel Y_illum modulation was removed for edge halos —
+    // see the MAIN TUNING notes; this header lagged the code).
     // Added AFTER APL/dynamic intensity — not subject to those dampeners.
     #if ENABLE_SPECULAR_BONUS
     float spec_strength;
@@ -4925,16 +5222,50 @@ vec4 cf_shade() {
         // nonlinear ramp. Insufficient evidence, an isolated glint, or a hard
         // edge falls back to raw. The 0.05 below-onset pad can fill a grain pit
         // inside a broad admitted field; this blunt A/B accepts wider reach.
+        // v5.19 structure: the local gather also feeds the impact weight and
+        // the sat deadband, so it runs for clipped centers too (the old
+        // ordinary_r < HOT_HI test now guards only the lock/lift — a clipped
+        // 2x2 star must still be weighed). Frame borders fall back to raw:
+        // clamp-to-edge collapses an inner pair's outward tap onto the center
+        // itself (wn==1, single-tap acceptance) and halves pair contrast, so
+        // the outer cf_spec_radius pixels ran on structurally looser evidence.
+        float impact_w = 1.0;
+        float spec_sat = sat_gamma;
+        vec2 spec_px = HOOKED_pos * HOOKED_size;
+        float spec_guard = SPEC_LOCK_RADIUS + 1.0;
+        bool spec_in_frame = spec_px.x >= spec_guard
+                          && spec_px.y >= spec_guard
+                          && spec_px.x < HOOKED_size.x - spec_guard
+                          && spec_px.y < HOOKED_size.y - spec_guard;
         if (cf_spec_stab > 0.0
             && cf_spec > 0.0
             && cf_strength > 0.0
             && applied_spec_signal > 1e-5
             && Y_gamma > spec_y_low - SPEC_LOCK_SUPPORT_PAD
-            && ordinary_r < SPEC_LOCK_HOT_HI)
+            && spec_in_frame)
         {
             float lift_support;
-            vec4 local = spec_local_reference(Y_gamma, spec_y_low,
-                                              lift_support);
+            float sat_ref;
+            float impact_evidence;
+            vec4 local = spec_local_reference(Y_gamma, sat_gamma, spec_y_low,
+                                              lift_support, sat_ref,
+                                              impact_evidence);
+
+            // IMPACT WEIGHT (v5.19, see SPEC_IMPACT_MASS block). Applied to
+            // the final spec product below — the ramp still owns amplitude
+            // within any coherent body (the weight saturates there), so
+            // gradient-into-core is untouched; the weight can only attenuate,
+            // never donate across a boundary. Evidence is inner-3x3-only and
+            // includes the lift channel (filled pits keep body weight).
+            impact_w = mix(cf_spec_floor, 1.0,
+                           smoothstep(0.0, SPEC_IMPACT_MASS, impact_evidence));
+
+            // Bounded sat-noise deadband for the spec sat gate (v5.19, see
+            // SPEC_SAT_STAB_LIM block). Never fed to the Oklab fast path.
+            spec_sat = sat_gamma + clamp(sat_ref - sat_gamma,
+                                         -SPEC_SAT_STAB_LIM, SPEC_SAT_STAB_LIM);
+
+            if (ordinary_r < SPEC_LOCK_HOT_HI) {
             float ref_r = pow(smoothstep(spec_y_low, 1.0, local.x), spec_gamma);
             float locked_r = ref_r
                            + clamp(ordinary_r - ref_r,
@@ -4960,6 +5291,10 @@ vec4 cf_shade() {
             // can only raise and never extrapolates beyond a donor. Antipodal
             // contrast plus fixed support reject true boundaries; a pepper pit
             // surrounded by a coherent bright field is deliberately filled.
+            // v5.19: bounded at 0.2, ~6 of 8 pairs required, and lift_center
+            // spans the full SUPPORT_PAD (continuous at the entry boundary;
+            // the old 0.025 span let ±2-3 8-bit codes of grain swing the fill
+            // 40-100% per frame).
             float lift_r = pow(smoothstep(spec_y_low, 1.0, local.w), spec_gamma);
             float lift_floor = max(lift_r - SPEC_LOCK_BAND, 0.0);
             float lift_target = max(ordinary_r,
@@ -4968,11 +5303,11 @@ vec4 cf_shade() {
             float lift_evidence = smoothstep(SPEC_LOCK_LIFT_MASS_LO,
                                              SPEC_LOCK_LIFT_MASS_HI,
                                              lift_support);
-            float lift_center = smoothstep(spec_y_low - SPEC_LOCK_SUPPORT_Y,
+            float lift_center = smoothstep(spec_y_low - SPEC_LOCK_SUPPORT_PAD,
                                            spec_y_low, Y_gamma);
             ordinary_r = mix(ordinary_r, lift_target,
                              cf_spec_stab * lift_evidence * lift_center);
-
+            }
         }
         // Super-white is raw center evidence: add it after the range lock so a
         // neighbour can neither donate it nor average it away. At
@@ -5039,9 +5374,15 @@ vec4 cf_shade() {
         // firing on the red car under the sun. Saturation rejection stays
         // engaged through clip: a V-keyed carve was field-convicted on the
         // Kuroneko yellow sky and supplied no protection the Exit-8 sign
-        // actually needed. sat_gamma is shared with the Oklab fast-path bypass.
+        // actually needed. v5.19: the gate reads spec_sat (bounded deadband
+        // toward the same-surface sat reference — kills 4:2:0 chroma-noise
+        // speckle at the gate); the Oklab fast path keeps raw sat_gamma.
         float sat_atten = mix(SPEC_SAT_ATTEN_DARK, SPEC_SAT_ATTEN_BRIGHT, apl_t);
-        spec_strength *= 1.0 - smoothstep(SPEC_SAT_LOW, SPEC_SAT_HIGH, sat_gamma) * sat_atten;
+        spec_strength *= 1.0 - smoothstep(SPEC_SAT_LOW, SPEC_SAT_HIGH, spec_sat) * sat_atten;
+
+        // Impact weight last: scales the whole per-pixel product (ramp,
+        // overshoot bonus, sat-gated) so debug-5 shows what actually applies.
+        spec_strength *= impact_w;
 
         expansion += spec_strength;
     }

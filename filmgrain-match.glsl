@@ -70,7 +70,7 @@
 //                    visible grain ticks. 1 = every tick; 0.25 = every fourth.
 //                    Arrangement still rehashes on every visible tick, so this
 //                    is a small performance option, not a boil-speed control.
-//   grain_base_sat   explicit per-channel generator prior. 0.25 = calibrated
+//   grain_base_sat   explicit per-channel generator prior. 0.75 = calibrated
 //                    look; 0 = true mono. Off-default values drift per-channel
 //                    grain RMS by a few percent.
 //
@@ -244,7 +244,7 @@
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
-0.25
+0.75
 
 //!PARAM restore_gain
 //!DESC Missing-power authority. 0 = complement only · 1 = inferred missing-power target · above 2 restored power rises ~quadratically and can overgrain intact material · 6 = expert ceiling.
@@ -2105,12 +2105,18 @@ void hook() {
 // rises. Offline-locked to CyberCity (tools/mgt_bandpass_design.py): BP_RATIO 1.8, A0 0.60.
 #define BP_RATIO     1.8
 #define BP_ALPHA     0.60
-#define RED_VARIANCE_SCALE   1.0
-#define GREEN_VARIANCE_SCALE 1.0
-#define BLUE_VARIANCE_SCALE  1.0
-#define RED_SATURATION       0.6
-#define GREEN_SATURATION     0.5
-#define BLUE_SATURATION      0.80
+// Chroma/energy calibration (2026-08): common generator amplitude scale plus a
+// corpus-fit saturation triple, verified against master RGB grain correlations
+// on both film families (correlation error ~0.02 vs ~0.33 uncalibrated; luma
+// field RMS unchanged to 0.01%). Prior triple 0.6/0.5/0.80 with unit scales
+// and base_sat default 0.25 — kept here because the historical GRAIN_STD
+// anchors below were measured at exactly that mix.
+#define RED_VARIANCE_SCALE   1.027766
+#define GREEN_VARIANCE_SCALE 1.027766
+#define BLUE_VARIANCE_SCALE  1.027766
+#define RED_SATURATION       0.736
+#define GREEN_SATURATION     0.262
+#define BLUE_SATURATION      0.718
 
 const uvec2 isize = uvec2(gl_WorkGroupSize) + uvec2(2 * MAX_TAPS);
 
@@ -2245,21 +2251,44 @@ void hook() {
                            - 2.0 * bp_alpha * (s12c[c]*s12c[c]) / r1;
             bp_norm[c] = inversesqrt(max(vr, 1e-4));
         }
+        // Two per-channel sigma families since the chroma/energy calibration.
+        // GRAIN_STD is the FROZEN marginal std of the historical anchor mix —
+        // it stays the field_norm denominator so the calibrated saturations
+        // and amplitude scale flow through to rendered power as intentional
+        // character (re-anchoring it to the live mix would cancel them).
+        // mix_std is the LIVE marginal std of the actual RGB mix (drifts with
+        // grain_base_sat); the value-warp knee must normalize by it, or tanh
+        // bites each channel at the wrong amplitude.
+        const vec3 GRAIN_STD = vec3(0.16223, 0.1742, 0.15653);
+        const vec3 base_luma = vec3(0.299, 0.587, 0.114);
+        const vec3 noise_scale = vec3(RED_VARIANCE_SCALE,
+                                      GREEN_VARIANCE_SCALE,
+                                      BLUE_VARIANCE_SCALE);
+        vec3 lum_mix = base_luma * noise_scale;
+        vec3 sat = vec3(RED_SATURATION, GREEN_SATURATION,
+                        BLUE_SATURATION) * grain_base_sat;
+        vec3 mix_r = mix(lum_mix, vec3(noise_scale.r, 0.0, 0.0), sat.r);
+        vec3 mix_g = mix(lum_mix, vec3(0.0, noise_scale.g, 0.0), sat.g);
+        vec3 mix_b = mix(lum_mix, vec3(0.0, 0.0, noise_scale.b), sat.b);
+        const float TRIANGULAR_STD = 0.612 / sqrt(6.0);
+        vec3 mix_std = TRIANGULAR_STD * sqrt(vec3(
+            dot(mix_r, mix_r), dot(mix_g, mix_g), dot(mix_b, mix_b)));
         // value_warp amplitude bookkeeping (uniform; computed once per frame). vsum_sigma =
-        // the per-channel RMS of vsum (bp_norm makes Var(vsum)=Var(vsum1)=GRAIN_STD^2*s1c^2;
-        // verified ratio 1.000). warp_renorm = 1/sqrt(E[tanh^2(value_warp*Z)]), Z~N(0,1),
+        // the per-channel RMS of vsum (bp_norm makes Var(vsum)=Var(vsum1)=mix_std^2*s1c^2;
+        // verified ratio 1.000 in the pre-calibration GRAIN_STD form at its own mix).
+        // warp_renorm = 1/sqrt(E[tanh^2(value_warp*Z)]), Z~N(0,1),
         // via fixed Gaussian quadrature -> the tanh warp preserves grain strength (RMS
         // stable to ~1% offline). value_warp<=0.05 -> renorm 1 (the warp branch is skipped).
-        const vec3 GRAIN_STD = vec3(0.16223, 0.1742, 0.15653);
-        vsum_sigma[0] = GRAIN_STD.x * s1c[0];
-        vsum_sigma[1] = GRAIN_STD.y * s1c[1];
-        vsum_sigma[2] = GRAIN_STD.z * s1c[2];
+        vsum_sigma[0] = mix_std.x * s1c[0];
+        vsum_sigma[1] = mix_std.y * s1c[1];
+        vsum_sigma[2] = mix_std.z * s1c[2];
         // Canonical absolute RMS at the neutral picture-space kernel. Without
         // this normalization coarse kernels render less power and fine kernels
         // more power even when the observer requested the same sigma_plus.
-        field_norm[0] = 0.08318138 / max(vsum_sigma[0], 1.0e-6);
-        field_norm[1] = 0.06602582 / max(vsum_sigma[1], 1.0e-6);
-        field_norm[2] = 0.04909565 / max(vsum_sigma[2], 1.0e-6);
+        // Anchored to GRAIN_STD, deliberately NOT vsum_sigma (see above).
+        field_norm[0] = 0.08318138 / max(GRAIN_STD.x * s1c[0], 1.0e-6);
+        field_norm[1] = 0.06602582 / max(GRAIN_STD.y * s1c[1], 1.0e-6);
+        field_norm[2] = 0.04909565 / max(GRAIN_STD.z * s1c[2], 1.0e-6);
 
         // Analytic pre-warp RGB covariance of the field this dispatch builds.
         // H.274/AV1 model grain per colour component, and the generator's
@@ -2301,30 +2330,19 @@ void hook() {
                  self_energy.x * self_energy.z,
                  self_energy.y * self_energy.z), vec3(1.0e-12)));
 
-        const vec3 base_luma = vec3(0.299, 0.587, 0.114);
-        const vec3 noise_scale = vec3(RED_VARIANCE_SCALE,
-                                      GREEN_VARIANCE_SCALE,
-                                      BLUE_VARIANCE_SCALE);
-        vec3 lum_mix = base_luma * noise_scale;
-        vec3 sat = vec3(RED_SATURATION, GREEN_SATURATION,
-                        BLUE_SATURATION) * grain_base_sat;
-        vec3 mix_r = mix(lum_mix, vec3(noise_scale.r, 0.0, 0.0), sat.r);
-        vec3 mix_g = mix(lum_mix, vec3(0.0, noise_scale.g, 0.0), sat.g);
-        vec3 mix_b = mix(lum_mix, vec3(0.0, 0.0, noise_scale.b), sat.b);
         vec3 base_corr = vec3(dot(mix_r, mix_g),
                               dot(mix_r, mix_b),
                               dot(mix_g, mix_b)) * inversesqrt(max(vec3(
             dot(mix_r, mix_r) * dot(mix_g, mix_g),
             dot(mix_r, mix_r) * dot(mix_b, mix_b),
             dot(mix_g, mix_g) * dot(mix_b, mix_b)), vec3(1.0e-12)));
-        // field_norm uses the historical calibrated GRAIN_STD constants. The
-        // base mix's true marginal standard deviation drifts when base_sat is
-        // changed (and blue is slightly below the calibration even at the
-        // default), so derive cap-only live diagonals from the actual mix. Do
-        // not feed these into the established log-normal mean correction.
-        const float TRIANGULAR_STD = 0.612 / sqrt(6.0);
-        vec3 mix_std = TRIANGULAR_STD * sqrt(vec3(
-            dot(mix_r, mix_r), dot(mix_g, mix_g), dot(mix_b, mix_b)));
+        // field_norm keeps the historical GRAIN_STD anchors, so the rendered
+        // field's true std is anchor * mix_std/GRAIN_STD — at the calibrated
+        // defaults every channel now sits above its anchor (red most, ~1.17x)
+        // and it drifts further when base_sat is changed. Derive cap-only live
+        // diagonals from the actual mix. Do not feed these into the log-normal
+        // mean correction: that stays a static constant evaluated at the
+        // calibrated defaults (OUTPUT field_var).
         vec3 cap_field_std = vec3(0.08318138, 0.06602582, 0.04909565)
                            * mix_std / GRAIN_STD;
         vec3 cap_field_var = cap_field_std * cap_field_std;
@@ -2498,9 +2516,16 @@ void hook() {
 #define MP_STATE_MAGIC_OUT 0.949451
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
-const vec3 field_var = vec3(0.08318138 * 0.08318138,
-                            0.06602582 * 0.06602582,
-                            0.04909565 * 0.04909565);
+// True per-channel variance of the canonical rendered field at the calibrated
+// defaults: (anchor * mix_std/GRAIN_STD)^2 with PASS 1's chroma/energy-
+// calibrated mix (scales 1.027766, saturations 0.736/0.262/0.718, base_sat
+// 0.75). Static by design — the log-normal zero-mean correction stays pinned
+// to the calibration point; live diagonals are cap-only (see PASS 1). The
+// pre-calibration triple was the bare anchors 0.08318138/0.06602582/0.04909565
+// squared.
+const vec3 field_var = vec3(0.09695780 * 0.09695780,
+                            0.06967857 * 0.06967857,
+                            0.05353626 * 0.05353626);
 
 // Workgroup snapshot of every GRAIN_STATE scalar the live path reads. On the
 // NVIDIA Vulkan driver the per-pixel SSBO loads in this pass measured
@@ -2639,8 +2664,9 @@ float matched_grain_scale(float lum, float hdr_mode) {
 //   dY = scale * (luma_coeff * carrier_rgb)^T * grain_rgb,
 // so its variance is q^T C q. On a neutral at the same luma q is simply the
 // neutral level times luma_coeff. Because this generator intentionally gives
-// red the strongest/finer component, the old path made equal-luma saturated
-// red ~1.24x neutral RMS at defaults (up to ~1.42x at grain_base_sat=1).
+// red the strongest/finer component, an uncapped path makes equal-luma
+// saturated red ~1.44x neutral RMS at the calibrated defaults (up to ~1.63x
+// at grain_base_sat=1; pre-calibration these were ~1.24x/~1.42x).
 // Carry the generator's current covariance and reduce only chromaticities above
 // the neutral reference. Never boost a quiet direction: H.274/AV1 permit real
 // per-component grain character, and this correction removes compositing bias

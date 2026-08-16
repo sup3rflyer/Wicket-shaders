@@ -227,7 +227,7 @@ Runtime controls (live-toggleable via `glsl-shader-opts`):
 | Param | Effect |
 |-------|--------|
 | `match_grain` | 0 = no synthetic output while observation remains live; 1 = full Match Grain+. Intermediate values are valid evaluation amounts. |
-| `grain_sharpness` | Measured-size influence (1 = literal compact-observer estimate; 0 = neutral generator). |
+| `grain_sharpness` | Size trim between the neutral generator (0) and the calibrated crisp point (1); default 0.3. Size/hardness rendering is evidence-frozen at the calibration point — delivery texture no longer steers it. |
 | `grain_rate` | Visible arrangement cadence as a fraction of *source* frames (default 1 = on ones; 0.5 = on twos). Display-refresh independent. |
 | `grain_gen_rate` | Template-vocabulary regeneration rate relative to visible ticks (default 1 = every tick; 0.25 = every fourth). Arrangement still refreshes each visible tick; the saving is modest because OUTPUT dominates cost, and finite-vocabulary reuse can change higher-order temporal correlation. |
 | `grain_base_sat` | Per-channel independence of the base grain — the subtle baked-in hue speckle (default 0.75 = calibrated look; 0 = mono grain). |

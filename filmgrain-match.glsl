@@ -62,7 +62,8 @@
 //   value_warp       VALUE-domain contrast: 0 = Gaussian (bit-identical), ~2 hard, ~3 extreme
 //                    = bimodal/high-per-grain-contrast (CyberCity "harsh"). Amplitude-
 //                    preserving; the value-domain cousin of grain_contrast.    [Alt+F3]
-//   grain_sharpness  measured-size influence: 0.3 = default, 1 = literal read.
+//   grain_sharpness  size trim, neutral (0) to calibrated crisp (1); 0.3 default.
+//                    (Evidence-frozen: the observer no longer steers size.)
 //   grain_rate       visible temporal cadence: fraction of SOURCE frames that
 //                    choose a fresh on-screen arrangement (1 = on ones; 0.5 =
 //                    on twos). Source-locked and display-refresh independent.
@@ -219,7 +220,7 @@
 0.0
 
 //!PARAM grain_sharpness
-//!DESC Measured-size influence. 1 = literal compact-observer estimate · 0 = neutral generator. Default 0.3 keeps source character without inheriting delivery softness.
+//!DESC Size trim between the neutral generator (0) and the calibrated crisp point (1). Evidence-frozen: delivery texture no longer steers size. Default 0.3.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
@@ -598,6 +599,9 @@ void lean_observe() {
             m_temporal_support = 0.0;
             m_title_conf = 0.0;
             m_title_power = MP_PRIOR_SIGMA * MP_PRIOR_SIGMA;
+            // 0.50 = the neutral state point. MUST equal PASS 2's
+            // FROZEN_SHOT_SHAPE: the render freeze is "the calibration
+            // point" only while these inits and that constant agree.
             m_title_size = 0.50;
             m_title_hardness = 0.50;
             m_shot_size = 0.50;
@@ -1974,10 +1978,12 @@ void lean_observe() {
             || abs(m_baked_grain_base_sat - grain_base_sat) > 1.0e-6
             || abs(m_baked_grain_sharpness - grain_sharpness) > 1.0e-6
             || abs(m_baked_match_grain - match_grain) > 1.0e-6;
-        // Size/hardness are baked into GRAIN_FIELD. Keep their fast post-cut
-        // acquisition responsive even at a reduced steady-state gen rate.
-        bool fast_character = shot_boundary
-            || (!geometry_only && m_shot_age <= 4.0 && evidence > 0.0);
+        // A cut still forces a fresh template so each shot gets its own
+        // vocabulary even at a reduced gen rate. The old post-cut fast-
+        // acquisition regens died with the size/hardness evidence freeze:
+        // GRAIN_FIELD content is params + seed only now, so a mid-window
+        // regen without a seed change rebuilt a bit-identical template.
+        bool fast_character = shot_boundary;
         if (scheduled_regen || fast_character || baked_params_changed) {
             if (visible_tick)
                 m_field_seed = m_arr_seed;
@@ -2117,6 +2123,18 @@ void hook() {
 #define RED_SATURATION       0.736
 #define GREEN_SATURATION     0.262
 #define BLUE_SATURATION      0.718
+// SIZE/HARDNESS EVIDENCE FREEZE (2026-08): delivery-grade encodes destroy
+// per-title size/softness identity (master-side separation collapses to noise
+// after 5 Mbps AVC/AV1, with rank flips), so the observer's size/hardness
+// estimates are codec texture, not source character. The render evaluates at
+// this frozen neutral state point — the same point the size/hardness lever
+// calibration was measured at — and the observer keeps measuring for
+// diagnostics only (debug rows 14/15). Archetype-specific size/hardness
+// comes from the explicit levers (grain_size / grain_sharpness /
+// grain_contrast), not from evidence. MUST equal PASS 1's neutral state
+// init (m_shot_size/m_shot_hardness = 0.50) — same manual-sync rule as
+// PICTURE_DENSITY.
+#define FROZEN_SHOT_SHAPE 0.50
 
 const uvec2 isize = uvec2(gl_WorkGroupSize) + uvec2(2 * MAX_TAPS);
 
@@ -2174,16 +2192,15 @@ void hook() {
     if ((grain_gain <= 0.0 || match_grain <= 0.0) && debug_match <= 0.5)
         return;
 
-    // Grain is generated on the picture-space implementation lattice. Shot
-    // character is committed from the persistent title posterior at cuts,
-    // then moves only imperceptibly.
+    // Grain is generated on the picture-space implementation lattice. Size
+    // is evidence-FROZEN (see FROZEN_SHOT_SHAPE): the generator evaluates the
+    // observer path at the neutral state point, so delivery texture can never
+    // morph rendered size — the m_shot_size estimate is measure-only now.
     float k_neutral = K_NEUTRAL;
     float observed_size = mix(1.35, 0.65,
-                              smoothstep(0.20, 0.85, m_shot_size));
+                              smoothstep(0.20, 0.85, FROZEN_SHOT_SHAPE));
     float source_size = mix(k_neutral, observed_size,
                             clamp(match_grain * grain_sharpness, 0.0, 1.0));
-    // Delivery loss changes missing power only. It cannot morph size/hardness
-    // inside a shot, which previously made motion-correlated loss look synthetic.
     float k_size = source_size;
     // grain_size: live size multiplier (1.0 = calibrated). <1 finer, >1 coarser. Lets
     // you correct the per-source size by eye -- CyberCity currently renders too FINE
@@ -2192,12 +2209,12 @@ void hook() {
     const float soften_eff = 0.0;
 
     // CONTRAST/BANDPASS: build inner (s1) AND outer (s2 = BP_RATIO*s1) blur weights.
-    // bp_alpha is UNIFORM across the workgroup (grain_contrast/match_grain/
-    // m_shot_hardness are uniform reads), and the outer blur below runs
+    // bp_alpha is UNIFORM across the workgroup (grain_contrast/match_grain are
+    // uniform cbuffer reads; hardness is the frozen constant), and the outer blur below runs
     // UNCONDITIONALLY (X3663 rework), so every barrier stays in uniform
     // control flow. bp_alpha=0 -> vsum2 multiplied out in the combine,
     // bp_norm=1, grain = blur(s1) = the old lowpass generator (A/B-safe).
-    float render_hardness = smoothstep(0.25, 0.82, m_shot_hardness);
+    float render_hardness = smoothstep(0.25, 0.82, FROZEN_SHOT_SHAPE);
     float bp_alpha = BP_ALPHA * grain_contrast * match_grain
                    * render_hardness;
     // DoG positivity guard: when both blur sigmas clamp at SIGMA_MAX the
@@ -3157,6 +3174,9 @@ void hook() {
             else if (row == 11) v = m_structure_ratio * 1000000.0;
             else if (row == 12) v = m_coverage * 65000.0;
             else if (row == 13) v = m_motion * 30000.0;
+            // Rows 14/15 decode the MEASURED size/hardness estimates —
+            // diagnostics only since the evidence freeze; the render uses
+            // PASS 2's FROZEN_SHOT_SHAPE and ignores these.
             else if (row == 14) v = m_shot_size * 60000.0;
             else if (row == 15) v = m_shot_hardness * 60000.0;
             else if (row == 16) v = m_cut_score * 30000.0;

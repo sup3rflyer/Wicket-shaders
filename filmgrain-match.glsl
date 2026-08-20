@@ -110,7 +110,12 @@
 //                    which grain reaches zero. ONE knob for every chain --
 //                    below 0.5 it also widens the rise out of black; between
 //                    that toe and the upper fade, amount follows the title's
-//                    own rendition curve (no aesthetic shoulder). Clip-limited
+//                    own rendition curve (no aesthetic shoulder). The approach
+//                    into the fade is sized in stops: through the content
+//                    range the glide spans ~1.8 stops below the zero point
+//                    (start = 0.60 x top), tightening to the stock half-stop
+//                    band as the top nears white -- a low fade rolls off
+//                    gradually instead of switching off. Clip-limited
 //                    chains (grain_hdr = 0, or grain_headroom = 0) cap the
 //                    effective top at 0.95 (the near-clip dead zone), so
 //                    the 1.10 default is stock on every chain; with
@@ -355,6 +360,7 @@
 //!VAR float m_geom_changed
 //!VAR float prev_probe[4096]
 //!VAR float m_pan_px
+//!VAR float m_bed_ema
 //!STORAGE
 
 //!TEXTURE GRAIN_FIELD
@@ -403,7 +409,7 @@
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
 #define MP_FIELD_STD           0.0185
-#define MP_STATE_MAGIC         0.949451
+#define MP_STATE_MAGIC         0.950820
 #define MP_MIN_BIN_SAMPLES     24u
 // Film-plausible evidence band. Per-frame sigma above this band is not
 // photographic grain (fireworks, confetti, dense near-field rain, damage):
@@ -610,6 +616,9 @@ void lean_observe() {
             m_shot_conf = 0.0;
             m_shot_gain = 1.0;
             m_shot_restore_boost = 1.0;
+            // Cold start assumes the full deficit, exactly the old fixed
+            // prior; evidenced shots then teach the title-typical bed level.
+            m_bed_ema = 1.0;
             m_est_missing = 0.0;
             m_loss_conf = 0.35;
             m_loss_mix = 0.0;
@@ -1393,15 +1402,36 @@ void lean_observe() {
                 uint target = (count + 1u) / 2u;
                 uint acc = 0u;
                 int med_bin = 0;
+                uint acc_before = 0u;
                 for (int a = 0; a < AMP_BINS; a++) {
                     acc += s_hist[base + a];
-                    if (acc >= target) { med_bin = a; break; }
+                    if (acc >= target) {
+                        med_bin = a;
+                        acc_before = acc - s_hist[base + a];
+                        break;
+                    }
                 }
-                // Exact-zero bins remain exact zero; dequantizing their centre
-                // would manufacture evidence on mathematically flat input.
-                float med_abs = (med_bin == 0) ? 0.0
-                              : (float(med_bin) + 0.5) * MP_AMP_MAX
-                              / float(AMP_BINS);
+                // Interpolated grouped median (linear CDF inside the median
+                // bin). The old bin-CENTER dequantization made per-frame
+                // sigma a 5-rung lattice with nothing between 0 and
+                // 0.994e-3 (M1 instrument audit, 2026-08-20) — faint grain
+                // read exact zero and every lane consumed rung-snapped
+                // values. Exact-zero rule preserved: a bin-0 median stays
+                // exact zero, so mathematically flat input still cannot
+                // manufacture evidence. The SPATIAL clean-lane ceilings
+                // (<= 0.3e-3) stay satisfiable only by true zero (nonzero
+                // floor ~6.6e-4); the temporal gate's boolean has a ~2%-of-
+                // bin-1 sliver above its 1.17e-4 floor, held to ~1% effect
+                // by its multiplicative smoothstep (review 2026-08-20).
+                float med_abs;
+                if (med_bin == 0) med_abs = 0.0;
+                else {
+                    float in_bin = float(s_hist[base + med_bin]);
+                    float frac = clamp((float(target) - float(acc_before))
+                                       / max(in_bin, 1.0), 0.0, 1.0);
+                    med_abs = (float(med_bin) + frac) * MP_AMP_MAX
+                            / float(AMP_BINS);
+                }
                 float sigma = med_abs * MP_MEDABS_TO_STD;
                 if (j == 0) sigma *= MP_HP_TO_SOURCE;
                 sigma_band[b * MP_BANDS + j] =
@@ -1420,13 +1450,28 @@ void lean_observe() {
         uint ttarget = (tcount + 1u) / 2u;
         uint tacc = 0u;
         int tmed_bin = 0;
+        uint tacc_before = 0u;
         for (int a = 0; a < AMP_BINS; a++) {
             tacc += s_content_hist[a];
-            if (tacc >= ttarget) { tmed_bin = a; break; }
+            if (tacc >= ttarget) {
+                tmed_bin = a;
+                tacc_before = tacc - s_content_hist[a];
+                break;
+            }
         }
-        float temporal = (tcount == 0u || tmed_bin == 0) ? 0.0
-                       : (float(tmed_bin) + 0.5) * MP_TEMP_MAX
-                       / float(AMP_BINS) * MP_MEDABS_TO_STD
+        // Same interpolated grouped median as the spatial estimator above,
+        // same exact-zero rule — temporal_ratio must compare a continuous
+        // numerator against the now-continuous observed denominator.
+        float tmed_abs;
+        if (tcount == 0u || tmed_bin == 0) tmed_abs = 0.0;
+        else {
+            float t_in = float(s_content_hist[tmed_bin]);
+            float t_frac = clamp((float(ttarget) - float(tacc_before))
+                                 / max(t_in, 1.0), 0.0, 1.0);
+            tmed_abs = (float(tmed_bin) + t_frac) * MP_TEMP_MAX
+                     / float(AMP_BINS);
+        }
+        float temporal = tmed_abs * MP_MEDABS_TO_STD
                        * MP_HP_TO_SOURCE * 0.70710678;
         float temporal_ratio = temporal / max(observed, 1.0e-6);
         float fine_e = float(s_fine_energy);
@@ -1717,6 +1762,32 @@ void lean_observe() {
         // authorize it without counting the same grain evidence twice.
         m_shot_restore_boost = 1.0;
 
+        // Scene tone centroid (sqrt-bin domain, bar/matte-excluded histogram).
+        // Master evidence from bins far ABOVE it is exposure-suspect: bright
+        // pixels inside a dark scene (lamps, rim light) carry the dark
+        // scene's capture character and book it into a tone bin that
+        // genuinely bright scenes later render (M3 field trace, Aldnoah E01
+        // 2026-08-20: bin 6 climbed to 2.5x prior during a stretch with no
+        // daylight). This guard is a PARTIAL bound on the extreme tail only:
+        // the measured climber sat ~1.5 bins above its scenes' centroids —
+        // at this ramp's lower edge, where the guard is inert — and the
+        // field A/B trimmed ~25% of the excess. The edges await
+        // M1/golden-pair calibration; do not present this as the full fix.
+        // Genuine bright scenes have their centroid AT those bins, so they
+        // are untouched. The guard discounts the RISE rate and the authority
+        // earn only — downward reads stay reduce-safe at full effect — and
+        // floors at 0.35, which keeps the anti-rectification rate ordering
+        // (rise 0.003 x 0.35 >= down 0.001) so symmetric sigma jitter cannot
+        // rectify into a one-way decline.
+        float cent_n = 0.0;
+        float cent_s = 0.0;
+        for (int b = 0; b < MP_TONE_BINS; b++) {
+            float c = float(s_luma_now[b]);
+            cent_n += c;
+            cent_s += c * float(b);
+        }
+        float scene_centroid = (cent_n > 0.0) ? cent_s / cent_n : 3.5;
+
         float title_sum = 0.0;
         float weight_sum = 0.0;
         float char_sum = 0.0;
@@ -1763,11 +1834,15 @@ void lean_observe() {
                 // translation decorrelation can only INFLATE sigma, so a
                 // sub-master read under motion is a valid one-sided bound
                 // and keeps walking the level down (reversibility).
+                float above = max(float(b) - scene_centroid, 0.0);
+                float exposure_guard = 1.0
+                                     - 0.65 * smoothstep(1.5, 3.5, above);
                 float master_rate = (clipped > m_master_p[b])
-                                  ? 0.003 * q_source : 0.001;
+                                  ? 0.003 * q_source * exposure_guard
+                                  : 0.001;
                 m_master_p[b] = mix(m_master_p[b], clipped,
                                     master_rate * reliability_raw);
-                m_master_w[b] += 0.005 * reliability
+                m_master_w[b] += 0.005 * reliability * exposure_guard
                                * (1.0 - m_master_w[b]);
 
             } else {
@@ -1822,8 +1897,18 @@ void lean_observe() {
         // extinguish — surviving delivered grain is damaged evidence
         // (clumping, blocking, compressed patches), and no lossy delivery
         // is a ProRes master.
-        float surv_wsum = 0.5;   // prior mass: no survivor evidence
-        float surv_dsum = 0.5;   // means the full missing fraction
+        // The prior mass anchors at the title's own recent bed level
+        // (m_bed_ema), not at the full missing fraction. The old fixed 1.0
+        // prior made an EMPTY survivor read commit the full deficit, so the
+        // cleanest scenes rendered MORE restore grain than grainy ones and
+        // grain stepped ~1.3x in sigma at those cuts (M3 field trace,
+        // Aldnoah E01 2026-08-20: daylight crowds hit the run-max eff 0.057,
+        // equal to the darkest shots). An empty read is censored, not
+        // evidence of survival, so it inherits what evidenced shots of this
+        // title typically show instead of snapping to the worst case. Cold
+        // start (m_bed_ema = 1.0) is exactly the old behavior.
+        float surv_wsum = 0.0;
+        float surv_dsum = 0.0;
         for (int b = 0; b < MP_TONE_BINS; b++) {
             float w = clamp(m_shot_obs_w[b], 0.0, 1.0);
             if (w <= 0.0) continue;
@@ -1838,7 +1923,23 @@ void lean_observe() {
             surv_wsum += w;
             surv_dsum += w * (1.0 - healthy);
         }
-        float bed_deficit = surv_dsum / surv_wsum;
+        float bed_prior = clamp(m_bed_ema, 0.0, 1.0);
+        float bed_deficit = (0.5 * bed_prior + surv_dsum)
+                          / (0.5 + surv_wsum);
+        // Learn the recent delivery-health bed only from frames with real
+        // survivor mass (evidence-only ratio, prior excluded), on a ~20 s
+        // horizon of evidenced frames. The temporal gate matters: survivor
+        // reads are spatial-only and cannot distinguish grain from picture
+        // texture (see the acquire comment above), which was safe while the
+        // lane was shot-local reduce-only but must not teach a
+        // title-persistent statistic unauthenticated (design review
+        // 2026-08-20). Read-modify-write kept as one unconditional store
+        // (FXC per-arm-store rule, see m_shot_gain).
+        float bed_meas = (surv_wsum > 1.0e-6) ? surv_dsum / surv_wsum
+                                              : bed_prior;
+        float bed_rate = 0.002 * smoothstep(0.25, 1.0, surv_wsum)
+                       * q_random * q_still;
+        m_bed_ema = mix(bed_prior, bed_meas, bed_rate);
 
         for (int b = 0; b < MP_TONE_BINS; b++) {
             float sigma0 = sigma_band[b * MP_BANDS];
@@ -2530,7 +2631,7 @@ void hook() {
 #define MP_FIELD_STD_OUT 0.0185
 // MUST equal PASS 1's MP_STATE_MAGIC (same translation-unit-sync rule as
 // MP_TONE_BINS_OUT / MP_FIELD_STD_OUT — no compile guard exists).
-#define MP_STATE_MAGIC_OUT 0.949451
+#define MP_STATE_MAGIC_OUT 0.950820
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
 // True per-channel variance of the canonical rendered field at the calibrated
@@ -2648,11 +2749,24 @@ float matched_grain_scale(float lum, float hdr_mode) {
     // temporal playback reveals it and channel clipping makes it one-sided
     // (the 2026-07-15 live-white finding). With headroom the top is the
     // user's above-ref-white reach; we cannot know the upstream expansion's
-    // tuning. The 0.96/1.10 start/top ratio is the retained stock geometry.
-    // Aggressive low fades need a matching shadow toe: the stock black gate
-    // reaches full grain almost immediately, which makes a 0.2 fade read as a
-    // hard band. Below 0.5, widen the rise and shorten its full-strength shelf;
-    // at 0.5 and above every edge is exactly the stock expression.
+    // tuning.
+    // The approach into the fade is sized in photographic stops, so its
+    // perceptual width cannot collapse as the knob moves down. Through the
+    // content range (top <= 0.70) the fade spans start/top = 0.60 -- about
+    // 1.8 stops in the 2.4-gamma work domain, the width of a natural
+    // sensitometric rolloff. Over top 0.70 to 0.95 the ratio tightens
+    // smoothly to the stock 0.96/1.10 half-stop band, so every default
+    // (0.95-capped clip-limited chains and the 1.10 stock top) renders
+    // exactly the stock geometry: content up there is sparse and the
+    // live-white finding wants a decisive end near clip.
+    // Motivation (2026-08-20 sky finding): the old proportional geometry at
+    // grain_fade 0.5 left a 0.064-wide band (16->22 nits at ref white 116)
+    // and a smooth sky gradient crossed it in ~400 px, so grain read as
+    // switching off along an iso-luma line.
+    // Aggressive low fades still need a matching shadow toe: the stock black
+    // gate reaches full grain almost immediately, which makes a 0.2 fade
+    // read as a hard band. Below 0.5, widen the rise and shorten its
+    // full-strength shelf.
     // OUTPUT's symmetric room clamp and flash-guard ceiling key on the same
     // top; the black gate stays container-keyed on hdr_mode.
     float white_hdr = hdr_mode * step(0.5, grain_headroom);
@@ -2660,10 +2774,10 @@ float matched_grain_scale(float lum, float hdr_mode) {
     // collapse the smoothstep edges below (NaN through the whole tone scale).
     float fade_user = max(grain_fade, 0.2);
     float fade_top = mix(min(fade_user, 0.95), fade_user, white_hdr);
-    float stock_start = fade_top * (0.96 / 1.10);
     float low_fade_q = 1.0 - smoothstep(0.30, 0.50, fade_top);
+    float wide_q = 1.0 - smoothstep(0.70, 0.95, fade_top);
     float toe_hi = mix(black_hi, max(black_hi, 0.45 * fade_top), low_fade_q);
-    float fade_start = mix(stock_start, 0.60 * fade_top, low_fade_q);
+    float fade_start = fade_top * mix(0.96 / 1.10, 0.60, wide_q);
     float shadow_toe = smoothstep(black_lo, toe_hi, lum);
     float white_fade = 1.0 - smoothstep(fade_start, fade_top, lum);
     float protection = shadow_toe * white_fade;

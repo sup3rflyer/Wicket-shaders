@@ -80,6 +80,11 @@
 //                    1 = inferred target, >1 = explicit amplitude override;
 //                    values near 5 are aggressive shot-specific overrides,
 //                    not a preset; 6 is the expert ceiling.
+//   grain_extreme    per-title admission scale for grain HEAVIER than the
+//                    normal film model (the plausibility band rejects it as
+//                    fireworks/damage otherwise). 1 = exactly neutral; ~2 for
+//                    the sandpaper OVA class whose measured grain sits at
+//                    4-8x normal; set from a profile, not a look knob.
 //
 //  == PIPELINE / SIZING =====================================================
 //   density_combine  0 = additive, 1 = multiplicative density.
@@ -264,6 +269,13 @@
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
+1.0
+
+//!PARAM grain_extreme
+//!DESC Extreme-grain admission. 1 = normal film model (exactly neutral) · 2 = admit ~2x heavier grain (sandpaper OVA class) · above ~2.5 only for the heaviest scans. Scales the plausibility band, the temporal/still instruments, and the evidence ceilings together.
+//!TYPE DYNAMIC float
+//!MINIMUM 1.0
+//!MAXIMUM 4.0
 1.0
 
 //!PARAM grain_hdr
@@ -1319,7 +1331,8 @@ void lean_observe() {
                      ? max(abs(prev_grid[k]) - 1.0, 0.0) : c;
 
         int now_lb = tone_bin(c);
-        if (s_history_ready != 0u && abs(c - prev_c) > 0.018)
+        if (s_history_ready != 0u
+            && abs(c - prev_c) > 0.018 * grain_extreme)
             atomicAdd(s_changed_count, 1u);
 
         // Grid global-translation (single-step Lucas-Kanade) accumulation --
@@ -1399,7 +1412,8 @@ void lean_observe() {
 
             if (prev_flat) {
                 float dhp = abs(band0 - prev_grid_off[k]);
-                int tb = clamp(int(dhp / MP_TEMP_MAX * float(AMP_BINS)),
+                int tb = clamp(int(dhp / (MP_TEMP_MAX * grain_extreme)
+                                   * float(AMP_BINS)),
                                0, AMP_BINS - 1);
                 atomicAdd(s_content_hist[tb], 1u);
             }
@@ -1495,8 +1509,8 @@ void lean_observe() {
             float t_in = float(s_content_hist[tmed_bin]);
             float t_frac = clamp((float(ttarget) - float(tacc_before))
                                  / max(t_in, 1.0), 0.0, 1.0);
-            tmed_abs = (float(tmed_bin) + t_frac) * MP_TEMP_MAX
-                     / float(AMP_BINS);
+            tmed_abs = (float(tmed_bin) + t_frac)
+                     * (MP_TEMP_MAX * grain_extreme) / float(AMP_BINS);
         }
         float temporal = tmed_abs * MP_MEDABS_TO_STD
                        * MP_HP_TO_SOURCE * 0.70710678;
@@ -1651,7 +1665,8 @@ void lean_observe() {
             float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
             float amp_r = smoothstep(0.00012, 0.00070, sigma0);
             float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
-                                           MP_SIGMA_PLAUS_HI, sigma0);
+                                           MP_SIGMA_PLAUS_HI,
+                                           sigma0 / grain_extreme);
             // Presence is a rise-only lane: the S4 veto applies in full.
             float reliability = count_r * amp_r * plaus
                               * q_cov * q_random * q_still * q_source;
@@ -1669,7 +1684,9 @@ void lean_observe() {
                 // in the approach rate below, annealed by how many tones
                 // corroborate, so one outlier bin transfers slowly while
                 // broad agreement transfers at full weight.
-                float candidate = min(candidate_gain, 3.24) * prior_base_p;
+                float candidate = min(candidate_gain,
+                                      3.24 * grain_extreme * grain_extreme)
+                                * prior_base_p;
                 float candidate_auth = reliability * master_auth;
                 float rise = candidate_auth
                            * max(candidate - m_title_power, 0.0);
@@ -1748,7 +1765,8 @@ void lean_observe() {
         // measured-clean master renders a subtle acquisition layer, never
         // nothing (charter: a zero-grain master is never authorized).
         m_title_power = clamp(m_title_power, 0.25 * prior_base_p,
-                              3.24 * prior_base_p);
+                              3.24 * grain_extreme * grain_extreme
+                              * prior_base_p);
 
         // A real cut commits only the authenticated title presentation. Spatial
         // evidence on the boundary cannot distinguish grain from picture texture;
@@ -1838,7 +1856,8 @@ void lean_observe() {
             float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
             float amp_r = smoothstep(0.00012, 0.00070, sigma0);
             float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
-                                           MP_SIGMA_PLAUS_HI, sigma0);
+                                           MP_SIGMA_PLAUS_HI,
+                                           sigma0 / grain_extreme);
             float spatial_reliability = count_r * amp_r * plaus * q_cov;
             float reliability_raw = spatial_reliability * q_random * q_still;
             float reliability = reliability_raw * q_source;
@@ -1862,7 +1881,9 @@ void lean_observe() {
                 float pobs_title = pobs / clamp(m_shot_gain, 1.0, 4.0);
                 float clipped = clamp(pobs_title, 0.25 * m_master_p[b],
                                       4.0 * m_master_p[b]);
-                clipped = min(clipped, MP_MASTER_P_MAX);
+                clipped = min(clipped,
+                              MP_MASTER_P_MAX * grain_extreme
+                              * grain_extreme);
                 // 3:1, not 10:1: a blind rate asymmetry rectifies fluctuating
                 // evidence (fire/texture sigma jitter) into a one-way climb.
                 // The erasure prior still earns a downward discount, but down
@@ -2003,12 +2024,11 @@ void lean_observe() {
             // the 3-8x band earns a partial ceiling and only proven
             // heavy grain collects it all. The floor is the taste
             // constant: 0.75 sat as still-hot on LvB (2026-08-22
-            // re-sit); 0.45 is the author's deeper pick (~9% bed-sigma
-            // trim at anchor 4).
+            // re-sit); 0.3 is the author's deeper pick.
             ev_gate = max(ev_gate,
                           smoothstep(0.10, 0.35, m_master_w[gb])
                         * smoothstep(1.6, 3.0, gratio)
-                        * mix(0.45, 1.0, smoothstep(3.0, 8.0, gratio)));
+                        * mix(0.3, 1.0, smoothstep(3.0, 8.0, gratio)));
         }
 
         for (int b = 0; b < MP_TONE_BINS; b++) {
@@ -2016,7 +2036,8 @@ void lean_observe() {
             float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
             float amp_r = smoothstep(0.00012, 0.00070, sigma0);
             float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
-                                           MP_SIGMA_PLAUS_HI, sigma0);
+                                           MP_SIGMA_PLAUS_HI,
+                                           sigma0 / grain_extreme);
             float spatial_reliability = count_r * amp_r * plaus * q_cov;
             float reliability_raw = spatial_reliability * q_random * q_still;
             float reliability = reliability_raw * q_source;

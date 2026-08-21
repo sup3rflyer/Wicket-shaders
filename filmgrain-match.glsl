@@ -530,6 +530,32 @@ float prior_tone_shape(int b) {
     return shadow * highlight;
 }
 
+// Fraction of the master's grain POWER presumed erased by the delivery
+// encode. Recalibrated 2026-08-20 to the paired-encode censoring audit
+// (film corpus + anime ladder + an official streaming AVC/HEVC/AV1
+// set): picture-wide missing power measures ~0.39 at remux/UHD-BD
+// tier, 0.55-0.75 in AVC 5M film mids, ~0 on modern digital anime AVC
+// deliveries — against the old 0.80-0.92 profile. Because the restore
+// target multiplies this by an evidence-reduced bed_deficit whose
+// flat-cell survivor credit is optimistic (flats are where censoring
+// is weakest), the end-to-end exact value is tier-dependent: ~0.46 at
+// remux/UHD-BD, ~0.7-0.9 at AVC 5M film. This profile sits at the
+// remux-exact end. The function below is the legacy film-exact CEILING
+// (author-validated on heavy-grain titles); MP_MISSING_FLOOR_SCALE
+// scales it to the recalibrated clean/remux-exact FLOOR (the two
+// profiles are exactly proportional), and the evidence key at the
+// restore target blends between them per bin. Accepted under-restored
+// cells: deliveries whose censoring erased the evidence itself —
+// low-bitrate AV1 and streaming HEVC/AV1 rungs (46-83% censoring vs
+// their AVC sibling) read as low-evidence and stay at the floor. The
+// tone slope is retained from the legacy profile; per-bin shape
+// evidence is thin and class-contradictory (film brights censor
+// hardest, anime brights survive AVC) and supports no recalibrated
+// shape. Recovering the erased-evidence cells needs the
+// delivery-health keying planned above (m_structure_ratio), which
+// requires its own evidence audit first — that keying's natural home
+// is this same floor scale.
+#define MP_MISSING_FLOOR_SCALE 0.60
 float prior_missing_fraction(int b) {
     float q = (float(b) + 0.5) / float(MP_TONE_BINS);
     float y = q * q;
@@ -635,7 +661,8 @@ void lean_observe() {
                 // This is the acquisition posterior, not a decorative floor:
                 // absent delivery evidence, all capture paths still imply a
                 // conservative amount of master grain throughout the range.
-                m_restore_p[b] = prior_missing_fraction(b) * p;
+                m_restore_p[b] = MP_MISSING_FLOOR_SCALE
+                               * prior_missing_fraction(b) * p;
                 eff_sum += m_char_p[b] + restore_gain * restore_gain
                          * m_restore_p[b];
             }
@@ -1665,6 +1692,10 @@ void lean_observe() {
         }
         bool broad_clean = clean_bins >= 3
                         && clean_last - clean_first >= 2
+                        // The span must reach the mids: AVC censoring is
+                        // near-total in crushed darks, so a dark-only clean
+                        // read is uninformative (see the rate note below).
+                        && clean_last >= 3
                         && coverage >= 0.35
                         && q_still >= 0.80
                         && clean_peak <= 0.00018
@@ -1689,18 +1720,26 @@ void lean_observe() {
             // Downward target is the level the clean window actually measures
             // (floored), never a fixed drain: reversibility means converging
             // to the evidence, not to zero. The rate carries the censoring
-            // model: clean evidence is collectable ONLY from flat, still
-            // regions — exactly where delivery erasure is near-certain — so
-            // quiet flats get ~the survival complement (~0.12) of face-value
-            // weight. A genuinely clean title still converges over an
-            // episode; held cels and dark still scenes inside a grainy title
-            // can no longer hole the base between presence refills (presence
-            // runs ~40x faster). Field bug 2026-07-17 night: the previous
-            // 0.002 full-rate lane drained titles to the floor during any
-            // long quiet scene and whole shots rendered no grain at all.
+            // model: clean evidence comes from flat, still regions, and the
+            // 2026-08-20 paired-encode audit measured FLAT-STILL reads (not
+            // picture-wide loss) as 80-100% trustworthy on AVC-class
+            // deliveries — so they get ~half of face-value weight, not the
+            // old ~0.12 survival complement. That is 4x the previous rate
+            // at EVERY confidence (the anneal floor now equals the old
+            // full rate), which is safe only because eligibility requires
+            // the clean span to reach a mid tone bin: darks censor
+            // near-totally on AVC, so a dark still hold inside a grainy
+            // title reads clean there, and at 4x it would hole the base
+            // between presence refills (presence runs ~10x faster) — the
+            // shape of the 2026-07-17 field bug, where a 0.002 FULL-RATE
+            // UNGATED lane drained titles to the floor during long quiet
+            // scenes and whole shots rendered no grain at all. Mids survive
+            // AVC on every measured class, so a grainy title cannot qualify
+            // anywhere its grain is actually erased; a genuinely clean
+            // title still converges within an episode.
             float clean_target = max(represented_peak * represented_peak,
                                      0.25 * prior_base_p);
-            float clean_rate = 0.00025 * clean_q
+            float clean_rate = 0.001 * clean_q
                              * mix(1.0, 0.25,
                                    smoothstep(0.05, 0.50, m_title_conf));
             m_title_power = mix(m_title_power, clean_target, clean_rate);
@@ -1941,6 +1980,26 @@ void lean_observe() {
                        * q_random * q_still;
         m_bed_ema = mix(bed_prior, bed_meas, bed_rate);
 
+        // Title-class certificate for the censoring key below: only
+        // exposure-safe DARK-bin evidence may certify heavy grain. The
+        // known exposure-conflation residual books contaminated master
+        // power UPWARD (practicals inside dark scenes land in the
+        // mid-bright bins — the M3 climber measured 2.2-2.5x prior on
+        // the motivating title, and an ungated per-bin key re-inflated
+        // exactly those bins to the ceiling in the 2026-08-21 trace),
+        // so it cannot inflate b1/b2 — while every measured grainy
+        // class shows dark-bin evidence (lain 12x, cybercity 12x,
+        // ladies 4x, edgerunners 4x prior vs aldnoah 1.4x, clean 1.0x).
+        float ev_gate = 0.0;
+        for (int gb = 1; gb <= 2; gb++) {
+            float gshape = prior_tone_shape(gb);
+            float gratio = m_master_p[gb]
+                         / max(gshape * gshape * prior_base_p, 1.0e-12);
+            ev_gate = max(ev_gate,
+                          smoothstep(0.10, 0.35, m_master_w[gb])
+                        * smoothstep(1.6, 3.0, gratio));
+        }
+
         for (int b = 0; b < MP_TONE_BINS; b++) {
             float sigma0 = sigma_band[b * MP_BANDS];
             float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
@@ -1958,7 +2017,24 @@ void lean_observe() {
             // quiet bin must be allowed to render below the title curve, or
             // downward per-bin learning is presentation-inert.
             float master = mix(title_curve, learned_master, local_q);
-            float missing_fraction = prior_missing_fraction(b);
+            // Evidence-keyed censoring (author direction 2026-08-20 night):
+            // encoders censor grain roughly in proportion to how much there
+            // is to code — measured missing power tracks grain character
+            // (clean digital anime ~0; film 0.39 at remux, 0.55-0.75 at
+            // AVC 5M). A bin whose OWN measured master sits well above the
+            // prior level earns the legacy film-exact fraction, but only
+            // on a title the dark-bin certificate above proves grainy;
+            // prior-level, unevidenced, or measured-quiet bins keep the
+            // recalibrated clean/remux floor. Keyed to LOCAL per-bin
+            // evidence, never the title curve: title_power saturates on
+            // dark-survivor titles and a title-level key would re-inflate
+            // their quiet mids.
+            float ev_ratio = m_master_p[b]
+                           / max(shape * shape * prior_base_p, 1.0e-12);
+            float ev_q = ev_gate * local_q
+                       * smoothstep(1.3, 2.8, ev_ratio);
+            float missing_fraction = prior_missing_fraction(b)
+                                   * mix(MP_MISSING_FLOOR_SCALE, 1.0, ev_q);
             float obs_weight = clamp(m_shot_obs_w[b], 0.0, 1.0);
             float char_target = MP_COMPLEMENT_POWER * master;
             float restore_target = bed_deficit * missing_fraction * master;

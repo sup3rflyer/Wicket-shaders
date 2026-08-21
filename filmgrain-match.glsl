@@ -1995,9 +1995,20 @@ void lean_observe() {
             float gshape = prior_tone_shape(gb);
             float gratio = m_master_p[gb]
                          / max(gshape * gshape * prior_base_p, 1.0e-12);
+            // Certification is binary-ish at 3.0x, but the ceiling GRANT
+            // keeps ramping: the author's sitting (2026-08-22) found
+            // mid-anchor titles (~4x: Ladies vs Butlers 3.95, Edgerunners
+            // 4.09) borderline overgrained at the full legacy ceiling
+            // while heavy anchors (Lain/CyberCity ~12x) read right, so
+            // the 3-8x band earns a partial ceiling and only proven
+            // heavy grain collects it all. The floor is the taste
+            // constant: 0.75 sat as still-hot on LvB (2026-08-22
+            // re-sit); 0.45 is the author's deeper pick (~9% bed-sigma
+            // trim at anchor 4).
             ev_gate = max(ev_gate,
                           smoothstep(0.10, 0.35, m_master_w[gb])
-                        * smoothstep(1.6, 3.0, gratio));
+                        * smoothstep(1.6, 3.0, gratio)
+                        * mix(0.45, 1.0, smoothstep(3.0, 8.0, gratio)));
         }
 
         for (int b = 0; b < MP_TONE_BINS; b++) {

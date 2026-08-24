@@ -1,5 +1,18 @@
-// CelFlare v5.20 — Illumination-Decomposition SDR→HDR Expansion
+// CelFlare v5.21 — Illumination-Decomposition SDR→HDR Expansion
 // Copyright (C) 2026 Agust Ari · GPL-3.0
+//
+// v5.21 evens out specular pop across low-amplitude texture. The steep spec
+// ramp multiplies whatever local contrast the source has near its onset by
+// the ramp slope, so film grain and surface mottle straddling the onset
+// rendered as hot speckle and curdled blotches (measured: the applied
+// multiplier field ran ~3x rougher than the source's own texture in the
+// 0.90-1.00 band). The lock/lift can't reach this — their engagement
+// evidence is spec-supported mass, which collapses exactly at the straddle
+// boundary. New cf_spec_texture feeds the ramp a drive whose deviation from
+// a same-surface wide reference (antipodal 1/4-res pairs, 8/20 px reach) is
+// soft-compressed at texture amplitude and identity at edge amplitude:
+// bodies keep their pop, texture stops being ramp-amplified, glints and
+// smooth falloffs are untouched by construction.
 //
 // v5.20 hardens the scene/pump state machine against its cut detector. An
 // event-vs-cut classifier stops frame-filling in-scene brightenings — the
@@ -77,7 +90,7 @@
 //@shampv output trc=pq primaries=bt.2020
 //@shampv ref-white-param cf_ref_white
 //@shampv choice cf_debug off bypass illum expand spatial spec pump warm-skin stats mv-offset mv-evidence mv-residual additive-proof
-//@shampv active-if cf_spec_bonus 1 cf_spec cf_spec_stab cf_spec_floor
+//@shampv active-if cf_spec_bonus 1 cf_spec cf_spec_stab cf_spec_floor cf_spec_texture
 //@shampv active-if cf_light_pump 1 cf_pump
 //@shampv step cf_spec_radius 0.5
 
@@ -155,6 +168,13 @@
 //!MINIMUM 2.0
 //!MAXIMUM 6.0
 6.0
+
+//!PARAM cf_spec_texture
+//!DESC Texture-evened spec drive (experimental). Grain/mottle straddling the spec onset no longer gets its contrast ramp-amplified — the area keeps its pop, per-pixel crunch shrinks. Isolated glints, edges and smooth falloffs untouched. Where it owns a surface it also relaxes the cf_spec_stab lock/lift and the cf_spec_floor weight (one mechanism at a time). 0 = raw drive · 1 = shipped tune · ↑ 2 = overdrive (evens harder, deeper corrections).
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 2.0
+1.0
 
 //!PARAM cf_pump
 //!DESC Light pump — temporary surge on sustained brightening (explosions, tunnel exits, spells). ↑ = stronger surge · 1 = shipped · 0 = off.
@@ -3768,8 +3788,9 @@ void hook() {
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
 //!BIND MOTION_FLOW
+//!BIND CELFLARE_DS
 //!COMPUTE 16 16
-//!DESC CelFlare v5.20 (motion-aware additive A2 + impact-weighted spec)
+//!DESC CelFlare v5.21 (motion-aware additive A2 + texture-evened spec)
 
 // =============================================
 //  MAIN TUNING — deep anchors. The supported user surface is the cf_* block
@@ -4202,6 +4223,111 @@ void hook() {
 // (the GRAIN_RING_LIM philosophy — smooth the noise, never restructure).
 // Only the spec sat gate consumes this; the Oklab fast path keeps raw sat.
 #define SPEC_SAT_STAB_LIM      0.04
+// Texture-compressed drive (v5.21). The ramp compresses 0.90..1.0 into 0..1,
+// so it multiplies local source contrast near onset by its slope (~10x):
+// +/-0.02..0.03 of grain/mottle straddling the onset becomes multiplier
+// differences of tens of percent in nits (2026-08-23 moon capture: applied
+// multiplier field ~3x rougher than the source texture baseline in the
+// 0.90-1.00 band). The lock+lift above cannot cover this class: their
+// engagement evidence is spec-supported mass, which collapses exactly at the
+// straddle boundary (half the neighbourhood below onset = one cross-edge tap
+// rejects each direction), releasing to the raw ramp precisely where the
+// artifact lives. Fix: the ramp reads a drive whose deviation d from a
+// same-surface wide reference is soft-compressed at texture amplitude
+// (|d| < TEX_LO: slope TEX_SLOPE) and identity at edge amplitude
+// (|d| > TEX_HI). No evidence gate to collapse — |d| itself separates
+// texture from structure.
+// Honesty notes (2026-08-23 devil's-advocate + compute-audit rounds):
+// - Identity on large deviations is delivered by the BILATERAL WINDOW, not
+//   the knee: taps further than TEX_RANGE_HI from the center are rejected,
+//   so on a glint/edge/deep pit the reference collapses toward the center
+//   and d shrinks — |d| physically cannot exceed ~0.053 with the shipped
+//   acceptance (weight collapse caps it), so pass_t tops out ~0.47 and
+//   compression never fully releases via the knee (see the TEX_HI note:
+//   the knee must stay wide for monotonicity, so this is accepted).
+// - Any map compressive at small |d| and identity at large source
+//   deviation must have local gain > 1 somewhere between (calculus, not a
+//   tuning slip). In SOURCE-deviation space the steepening concentrates
+//   where the bilateral window collapses (source deviation ~0.09-0.11,
+//   local slope up to ~2.7), i.e. at true edge amplitude where the absolute
+//   displacement is already < ~0.003 drive units — edge steepening, not a
+//   level shift. Mottle at 0.02-0.04 stays net-compressed throughout.
+// - The correction is clamped in RAMP units at SPEC_TEX_RAMP_MAX (the
+//   strong lift's ceiling): a drive-unit bound is the wrong currency here
+//   because the ramp multiplies drive deltas ~10x. The roof is what makes
+//   the 2026-07-16 cloud-shoulder class structurally impossible. Downward
+//   correction additionally fades to zero above Y = TEX_CLIP_LO so genuine
+//   source clip (super-white included) keeps its full plateau ramp
+//   (rule 1); grain spikes below that stay trimmable.
+// - spec_tex_engage (the lock/lift/impact fade) requires BOTH a compressed
+//   deviation AND real donor mass (TEX_CONF band on accepted weight):
+//   d ~ 0 alone is ambiguous — total tap rejection also produces it, and
+//   an engage keyed on |d| alone force-disabled the catchlight floor and
+//   the deep-pit lift (2026-08-23 compute audit, fixed same day).
+// - Thin DARK structures on a bright field (a 3-6 px cel line 0.02-0.05
+//   below its field) read as coherent pits to the pair gather and get
+//   their SPEC distinction reduced toward the field — the same fill
+//   direction the lift applies to pepper pits, on a wider footprint, spec
+//   channel only; total output stays monotone in Y. This is the
+//   mechanism's real tradeoff: A/B line art over bright fields.
+// - Monotonicity in Y is exact for a fixed reference; the reference's
+//   center dependence (bilateral weights) was numerically swept over
+//   bimodal straddle configurations without finding an inversion, and the
+//   ramp-space roof bounds any residual to +/-SPEC_TEX_RAMP_MAX.
+// Thin BRIGHT strands/catchlights: both antipodal taps miss the strand,
+// |d| large, identity. Smooth falloffs: pair symmetry tracks the gradient,
+// d ~ 0, identity. Grain pits just below onset near a bright field are
+// partially pulled above it — same direction and magnitude class as the
+// lift's below-onset pad.
+// (Considered and rejected: bounded reuse of PASS 1's Y_decision as the
+// reference — zero extra fetches, but GRAIN_RANGE_MAX releases it to raw
+// above 0.95, exactly the worst measured band, and its bright-asymmetric
+// blur does not preserve affine gradients.)
+#define SPEC_TEX_LO         0.010   // fully compressed below (grain scale)
+#define SPEC_TEX_HI         0.100   // knee end. DELIBERATELY WIDE: |d| itself caps at
+                                    // ~0.053 (bilateral collapse), so pass_t tops out
+                                    // ~0.47 and the upper knee half never fires — but
+                                    // narrowing HI to the reachable range steepens the
+                                    // knee past the monotonicity budget (HI=0.05 swept
+                                    // 1302/2601 bimodal configs NON-MONOTONE, local
+                                    // slope -10 at the re-acceptance shoulder; HI=0.10
+                                    // sweeps clean). Identity on edges comes from the
+                                    // bilateral window, not from this knee.
+#define SPEC_TEX_SLOPE      0.15    // retained texture slope inside the knee (at knob 1)
+#define SPEC_TEX_SLOPE_MIN  0.05    // slope floor at knob 2 (never 0: no true flattening)
+#define SPEC_TEX_RAMP_MAX   0.20    // ramp-space roof on the correction (at knob 1;
+                                    // scales up to 2x at knob 2 — overdrive mapping below)
+#define SPEC_TEX_CLIP_LO    0.995   // downward correction fades out above (rule 1)
+#define SPEC_TEX_CONF_LO    0.15    // engage donor-mass band (fraction of 16)
+#define SPEC_TEX_CONF_HI    0.50
+#define SPEC_TEX_BORDER_FEATHER 8.0 // px of engage/drive fade inside the border guard
+#define SPEC_TEX_R1         2.0     // ring 1, DS texels (= 8 full-res px)
+#define SPEC_TEX_R2         5.0     // ring 2, DS texels (= 20 full-res px)
+#define SPEC_TEX_R3         10.0    // ring 3, DS texels (= 40 full-res px, large mottle)
+#define SPEC_TEX_SIDE_FRAC  0.5     // one-sided residual weight (near-edge evening):
+                                    // when a pair dies because its FAR tap crossed an
+                                    // outline, the surviving near-side tap still donates
+                                    // at this discount. A tap only ever contributes if
+                                    // it individually matches the center, so the outline
+                                    // itself is never averaged in — this relaxes the
+                                    // both-sides-agree rule near edges, not the
+                                    // same-surface rule. On smooth gradients the two
+                                    // taps carry equal weight and the residual cancels,
+                                    // preserving the affine identity to first order.
+// Overdrive (knob 1..2): the author asked for a stronger reach. Above 1 the
+// mix weight and engage stay at full and two internals scale instead:
+// retained slope fades SLOPE -> SLOPE_MIN (texture evened harder, never to
+// a true flat), and the ramp roof scales RAMP_MAX -> 2x (top-band
+// corrections stop saturating the clamp). The knee geometry (LO/HI) is
+// FIXED — it is monotonicity-constrained, not a strength lever.
+// The wide reference has its own bilateral acceptance, scaled to the
+// compressor's knee rather than the lock's: taps must stay accepted across
+// the whole amplitude class being compressed (up to ~TEX_HI), else mottle
+// half-rejects its own donors, the reference collapses toward the center,
+// |d| is under-measured and the knee under-compresses. Fade ends at true
+// edge scale, where the pair-min still hard-rejects one-sided boundaries.
+#define SPEC_TEX_RANGE_LO   0.035
+#define SPEC_TEX_RANGE_HI   0.120
 // Luminance-field ring blend (2026-07-16, parked for the upper-stabilizer
 // A/B). Its support-preserving v3 form remains below for comparison, but the
 // field test needs a pure tonal path with no 9px spec operator.
@@ -4781,6 +4907,88 @@ vec4 spec_local_reference(float center_y, float center_sat, float y_low,
     return vec4(y_ref, confidence, support, lift_y);
 }
 
+// Same-surface wide reference for the texture-compressed drive (v5.21, see
+// the SPEC_TEX block). 12 antipodal pairs of CELFLARE_DS taps (ring 1 at
+// SPEC_TEX_R1 texels = 8 full-res px, ring 2 at SPEC_TEX_R2 = 20 px,
+// ring 3 at SPEC_TEX_R3 = 40 px for large-scale mottle) plus a center
+// anchor. Pair weight = min of the two taps' bilateral weights against the
+// RAW center luma: a pair mean equals the center on an affine field, so
+// smooth gradients and falloffs are exact identities (the v5.18 pair-lock
+// argument). One cross-edge tap kills its pair's SYMMETRIC weight; the
+// surviving matching tap keeps donating one-sided at SPEC_TEX_SIDE_FRAC
+// discount so evening reaches outlines (the rejected tap itself never
+// contributes — no cross-edge donation). CELFLARE_DS is
+// the aliased 1/4-res box — fine here: averaging 25 box taps IS deliberate
+// filtering; the "never point-sample it as if it were smooth" rule targets
+// single-texel reads. DS luma is consistent with Y_gamma (PASS 1 leaves
+// rgb untouched; PASS 2 boxes it; luma is linear in rgb). Borders: the
+// caller guards rings 1-2 (22 px feathered skip — clamp-to-edge collapses
+// a pair onto the same edge texel and silently breaks antipodal symmetry);
+// ring 3 self-guards per pair instead (a 42 px dead zone would show raw
+// crunch as a visible band on full-frame bright content), dropping any
+// pair whose tap leaves the picture — a dropped pair is weight 0, which
+// biases nothing.
+float spec_texture_reference(float center_y, out float donor_mass) {
+    // Ring 1 fixed on the axes+diagonals (deterministic short-range core,
+    // the lock's inner-3x3 lesson); rings 2-3 base-phased 22.5 deg AND
+    // hash-rotated per pixel (static, same hash as the lock's outer ring):
+    // v5.19 convicted FIXED outer geometry — drifting content sweeps a
+    // fixed lattice in phase and oscillates whole regions coherently.
+    // Rotation noise on directional structure lands in d and is then
+    // knee-compressed, so the reference scatter it introduces is bounded.
+    const vec2 tex_pairs[12] = vec2[12](
+        vec2(SPEC_TEX_R1, 0.0), vec2(0.0, SPEC_TEX_R1),
+        vec2(SPEC_TEX_R1, SPEC_TEX_R1), vec2(SPEC_TEX_R1, -SPEC_TEX_R1),
+        vec2( 4.6194, 1.9134), vec2( 1.9134, 4.6194),   // SPEC_TEX_R2 at
+        vec2(-1.9134, 4.6194), vec2(-4.6194, 1.9134),   // 22.5/67.5/112.5/157.5 deg
+        vec2(SPEC_TEX_R3, 0.0), vec2(0.0, SPEC_TEX_R3), // ring 3 axes+diagonals
+        vec2(7.0711, 7.0711), vec2(7.0711, -7.0711));   // (7.0711*sqrt2 = R3)
+    vec2 tex_hpx = HOOKED_pos * HOOKED_size;
+    float tex_hang = fract(sin(dot(tex_hpx, vec2(12.9898, 78.233))) * 43758.5453) * 6.2832;
+    float tex_hca = cos(tex_hang), tex_hsa = sin(tex_hang);
+    vec2 tex_lo = 0.5 * CELFLARE_DS_pt;
+    vec2 tex_hi = vec2(1.0) - tex_lo;
+    float y_sum = center_y * SPEC_LOCK_CENTER_W;
+    float w_sum = SPEC_LOCK_CENTER_W;
+    for (int i = 0; i < 12; i++) {
+        vec2 o = tex_pairs[i];
+        if (i >= 4)
+            o = vec2(o.x * tex_hca - o.y * tex_hsa,
+                     o.x * tex_hsa + o.y * tex_hca);
+        o *= CELFLARE_DS_pt;
+        vec2 pp = CELFLARE_DS_pos + o;
+        vec2 pn = CELFLARE_DS_pos - o;
+        if (i >= 8
+            && !(all(greaterThanEqual(pp, tex_lo)) && all(lessThanEqual(pp, tex_hi))
+              && all(greaterThanEqual(pn, tex_lo)) && all(lessThanEqual(pn, tex_hi))))
+            continue;
+        float yp = get_luma(CELFLARE_DS_tex(pp).rgb);
+        float yn = get_luma(CELFLARE_DS_tex(pn).rgb);
+        float wp = 1.0 - smoothstep(SPEC_TEX_RANGE_LO, SPEC_TEX_RANGE_HI,
+                                    abs(yp - center_y));
+        float wn = 1.0 - smoothstep(SPEC_TEX_RANGE_LO, SPEC_TEX_RANGE_HI,
+                                    abs(yn - center_y));
+        float wp2 = wp * wp;
+        float wn2 = wn * wn;
+        float w = min(wp2, wn2);
+        // One-sided residual (see SPEC_TEX_SIDE_FRAC): the acceptance excess
+        // of the stronger tap keeps donating at a discount, so the evening
+        // reaches within one tap of an outline instead of dying a full ring
+        // radius away (author field note 2026-08-23: "doesn't work close to
+        // outlines/edges").
+        float w_res = (max(wp2, wn2) - w) * SPEC_TEX_SIDE_FRAC;
+        y_sum += (yp + yn) * w + ((wp2 > wn2) ? yp : yn) * w_res;
+        w_sum += 2.0 * w + w_res;
+    }
+    // Accepted donor weight, 0..24. The caller keys spec_tex_engage on this:
+    // |d| ~ 0 is ambiguous on its own (same-surface texture, but ALSO every
+    // tap rejected — an isolated glint or deep pit collapses the reference
+    // onto the center anchor bit-exactly, d == 0). Donor mass separates the
+    // two: no donors = the compressor knows nothing here.
+    donor_mass = w_sum - SPEC_LOCK_CENTER_W;
+    return y_sum / w_sum;
+}
+
 // ---------------------------------------------------------------------------
 // WORKGROUP STATE SNAPSHOT — NV-Vulkan uncached SSBO reads
 // ---------------------------------------------------------------------------
@@ -5210,8 +5418,100 @@ vec4 cf_shade() {
         // apl_t=0.5 with value SPEC_Y_LOW_MID_BUMP.
         float spec_y_low = SPEC_Y_LOW
                          + SPEC_Y_LOW_MID_BUMP * apl_t * (1.0 - apl_t) * 4.0;
-        float ordinary_r = pow(smoothstep(spec_y_low, 1.0, Y_gamma), spec_gamma);
-        float raw_ordinary_r = ordinary_r;
+        // Texture-compressed drive (v5.21, see SPEC_TEX block + the
+        // spec_texture_reference header). Same guard family as the stab
+        // block below, plus its own border skip (hash-rotated ring 2 can
+        // reach the full 5.0-texel radius on any axis + 0.5 bilinear =
+        // 22 px) with an 8 px feather inside it — a hard bool stepped the
+        // drive, engage AND impact_w at once and would print a rectangular
+        // ring just inside the frame on full-frame bright content.
+        // Compression can pull a grain pit from just below onset into the
+        // ramp — that is the SUPPORT_PAD term, the same fill direction the
+        // lift already applies. The lock/lift below keep reading raw
+        // Y_gamma evidence; only this smoothstep sees the compressed drive.
+        float y_spec_drive = Y_gamma;
+        float spec_tex_engage = 0.0;
+        vec2 tex_px = HOOKED_pos * HOOKED_size;
+        float tex_guard = SPEC_TEX_R2 * 4.0 + 2.0;
+        float tex_border_w = clamp((min(min(tex_px.x, tex_px.y),
+                                        min(HOOKED_size.x - tex_px.x,
+                                            HOOKED_size.y - tex_px.y))
+                                    - tex_guard) * (1.0 / SPEC_TEX_BORDER_FEATHER),
+                                   0.0, 1.0);
+        if (cf_spec_texture > 0.0
+            && cf_spec > 0.0
+            && cf_strength > 0.0
+            && applied_spec_signal > 1e-5
+            && Y_gamma > spec_y_low - SPEC_LOCK_SUPPORT_PAD
+            && tex_border_w > 0.0)
+        {
+            float donor_mass;
+            float y_texref = spec_texture_reference(Y_gamma, donor_mass);
+            float d = Y_gamma - y_texref;
+            float pass_t = smoothstep(SPEC_TEX_LO, SPEC_TEX_HI, abs(d));
+            // Overdrive mapping (see SPEC_TEX block): knob 0..1 scales the
+            // mix; knob 1..2 holds the mix at full and fades the retained
+            // slope toward SLOPE_MIN instead.
+            float tex_amt = min(cf_spec_texture, 1.0);
+            float tex_over = clamp(cf_spec_texture - 1.0, 0.0, 1.0);
+            float tex_slope = max(SPEC_TEX_SLOPE * (1.0 - tex_over),
+                                  SPEC_TEX_SLOPE_MIN);
+            float y_comp = y_texref
+                         + d * (tex_slope + (1.0 - tex_slope) * pass_t);
+            y_spec_drive = mix(Y_gamma, y_comp, tex_amt * tex_border_w);
+            // Division of labor with the stab block below (measured on the
+            // moon replay: with the drive compressed, the lock/lift/impact
+            // evidence smoothsteps became the DOMINANT residual roughness in
+            // textured fields — their mid-range evidence half-applies
+            // corrections pixel-to-pixel). Engage = the compressor OWNS this
+            // pixel: deviation in the compressed class AND enough accepted
+            // donor mass to make the reference real. The donor term is
+            // load-bearing (2026-08-23 compute audit): |d| ~ 0 alone is
+            // ambiguous — an isolated glint or deep pit rejects every tap
+            // and collapses the reference onto the center bit-exactly
+            // (d == 0), and keying on |d| alone force-disabled the impact
+            // weight on catchlights (the cf_spec_floor lever) and the lift
+            // on the deep pits it exists to fill. With no donors, engage = 0
+            // and every v5.18/19 mechanism operates unchanged.
+            float tex_conf = smoothstep(SPEC_TEX_CONF_LO, SPEC_TEX_CONF_HI,
+                                        donor_mass * (1.0 / 24.0));
+            spec_tex_engage = tex_amt * (1.0 - pass_t) * tex_conf
+                            * tex_border_w;
+        }
+        // Ramp-space roof (see SPEC_TEX block): the compressed drive may
+        // move the ramp at most +/-SPEC_TEX_RAMP_MAX from the raw ramp —
+        // the currency that actually bounds shoulders and fills. No
+        // hot_release twin here, deliberately (A/B'd 2026-08-23: a
+        // lock-style release of downward correction above ramp 0.82
+        // protected the near-clip grain spikes that ARE the measured crunch
+        // and erased the whole top-band win). Charter check: a clipped
+        // core's INTERIOR is identity by construction (its taps are also
+        // clipped, d ~ 0) and super-white stays raw; only the non-affine
+        // rim of a sub-footprint core gets a bounded, monotone tip trim —
+        // the same de-emphasis direction the impact weight already applies
+        // to tiny isolated points. Sitting A/B for this class: candle
+        // flames, star fields, catchlights. At cf_spec_texture=0 the drive
+        // equals Y_gamma and this is an exact identity.
+        float raw_ramp_r = pow(smoothstep(spec_y_low, 1.0, Y_gamma), spec_gamma);
+        float tex_roof = SPEC_TEX_RAMP_MAX
+                       * (1.0 + clamp(cf_spec_texture - 1.0, 0.0, 1.0));
+        float tex_ramp_corr = clamp(pow(smoothstep(spec_y_low, 1.0, y_spec_drive),
+                                        spec_gamma) - raw_ramp_r,
+                                    -tex_roof, tex_roof);
+        // Genuine source clip is never attenuated (rule 1): downward
+        // correction fades out over the last half code value before clip,
+        // so a super-white or exactly-clipped center keeps its full plateau
+        // ramp (the overshoot term below is raw as well). Grain spikes at
+        // 0.96-0.99 stay trimmable — the rejected hot_release variant
+        // protected everything above ramp 0.82 and erased the top-band win.
+        if (tex_ramp_corr < 0.0)
+            tex_ramp_corr *= 1.0 - smoothstep(SPEC_TEX_CLIP_LO, 1.0, Y_gamma);
+        float ordinary_r = raw_ramp_r + tex_ramp_corr;
+        // The lift cap below means "relative to this pixel's own UNMODIFIED
+        // ramp" — capture the raw ramp, not the corrected one (2026-08-23
+        // compute audit: capturing post-correction silently lowered the
+        // lift ceiling by up to RAMP_MAX on compressed pixels).
+        float raw_ordinary_r = raw_ramp_r;
 
         // Edge-aware LOCAL RANGE LOCK in spec-strength space. The bilateral
         // luma field produces a reference ramp and evidence only. Raw r stays
@@ -5259,6 +5559,12 @@ vec4 cf_shade() {
             // includes the lift channel (filled pits keep body weight).
             impact_w = mix(cf_spec_floor, 1.0,
                            smoothstep(0.0, SPEC_IMPACT_MASS, impact_evidence));
+            // Compressed-texture fields are same-surface by construction
+            // (small |d| WITH real donor mass) — impact evidence noise
+            // there is spurious. An isolated glint rejects every wide tap,
+            // so its donor mass is 0, engage is 0, and this de-emphasis
+            // path (the cf_spec_floor catchlight lever) is untouched.
+            impact_w = mix(impact_w, 1.0, spec_tex_engage);
 
             // Bounded sat-noise deadband for the spec sat gate (v5.19, see
             // SPEC_SAT_STAB_LIM block). Never fed to the Oklab fast path.
@@ -5284,7 +5590,8 @@ vec4 cf_shade() {
                 hot_release -= smoothstep(SPEC_LOCK_HOT_LO,
                                           SPEC_LOCK_HOT_HI, ordinary_r);
             ordinary_r = mix(ordinary_r, locked_r,
-                             cf_spec_stab * confidence * support * hot_release);
+                             cf_spec_stab * confidence * support * hot_release
+                             * (1.0 - spec_tex_engage));
 
             // STRONG ADJACENT LIFT. The pair-coherent conditional mean can set
             // a much higher floor than the former fixed-area average, but it
@@ -5306,12 +5613,15 @@ vec4 cf_shade() {
             float lift_center = smoothstep(spec_y_low - SPEC_LOCK_SUPPORT_PAD,
                                            spec_y_low, Y_gamma);
             ordinary_r = mix(ordinary_r, lift_target,
-                             cf_spec_stab * lift_evidence * lift_center);
+                             cf_spec_stab * lift_evidence * lift_center
+                             * (1.0 - spec_tex_engage));
             }
         }
         // Super-white is raw center evidence: add it after the range lock so a
         // neighbour can neither donate it nor average it away. At
-        // cf_spec_stab=0 this is algebraically the flagship local ramp.
+        // cf_spec_stab=0 AND cf_spec_texture=0 this is algebraically the
+        // flagship local ramp (the texture drive is NOT gated on
+        // cf_spec_stab — the two knobs A/B independently).
         float center_r = ordinary_r
                        + max(Y_gamma - 1.0, 0.0) * SPEC_OVERSHOOT_GAIN;
         center_r = min(center_r, SPEC_RAMP_CEIL);

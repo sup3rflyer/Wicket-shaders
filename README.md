@@ -21,30 +21,55 @@ The keybindings above use a Lua script for mpv. Ask an AI assistant to write you
 
 **Scene-adaptive SDR-to-HDR highlight expansion** with PQ BT.2020 output.
 
-Uses a spatially-modulated expansion curve driven by an illumination field (bright-biased Gaussian blur of regional luminance). All pixels in a region share the same curve parameters — local contrast preserved by construction through multiplicative application. Frame-level scene metrics (APL, contrast, bright fraction) drive continuous adaptation rather than discrete scene-type classification. Highlights expand to ~200–310 nits with specular pop on top, while midtones stay close to the SDR grade. Works with anime and live-action content.
+The goal is a professional HDR grade of the source, not an "HDR filter" look: midtones stay close to the SDR grade, highlights expand with natural gradation, and speculars get a believable amount of extra pop. The shader does no tone mapping of its own; your display does the final mapping.
 
-All supported tuning lives in the **USER TUNING block at the top of the shader** — six sliders (`cf_ref_white`, `cf_strength`, `cf_curve`, `cf_shoulder`, `cf_spec`, `cf_pump`) and per-feature toggles, each documented in place. Edit the values there, or set them from `mpv.conf` without touching the file:
-
-```ini
-glsl-shader-opts=cf_ref_white=110,cf_strength=1.2,cf_spec=0.8
-```
-
-The sliders respond live during playback (bind `glsl-shader-opts` changes to keys for real-time A/B); toggles trigger a quick recompile. `cf_strength` scales the whole effect (0 = plain SDR), `cf_curve` sets how harshly expansion ramps into the highlights (peak brightness unchanged), `cf_shoulder` softens the arrival at peak for sources whose highlights are already harsh or clipped hard, `cf_spec` scales specular pop, `cf_pump` scales the light pump. Deeper internals are tunable in each pass — at your own peril.
+Every pixel gets a smooth, monotone expansion curve of its own brightness. The curve's shape is set by an illumination field (a wide Gaussian blur of the regional brightness), so all pixels in one region share one curve: tonal order is kept and no gradient can invert, while local contrast is scaled by the curve's slope. Frame-level statistics (bright fraction, contrast, brightness key) adapt the result continuously; there is no scene-type classifier. At `cf_strength` 1 the curve peaks at about 2.4x (bright regions) to 2.7x (dark regions) of reference white; the default 0.7 scales that down, before scene adaptation, specular pop and the light pump. Works with anime and live action.
 
 Features:
-- Spatially-modulated expansion curve (per-pixel, regionally adapted by an illumination field)
-- Continuous scene adaptation (APL, contrast, bright fraction) — no discrete scene-type classifier
-- Velocity-adaptive temporal smoothing: still scenes get stable averages, gradual lighting changes adapt faster, scene cuts lock on near-instantly
-- Growing-object detection — explosions, fire, backlit reveals, and similar expanding-bright events keep their HDR pop instead of being progressively dampened as they grow
-- Bright-scene specular recovery — chrome, sun glints, headlights, and snowfield highlights still pop in daylight where normal detection would shut off
-- Specular bonus with per-pixel ramp, scene-aware peak/gamma, and saturation gating (genuine highlights pop, bright colored surfaces don't)
-- Bezold-Brücke hue compensation (regional warm-to-red rotation in Oklab — fixes warm-to-green shift on fire, sunsets, skin)
-- Pale skin saturation protection
-- Grain stabilization via compute-shader bilateral log-luma filter with shared-memory tile load
-- Expansion in Oklab with chroma attenuation for saturated pixels; fast-path bypass for near-neutrals
-- PQ-aware temporal dither to mask 8-bit banding in expanded highlights
-- Direct PQ BT.2020 output bypasses libplacebo's SDR peak clipping
-- Multiple debug visualizations for tuning (including in-frame stats overlay)
+- Spatially modulated per-pixel expansion curve, shaped by a regional illumination field
+- Picture-size-aware geometry: the illumination field scales with the picture (80 px sigma at 1080p, 160 px on a 4K or 2x-upscaled picture), so an upscaler chain looks like 1080p playback of the same title; letterboxed and 4:3 encodes keep the 1080p scale
+- Continuous scene adaptation (brightness key, contrast, bright fraction), with letterbox/pillarbox bars excluded from the statistics
+- Velocity-adaptive temporal smoothing with cut detection: still scenes are stable, lighting changes adapt faster, cuts lock on quickly; a brightening explosion or tunnel exit is not mistaken for a cut, and strobing content does not keep the state in "cut" mode
+- Growing-object detection: explosions, fire and backlit reveals keep their HDR pop instead of being dampened as they grow
+- Specular bonus on near-clip highlights, with bright-scene recovery (chrome, sun glints, headlights in daylight) and saturation gating (bright colored surfaces do not get specular pop)
+- Specular stabilization (`cf_spec_stab`): grain and mottle near the specular onset are no longer amplified by the steep specular ramp, lone outliers and pepper pits are locked or filled, and tiny isolated glints can be de-emphasized (`cf_spec_floor`). Edges, glints and smooth falloffs are left alone
+- Light pump: a temporary, exposure-like surge on sustained brightening (explosions, tunnel exits, spells). It works per region of the picture, uses a motion search so camera pans and moving lamps do not trigger it, needs several frames of proof before it opens, and releases slowly with the source instead of snapping off
+- Warm-hue correction (Bezold-Brücke): fire, sunsets and skin do not drift green as they brighten
+- Pale-skin protection (saturation restore plus a small lift in bright, cooled scenes)
+- Grain stabilization: a compute-shader bilateral filter on luma makes the expansion decision grain-stable, so film grain stays filmic after expansion
+- Expansion in Oklab at constant chromaticity, with a fast path for near-neutral pixels
+- Exact PQ encoding where the fast approximation is inaccurate (near black, and above 1800 nits per channel), plus a PQ-aware dither against 8-bit banding in expanded highlights
+- Debug views with on-screen legends (`cf_debug`)
+
+**Controls.** All controls live in the **USER TUNING block at the top of the shader**. Edit the values there, or set them from `mpv.conf` without touching the file:
+
+```ini
+glsl-shader-opts=cf_ref_white=110,cf_strength=0.8,cf_spec=1.2
+```
+
+Sliders respond live during playback (no recompile; bind `glsl-shader-opts` changes to keys for real-time A/B). Toggles and `cf_debug` trigger a quick recompile.
+
+| Control | Range | Default | Effect |
+|---------|-------|---------|--------|
+| `cf_ref_white` | 80–480 | 116 | SDR white level in nits. **Must match `hdr-reference-white`.** |
+| `cf_strength` | 0–2 | 0.7 | Overall strength. 0 = plain SDR, 1 = the full internal tune. Scales base expansion, specular pop and the light pump together. |
+| `cf_curve` | 0.6–2 | 1.2 | Ramp shape. Below 1 = gentle, broad lift; above 1 = lift concentrated on the brightest pixels, midtones closer to the SDR grade. Peak unchanged. |
+| `cf_shoulder` | 0–1 | 1.0 | How softly expansion arrives at the peak. 1 = smoothest (no steepening near clip), 0 = steepest near-clip pop. |
+| `cf_spec` | 0–2 | 1.1 | Specular pop on glints, light sources and clipped highlights. 0 = off. |
+| `cf_spec_stab` | 0–2 | 1.0 | Specular stabilization. 0 = raw specular ramp; 1 = default; above 1 = overdrive (texture evened harder, stronger corrections). |
+| `cf_spec_floor` | 0–1 | 0.45 | Share of specular pop kept by tiny isolated points (2x2 stars, lone sparkles). Coherent highlights always get full pop. 1 = uniform, 0 = isolated points get base expansion only. Needs `cf_spec_stab` > 0. |
+| `cf_pump` | 0–2 | 1.0 | Light pump strength. 0 = off. |
+| `cf_grain_stab` | 0/1 | 1 | Grain stabilization toggle. |
+| `cf_additive_pump` | 0/1 | 1 | 1 = each region pumps at its own strength (motion-checked opening). 0 = the older subtractive mode, where the regional mask can only suppress a frame-wide pump. |
+| `cf_warm_shift` | 0/1 | 1 | Warm-hue correction toggle. |
+| `cf_pale_skin` | 0/1 | 1 | Pale-skin protection toggle. |
+| `cf_debug` | 0–12 | 0 | Debug view: 1 bypass, 2 illumination field, 3 expansion, 4 base expansion, 5 specular, 6 light pump, 7 warm shift / pale skin, 8 scene stats, 9 motion offset, 10 motion evidence (11 = same as 10), 12 light-pump opening proof. |
+
+`cf_spec_stab` in detail: from 0 to 1 it fades in both parts of the stabilization (the texture-evened drive and the range lock / pit fill). From 1 to 2 those stay at full, and the texture evening gets stronger: less of the grain is passed to the specular ramp (never zero) and the largest allowed correction doubles.
+
+**Removed in v6.0** (these keys no longer exist; drop them from `glsl-shader-opts` and saved profiles): `cf_spec_bonus` (use `cf_spec=0`), `cf_light_pump` (use `cf_pump=0`), `cf_spatial_pump` (the regional pump is always on; the frame-wide-only mode pumped on camera pans), `cf_spec_scene_reject` (always on), `cf_spec_radius` (fixed at 6 px), `cf_spec_texture` (merged into `cf_spec_stab`: `cf_spec_texture=2` with `cf_spec_stab=1` is now `cf_spec_stab=2`).
+
+Load **one** CelFlare shader at a time. Never combine `CelFlare.glsl` with `CelFlare-transport.glsl`: the picture would be processed twice.
 
 **Requirements:** mpv v0.41.0+ with `vo=gpu-next`. Uses compute shaders (GLSL 4.30+) — works on the default Vulkan and D3D11 backends; OpenGL backend requires 4.3+ for native compute.
 

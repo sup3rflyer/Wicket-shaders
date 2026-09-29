@@ -147,12 +147,41 @@
 //                    stays floored at ref white (overshoot physics), so
 //                    bright saturated channels keep their grain. Values near
 //                    0.2-0.3 aggressively confine grain to low luminance.
+//   grain_source_trc the SOURCE transfer the LUMA observer reads: 0 = SDR
+//                    gamma (every SDR source, and SDR retagged for CelFlare),
+//                    1 = PQ (native HDR10 / PQ sources). libplacebo does not
+//                    tell hooks the source transfer, so the profile that routes
+//                    native-HDR sources sets it. At 1 the observer bridges each
+//                    PQ luma sample to the SDR-equivalent code at
+//                    grain_ref_white before any statistic, so native HDR is
+//                    measured in the domain the whole model is calibrated in
+//                    (raw PQ codes under-read grain ~1.9x at 10 nits, ~3.1x at
+//                    50 nits vs ref white 116). HLG and Dolby Vision profile 5
+//                    (IPT) are not PQ luma: leave them at 0 (unbridged); DV P7/P8
+//                    base layers are plain PQ (1). The observer assumes LIMITED-
+//                    range luma (black ~16/255) -- true for disc, broadcast,
+//                    streaming and the AnimeJaNai upscaler output; full-range
+//                    video (yuvj, some screen/phone captures) mis-keys the tone
+//                    bins by up to ~1.5 bins at black.
+//                    shampv still lints this file as input sdr until it can sync
+//                    grain_source_trc from the source transfer itself: set it in
+//                    the profile that routes native-HDR sources.
 //   grain_ref_white  the nit level the chain anchors SDR white to; the bridge
 //                    divides by it, so it is DESCRIPTIVE -- it must equal what
 //                    the chain actually did, not what we would prefer. Plain
 //                    mpv PQ output anchors at hdr-reference-white, which is
 //                    "auto" by default = libplacebo's BT.2408 203 nits (hence
-//                    the 203 default; measured 202.4 on this chain). shampv
+//                    the 203 default; measured 202.4 on this chain). With
+//                    grain_source_trc = 1 it is ALSO the measure anchor: the
+//                    observer reads native PQ as SDR codes against this white,
+//                    so a wrong value rescales measured grain against the
+//                    absolute evidence constants (203 vs 116 reads sigma x0.79),
+//                    not just the keying. Native PQ source -> PQ output has no
+//                    chain anchor: it is a diffuse-white choice, and measure +
+//                    apply stay self-consistent for any value; pin it to the
+//                    SDR chain's white (116 here) so the SDR-calibrated
+//                    constants land on the same nits. PQ source -> SDR output
+//                    must match libplacebo's SDR white. shampv
 //                    syncs this from hdr-reference-white ONLY while that is
 //                    pinned numeric -- so PIN IT, and any upstream SDR->PQ
 //                    encoder's own reference white gets pinned to the same
@@ -186,6 +215,7 @@
 //@shampv pause-param grain_pause
 //@shampv epoch-param state_epoch
 //@shampv toggle match_grain grain_hdr grain_headroom debug_match grain_pause
+//@shampv choice grain_source_trc gamma pq
 //@shampv step grain_gain 0.05
 //@shampv step density_combine 0.05
 //@shampv step grain_soften 0.05
@@ -325,11 +355,18 @@
 1.10
 
 //!PARAM grain_ref_white
-//!DESC SDR reference white (nits) the output chain anchors to — match hdr-reference-white (203 = its auto anchor). Only used when grain_hdr = 1.
+//!DESC SDR reference white (nits) the output chain anchors to — match hdr-reference-white (203 = its auto anchor). Used when grain_hdr = 1, and by the PQ source bridge.
 //!TYPE DYNAMIC float
 //!MINIMUM 80.0
 //!MAXIMUM 480.0
 203.0
+
+//!PARAM grain_source_trc
+//!DESC Source transfer the observer reads (choice). 0 = gamma (all SDR, incl. SDR retagged for CelFlare) · 1 = PQ native HDR (HDR10/HDR10+, DV P7/P8 base layer): measure through a bridge to SDR-equivalent codes at grain_ref_white. HLG and DV P5 are not PQ luma: leave 0.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
 
 //!BUFFER GRAIN_STATE
 //!VAR float m_observed
@@ -553,6 +590,71 @@ shared uint s_lk_by_n;
 
 float measure_luma(vec2 uv) {
     return HOOKED_tex(uv).r;
+}
+
+// Limited-range luma code span. The observer runs on raw LUMA-plane codes, which
+// are limited range for every source this chain sees (plain decode: verified
+// 2026-07-29; the AnimeJaNai upscaler output is tagged yuv444p16 limited,
+// 2026-09-29). OUTPUT maps its full-range luma into this same coordinate before
+// reading the tone bins: MEASURE_BLACK_OUT/WHITE_OUT there MUST equal these.
+#define MEASURE_BLACK (16.0 / 255.0)
+#define MEASURE_WHITE (235.0 / 255.0)
+
+// Native-PQ bridge (grain_source_trc = 1): limited PQ code -> full-range PQ ->
+// nits -> SDR-equivalent BT.1886 2.4 code at grain_ref_white -> back into the
+// limited coordinate. Black maps to black and ref white to limited white. The
+// result is clamped at the SDR container ceiling (1.0): SDR LUMA codes never
+// exceed it, and the gates that are not behind the flat test (changed-cell count
+// -> q_still, the LK pan terms, the structure sums, the cut probe) must not see
+// expanded highlights at 2-5x their SDR range; flat_ok (c < 0.985) already kept
+// those cells out of the estimator, so the clamp costs no evidence.
+// Luma-only: Y' is treated as a PQ-coded luminance -- exact on neutrals;
+// skin/sky/foliage within ~0.02 bin and ~6% sigma; saturated 709 primaries bin
+// +0.06..0.26 brighter than OUTPUT keys them (review 2026-09-29). Same ST 2084
+// constants as the OUTPUT bridge. 10-bit sources normalize black/white to
+// 64/1023 and 940/1023; these 8-bit constants sit ~0.7% off at ref white,
+// negligible for a grain amplitude. One pow is folded into a uniform factor:
+// (10000 r^(1/m1) / W)^(1/2.4) = (10000/W)^(1/2.4) * r^(1/(2.4 m1)).
+// Call sites apply it in GROUPS under one uniform branch: FXC flattens a
+// single-call conditional into a select, which would make every d3d11 frame
+// pay the pow chain even at grain_source_trc = 0 (review 2026-09-29).
+float measure_bridge(float v) {
+    float e = clamp((v - MEASURE_BLACK) / (MEASURE_WHITE - MEASURE_BLACK), 0.0, 1.0);
+    float p = pow(e, 1.0 / 78.84375);
+    float r = max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p);
+    float sdr = pow(10000.0 / max(grain_ref_white, 1.0), 1.0 / 2.4)
+              * pow(r, 1.0 / (2.4 * 0.1593017578125));
+    return min(MEASURE_BLACK + sdr * (MEASURE_WHITE - MEASURE_BLACK), 1.0);
+}
+
+// PICTURE-RELATIVE SAMPLE FOOTPRINT (2026-09-29). The lattice points fall between
+// pixels, so each tap is a hardware bilinear blend of the neighbouring raster
+// pixels -- a footprint fixed in PIXELS. On the 1080-line rasters every evidence
+// constant was calibrated on, that is one footprint; on a 2160-line raster (native
+// 4K, or a 2x upscale such as AnimeJaNai ahead of this hook) the same blend covers
+// a quarter of the picture area, so grain reads stronger (live chain: Utena x2.16,
+// The Thin Red Line x2.00; a pixel-duplicated 2x twin x1.22, a lanczos 2x twin
+// x1.61) and grainy titles fall out of the plausibility band. Taller rasters
+// therefore sample what a 1080-line raster of the same picture would give: the
+// bilinear of a virtual 1080-line raster whose cells are box averages. At an
+// integer 2x each cell centre sits on a real pixel corner, so one hardware tap per
+// cell IS the 2x2 box; four cells combine with the virtual bilinear weights
+// (exact box-downsample-then-bilinear). At <= 1080 lines the loop runs once as
+// the plain native tap, bit-identical to HEAD. The trip count is a uniform int,
+// so FXC keeps a real loop instead of flattening the 4-tap path into every frame.
+float grain_sample(vec2 uv, vec2 vsize, int ntaps) {
+    vec2 P = uv * vsize - 0.5;
+    vec2 i0 = floor(P);
+    vec2 f = P - i0;
+    float s = 0.0;
+    for (int t = 0; t < ntaps; t++) {
+        vec2 sel = vec2(float(t & 1), float((t >> 1) & 1));
+        vec2 w2 = mix(vec2(1.0) - f, f, sel);
+        float w = (ntaps > 1) ? w2.x * w2.y : 1.0;
+        vec2 tuv = (ntaps > 1) ? (i0 + sel + 0.5) / vsize : uv;
+        s += w * measure_luma(tuv);
+    }
+    return s;
 }
 
 int tone_bin(float y) {
@@ -785,6 +887,8 @@ void lean_observe() {
         vec2 probe_uv = (vec2(float(gx), float(gy)) + 0.5)
                       / vec2(float(MP_GRID_W), float(MP_GRID_H));
         float c = measure_luma(probe_uv);
+        if (grain_source_trc >= 0.5)
+            c = measure_bridge(c);
         s_probe[k] = c;
         if (c > MP_BLACKOUT_CODE_MAX)
             atomicAdd(s_raster_signal, 1u);
@@ -996,7 +1100,10 @@ void lean_observe() {
                  + across_uv * (1.0 - 2.0 * s_scan_inset_y);
             enabled = true;
         }
-        s_refine_probe[lid] = enabled ? measure_luma(uv) : 1.0;
+        float refine_v = enabled ? measure_luma(uv) : 1.0;
+        if (enabled && grain_source_trc >= 0.5)
+            refine_v = measure_bridge(refine_v);
+        s_refine_probe[lid] = refine_v;
     }
     barrier();
 
@@ -1327,25 +1434,38 @@ void lean_observe() {
     vec2 dy3 = vec2(0.0, 6.0 * uvy_per_vtex);
     vec2 dx6 = vec2(12.0 * uvx_per_vtex, 0.0);
     vec2 dy6 = vec2(0.0, 12.0 * uvy_per_vtex);
+    // Picture-relative footprint (see grain_sample): one tap at <= 1080 lines.
+    float fp_scale = HOOKED_size.y / 1080.0;
+    int fp_taps = (fp_scale > 1.05) ? 4 : 1;
+    vec2 fp_vsize = HOOKED_size / max(fp_scale, 1.0);
 
     for (uint k = lid; k < uint(MP_GRID_N); k += nthreads) {
         vec2 grid_uv = (vec2(float(k % uint(MP_GRID_W)),
                              float(k / uint(MP_GRID_W))) + 0.5)
                      / vec2(float(MP_GRID_W), float(MP_GRID_H));
         vec2 uv = active_inset + grid_uv * active_extent;
-        float c = measure_luma(uv);
-        float xm1 = measure_luma(uv - dx1);
-        float xp1 = measure_luma(uv + dx1);
-        float ym1 = measure_luma(uv - dy1);
-        float yp1 = measure_luma(uv + dy1);
-        float xm3 = measure_luma(uv - dx3);
-        float xp3 = measure_luma(uv + dx3);
-        float ym3 = measure_luma(uv - dy3);
-        float yp3 = measure_luma(uv + dy3);
-        float xm6 = measure_luma(uv - dx6);
-        float xp6 = measure_luma(uv + dx6);
-        float ym6 = measure_luma(uv - dy6);
-        float yp6 = measure_luma(uv + dy6);
+        float c = grain_sample(uv, fp_vsize, fp_taps);
+        float xm1 = grain_sample(uv - dx1, fp_vsize, fp_taps);
+        float xp1 = grain_sample(uv + dx1, fp_vsize, fp_taps);
+        float ym1 = grain_sample(uv - dy1, fp_vsize, fp_taps);
+        float yp1 = grain_sample(uv + dy1, fp_vsize, fp_taps);
+        float xm3 = grain_sample(uv - dx3, fp_vsize, fp_taps);
+        float xp3 = grain_sample(uv + dx3, fp_vsize, fp_taps);
+        float ym3 = grain_sample(uv - dy3, fp_vsize, fp_taps);
+        float yp3 = grain_sample(uv + dy3, fp_vsize, fp_taps);
+        float xm6 = grain_sample(uv - dx6, fp_vsize, fp_taps);
+        float xp6 = grain_sample(uv + dx6, fp_vsize, fp_taps);
+        float ym6 = grain_sample(uv - dy6, fp_vsize, fp_taps);
+        float yp6 = grain_sample(uv + dy6, fp_vsize, fp_taps);
+        if (grain_source_trc >= 0.5) {
+            c = measure_bridge(c);
+            xm1 = measure_bridge(xm1); xp1 = measure_bridge(xp1);
+            ym1 = measure_bridge(ym1); yp1 = measure_bridge(yp1);
+            xm3 = measure_bridge(xm3); xp3 = measure_bridge(xp3);
+            ym3 = measure_bridge(ym3); yp3 = measure_bridge(yp3);
+            xm6 = measure_bridge(xm6); xp6 = measure_bridge(xp6);
+            ym6 = measure_bridge(ym6); yp6 = measure_bridge(yp6);
+        }
 
         float lp1 = (4.0 * c + xm1 + xp1 + ym1 + yp1) * 0.125;
         float lp3 = (4.0 * c + xm3 + xp3 + ym3 + yp3) * 0.125;
@@ -1380,10 +1500,19 @@ void lean_observe() {
             && lk_ky > 0u && lk_ky < uint(MP_GRID_H - 1)) {
             vec2 lk_step = active_extent
                          / vec2(float(MP_GRID_W), float(MP_GRID_H));
-            float lk_gx = 0.5 * (measure_luma(uv + vec2(lk_step.x, 0.0))
-                               - measure_luma(uv - vec2(lk_step.x, 0.0)));
-            float lk_gy = 0.5 * (measure_luma(uv + vec2(0.0, lk_step.y))
-                               - measure_luma(uv - vec2(0.0, lk_step.y)));
+            // Same picture-relative footprint as the grain cross: the pan
+            // thresholds sit on the static-grain noise floor of these taps,
+            // which is raster-dependent through the bilinear footprint.
+            float lk_xp = grain_sample(uv + vec2(lk_step.x, 0.0), fp_vsize, fp_taps);
+            float lk_xm = grain_sample(uv - vec2(lk_step.x, 0.0), fp_vsize, fp_taps);
+            float lk_yp = grain_sample(uv + vec2(0.0, lk_step.y), fp_vsize, fp_taps);
+            float lk_ym = grain_sample(uv - vec2(0.0, lk_step.y), fp_vsize, fp_taps);
+            if (grain_source_trc >= 0.5) {
+                lk_xp = measure_bridge(lk_xp); lk_xm = measure_bridge(lk_xm);
+                lk_yp = measure_bridge(lk_yp); lk_ym = measure_bridge(lk_ym);
+            }
+            float lk_gx = 0.5 * (lk_xp - lk_xm);
+            float lk_gy = 0.5 * (lk_yp - lk_ym);
             float lk_d = c - prev_c;
             float lk_gxy = lk_gx * lk_gy;
             float lk_bx = -lk_gx * lk_d;
@@ -2826,6 +2955,9 @@ void hook() {
 // MUST equal PASS 1's MP_STATE_MAGIC (same translation-unit-sync rule as
 // MP_TONE_BINS_OUT / MP_FIELD_STD_OUT — no compile guard exists).
 #define MP_STATE_MAGIC_OUT 0.951820
+// MUST equal PASS 1's MEASURE_BLACK / MEASURE_WHITE (same no-guard sync rule).
+#define MEASURE_BLACK_OUT (16.0 / 255.0)
+#define MEASURE_WHITE_OUT (235.0 / 255.0)
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
 // True per-channel variance of the canonical rendered field at the calibrated
@@ -2912,11 +3044,21 @@ vec3 signed_pow(vec3 v, float p) {
 }
 
 float matched_grain_scale(float lum, float hdr_mode) {
-    // Exposure-weighted bins devote two anchors to the compression-vulnerable
-    // near-black/shadow range. Curves store absolute independent power.
-    float p = clamp(sqrt(clamp(lum, 0.0, 1.0))
+    // Curves store absolute independent power per exposure-weighted tone bin.
+    // PASS 1 learns the bins on raw LIMITED-range LUMA codes (black ~16/255),
+    // while `lum` here is full-range work-domain luma. Read the bins in PASS 1's
+    // coordinate, or every shadow pixel lands up to 1.5 bins darker than the
+    // bin that measured it (0.55 bins at L = 0.1; the 2026-09-29 audit). Only
+    // the bin coordinate moves -- sigma units and every calibrated constant stay.
+    // Video black sits at the bin-2 edge, so bins 0-1 hold only sub-black codes
+    // and never gather evidence: floor the lookup at bin 2's centre (~L 0.04,
+    // ~0.37 nits at ref white 116) so no pixel reads a bin that cannot be
+    // measured. Below it the shadow toe still carries grain down to black.
+    float lum_meas = MEASURE_BLACK_OUT
+                   + clamp(lum, 0.0, 1.0) * (MEASURE_WHITE_OUT - MEASURE_BLACK_OUT);
+    float p = clamp(sqrt(lum_meas)
                     * float(MP_TONE_BINS_OUT) - 0.5,
-                    0.0, float(MP_TONE_BINS_OUT - 1));
+                    2.0, float(MP_TONE_BINS_OUT - 1));
     int i0 = int(floor(p));
     int i1 = min(i0 + 1, MP_TONE_BINS_OUT - 1);
     float char_p = mix(s_char_p[i0], s_char_p[i1], fract(p));

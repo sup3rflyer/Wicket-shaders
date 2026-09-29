@@ -261,10 +261,11 @@ Runtime controls (live-toggleable via `glsl-shader-opts`):
 | `grain_fade` | Work-domain luma where grain reaches zero. Default 1.10 preserves the stock top end; 0.2-0.3 confines grain to low luminance with a widened shadow toe so the grain rises gradually out of black. Below-reference-white values only move the luma envelope; the per-channel safety ceiling stays at reference white. |
 | `density_combine` | Combine mix: 0 = additive; 1 = multiplicative density (grain rides tone/bloom gradients, with neutral-referenced chromatic luma-energy protection); values between blend the two deltas linearly from the same field, so matched power holds while carrier weighting, bright-biased skew and shadow behaviour interpolate. |
 | `grain_hdr` | 1 = PQ BT.2020 output chain (e.g. CelFlare): grain is keyed and applied in the measured SDR domain via a per-pixel PQ bridge, fading out shortly above reference white. 0 = plain SDR (exact prior behavior). |
-| `grain_ref_white` | SDR reference white in nits for the HDR bridge — match `hdr-reference-white`. |
+| `grain_ref_white` | SDR reference white in nits for the HDR bridge — match `hdr-reference-white`. With `grain_source_trc=1` it is also the anchor native PQ is measured against. |
+| `grain_source_trc` | Source transfer the observer reads: 0 = gamma (all SDR, including SDR retagged for an SDR→HDR shader); 1 = PQ native HDR (HDR10/HDR10+, Dolby Vision P7/P8 base layer), measured through a bridge to SDR-equivalent codes at `grain_ref_white` so native HDR is read in the domain the model is calibrated in. HLG and Dolby Vision P5 stay 0. mpv cannot tell the shader the source transfer — set it per profile for HDR sources. |
 | `debug_match` | Machine-readable state overlay for tuning. |
 
-**Requirements:** mpv with `vo=gpu-next`; compute shaders (GLSL 4.30+) — Vulkan/D3D11, or OpenGL 4.3+. SDR content; for SDR→HDR chains (e.g. CelFlare, PQ BT.2020 out) set `grain_hdr=1` + `grain_ref_white=<your hdr-reference-white>` in `glsl-shader-opts`.
+**Requirements:** mpv with `vo=gpu-next`; compute shaders (GLSL 4.30+) — Vulkan/D3D11, or OpenGL 4.3+. SDR content, or native PQ HDR with `grain_source_trc=1`; for SDR→HDR chains (e.g. CelFlare, PQ BT.2020 out) set `grain_hdr=1` + `grain_ref_white=<your hdr-reference-white>` in `glsl-shader-opts`. Grain is measured in picture-relative terms, so 1080p, 4K and upscaled (e.g. an AI upscaler filter ahead of the shader) sources of the same picture read the same grain. The observer assumes limited-range video (disc, broadcast, streaming); full-range sources mis-key the darkest tones slightly.
 
 **Usage:**
 

@@ -56,7 +56,10 @@
 //
 //  == GRAIN LOOK (the dials to tune by eye) =================================
 //   grain_gain       overall grain AMOUNT/strength (1 = calibrated; up to 12).
-//   grain_size       grain SIZE: <1 finer, >1 coarser (1.2 = default).
+//   grain_size       grain SIZE: <1 finer, >1 coarser (1.2 = default). The
+//                    0.25 floor is dyadic on purpose: mpv rejects an opt that
+//                    sits exactly on a bound float can't represent (0.3 did),
+//                    and the kernels are already floored there.
 //   grain_contrast   spectral hardness: 0 = soft/lowpass, 1 = sandpaper bandpass, up to 2 =
 //                    more DC removed / peppery (difference-of-Gaussians).
 //   value_warp       VALUE-domain contrast: 0 = Gaussian (bit-identical), ~2 hard, ~3 extreme
@@ -64,6 +67,18 @@
 //                    preserving; the value-domain cousin of grain_contrast.    [Alt+F3]
 //   grain_sharpness  size trim, neutral (0) to calibrated crisp (1); 0.3 default.
 //                    (Evidence-frozen: the observer no longer steers size.)
+//   grain_soften     sub-pixel CAPTURE softness in lattice samples (picture-
+//                    height units, a title property like grain_size): a common
+//                    scan-aperture/optical MTF folded into every channel's
+//                    kernel, RMS-preserving. 0 = point-sampled lattice (legacy;
+//                    exact fold, the 13-tap support alone shifts RMS < 0.01%);
+//                    0.29 = the minimal one-sample scan aperture (default);
+//                    0.6-1.0 = softer scan/optics by eye (at equal RMS the power
+//                    moves toward the CSF peak, so it READS stronger -- trim
+//                    grain_gain, don't call it a bug). Softens the red (finest)
+//                    channel most; grain_size would coarsen all three and its
+//                    G/B kernels already sit on the SIGMA_MAX cap above ~1.5.
+//                    Floors the effective sigma under small grain_size.
 //   grain_rate       visible temporal cadence: fraction of SOURCE frames that
 //                    choose a fresh on-screen arrangement (1 = on ones; 0.5 =
 //                    on twos). Source-locked and display-refresh independent.
@@ -87,7 +102,8 @@
 //                    4-8x normal; set from a profile, not a look knob.
 //
 //  == PIPELINE / SIZING =====================================================
-//   density_combine  0 = additive, 1 = multiplicative density.
+//   density_combine  0 = additive, 1 = multiplicative density, between = linear
+//                    blend of the two deltas (same field, RMS holds).
 //
 //  == OUTPUT CHAIN (what the OUTPUT hook is handed) =========================
 //   grain_hdr        the player's OUTPUT transfer, NOT a look knob. libplacebo
@@ -169,8 +185,10 @@
 //@shampv target-trc-param grain_hdr
 //@shampv pause-param grain_pause
 //@shampv epoch-param state_epoch
-//@shampv toggle match_grain grain_hdr grain_headroom debug_match density_combine grain_pause
+//@shampv toggle match_grain grain_hdr grain_headroom debug_match grain_pause
 //@shampv step grain_gain 0.05
+//@shampv step density_combine 0.05
+//@shampv step grain_soften 0.05
 //@shampv measures LUMA
 
 //!PARAM match_grain
@@ -211,7 +229,7 @@
 //!PARAM grain_size
 //!DESC Grain cell size. ↓ finer · ↑ coarser. Default 1.2 = restoration scan character; 1 = neutral scale.
 //!TYPE DYNAMIC float
-//!MINIMUM 0.3
+//!MINIMUM 0.25
 //!MAXIMUM 2.5
 1.2
 
@@ -235,6 +253,13 @@
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.3
+
+//!PARAM grain_soften
+//!DESC Sub-pixel capture softness in grain-lattice samples (1/2160 of active picture height): sigma of a common scan-aperture/optical MTF folded into every channel's kernel, RMS-preserving on the generation lattice (sub-2160 outputs recover a little footprint loss), a title property like grain_size. 0 = legacy point-sampled lattice (grain sits on the lattice, no capture MTF) · 0.29 = the minimal one-sample scan aperture (default) · 0.6-1.0 = softer scan/optics by eye (reads stronger at equal RMS). Also floors the effective sigma under small grain_size.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.5
+0.29
 
 //!PARAM grain_rate
 //!DESC Visible arrangement cadence in SOURCE frames. 1 = fresh arrangement every frame / on ones · 0.5 = on twos. ↓ slows the boil. Display-refresh independent. 0.333 ≈ on-threes.
@@ -265,7 +290,7 @@
 1.0
 
 //!PARAM density_combine
-//!DESC Grain combine mode (toggle). 1 = multiplicative density, rides brightness like film (shipped) · 0 = additive.
+//!DESC Grain combine mix. 1 = multiplicative density, rides the carrier like film (shipped) · 0 = additive · between = linear blend of the two deltas from the same field (carrier weighting, bright-biased skew and shadow floor interpolate; matched RMS holds).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
@@ -355,6 +380,7 @@
 //!VAR float m_baked_value_warp
 //!VAR float m_baked_grain_base_sat
 //!VAR float m_baked_grain_sharpness
+//!VAR float m_baked_grain_soften
 //!VAR float m_baked_match_grain
 //!VAR float prev_grid[4096]
 //!VAR float prev_grid_off[4096]
@@ -421,7 +447,7 @@
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
 #define MP_FIELD_STD           0.0185
-#define MP_STATE_MAGIC         0.950820
+#define MP_STATE_MAGIC         0.951820
 #define MP_MIN_BIN_SAMPLES     24u
 // Film-plausible evidence band. Per-frame sigma above this band is not
 // photographic grain (fireworks, confetti, dense near-field rain, damage):
@@ -621,6 +647,7 @@ void lean_observe() {
             m_baked_value_warp = -1.0;
             m_baked_grain_base_sat = -1.0;
             m_baked_grain_sharpness = -1.0;
+            m_baked_grain_soften = -1.0;
             m_baked_match_grain = -1.0;
             m_source_aspect = HOOKED_size.x / max(HOOKED_size.y, 1.0);
             m_active_inset_x = 0.0;
@@ -711,6 +738,7 @@ void lean_observe() {
                 || abs(m_baked_value_warp - value_warp) > 1.0e-6
                 || abs(m_baked_grain_base_sat - grain_base_sat) > 1.0e-6
                 || abs(m_baked_grain_sharpness - grain_sharpness) > 1.0e-6
+                || abs(m_baked_grain_soften - grain_soften) > 1.0e-6
                 || abs(m_baked_match_grain - match_grain) > 1.0e-6;
             m_regen = 0.0;
             if (baked_params_changed) {
@@ -719,6 +747,7 @@ void lean_observe() {
                 m_baked_value_warp = value_warp;
                 m_baked_grain_base_sat = grain_base_sat;
                 m_baked_grain_sharpness = grain_sharpness;
+                m_baked_grain_soften = grain_soften;
                 m_baked_match_grain = match_grain;
                 m_regen_pending = 1.0;
             }
@@ -2024,11 +2053,11 @@ void lean_observe() {
             // the 3-8x band earns a partial ceiling and only proven
             // heavy grain collects it all. The floor is the taste
             // constant: 0.75 sat as still-hot on LvB (2026-08-22
-            // re-sit); 0.3 is the author's deeper pick.
+            // re-sit); 0.2 is the author's deeper pick.
             ev_gate = max(ev_gate,
                           smoothstep(0.10, 0.35, m_master_w[gb])
                         * smoothstep(1.6, 3.0, gratio)
-                        * mix(0.3, 1.0, smoothstep(3.0, 8.0, gratio)));
+                        * mix(0.2, 1.0, smoothstep(3.0, 8.0, gratio)));
         }
 
         for (int b = 0; b < MP_TONE_BINS; b++) {
@@ -2186,6 +2215,7 @@ void lean_observe() {
             || abs(m_baked_value_warp - value_warp) > 1.0e-6
             || abs(m_baked_grain_base_sat - grain_base_sat) > 1.0e-6
             || abs(m_baked_grain_sharpness - grain_sharpness) > 1.0e-6
+            || abs(m_baked_grain_soften - grain_soften) > 1.0e-6
             || abs(m_baked_match_grain - match_grain) > 1.0e-6;
         // A cut still forces a fresh template so each shot gets its own
         // vocabulary even at a reduced gen rate. The old post-cut fast-
@@ -2204,6 +2234,7 @@ void lean_observe() {
             m_baked_value_warp = value_warp;
             m_baked_grain_base_sat = grain_base_sat;
             m_baked_grain_sharpness = grain_sharpness;
+            m_baked_grain_soften = grain_soften;
             m_baked_match_grain = match_grain;
         }
 
@@ -2270,12 +2301,16 @@ void hook() {
 // GRAIN_FIELD is rgba16f: rgb = final signed grain (bandpass + warp),
 // a is unused.
 
-// 9-tap support (was 7): the blue channel's base sigma (1.20) reaches ~1.15 even at
-// the crisp neutral and higher when coarse, where 7 taps (clean only to sigma ~1.0)
-// truncate the Gaussian into a box and ripple the spectrum. 9 taps hold sigma up to
-// ~1.5 cleanly, covering the full fine-digital -> 16mm render range. Arrays/loops
-// are parametrized on MAX_TAPS so the support can never drift out of sync.
-#define MAX_TAPS 4
+// 13-tap support (was 9, before that 7): the blue channel's base sigma (1.20)
+// reaches ~1.15 even at the crisp neutral and higher when coarse, where 7 taps
+// (clean only to sigma ~1.0) truncate the Gaussian into a box and ripple the
+// spectrum. 9 taps held sigma up to ~1.5 (the SIGMA_MAX cap). grain_soften
+// (2026-08-22) widens every kernel AFTER that cap, up to sqrt(1.5^2 + 1.5^2)
+// = 2.12 at its ceiling; 13 taps hold ~2.2 cleanly (edge tap < 2% of peak).
+// Shared footprint 44x44x3 floats = 23 KB, under the 32 KB D3D11 limit.
+// Arrays/loops are parametrized on MAX_TAPS so the support can never drift
+// out of sync.
+#define MAX_TAPS 6
 
 // Neutral correlation-length calibration. The physical quantity is this sigma
 // divided by PICTURE_DENSITY: a fraction of active picture height. K=0.75 was
@@ -2302,11 +2337,14 @@ void hook() {
 // (Directive prefix omitted here on purpose: the parser splits sections on
 // that marker even inside a comment.)
 #define GEN_GRID ivec2(960, 540)
-// Per-channel render-sigma cap. The 9-tap support holds a Gaussian cleanly to ~1.5;
-// beyond that it would truncate. The coarse extreme and a higher-density future
+// Per-channel render-sigma cap. The coarse extreme and a higher-density future
 // res-scaling can push a channel past it, so cap GRACEFULLY (slightly finer than
 // ideal at that extreme) rather than ripple the spectrum. The actual film range
 // (fine digital .. ~16mm) stays under it, so this never touches normal operation.
+// KEPT at 1.5 although the support is now 13 taps: the blue outer DoG sigma
+// (1.2 * 1.8 = 2.16) is capped here at the calibration point, and raising the
+// cap would move the calibrated defaults. grain_soften widens post-cap (see
+// soften_var) and is what the wider support is for.
 #define SIGMA_MAX    1.5
 // CONTRAST / "sandpaper" axis (2026-06-05). The generator (white noise -> ONE Gaussian
 // blur) is LOWPASS (DC-peaked = soft cloud); real film grain is BANDPASS (suppressed DC,
@@ -2314,8 +2352,9 @@ void hook() {
 // Fix = difference-of-Gaussians: grain = blur(s1) - a*blur(s1*BP_RATIO), which suppresses
 // DC -> bandpass. s1 = the per-channel render sigma (size lever); a = BP_ALPHA*grain_contrast
 // (the hardness/sandpaper dial). grain_contrast=0 -> a=0 -> grain=blur(s1) = BIT-IDENTICAL
-// to the old lowpass (A/B-safe). The 2nd (wider) blur reuses the 9-tap machinery by
-// REGENERATING the (reproducible) noise; s2 is capped at SIGMA_MAX so 9 taps still hold it.
+// to the old lowpass (A/B-safe). The 2nd (wider) blur reuses the MAX_TAPS blur machinery by
+// REGENERATING the (reproducible) noise; s2 is capped at SIGMA_MAX (see the cap note) so the
+// support holds it even after the grain_soften widening.
 // An analytic RMS norm (from the blur weights) keeps grain STRENGTH constant as contrast
 // rises. Offline-locked to CyberCity (tools/mgt_bandpass_design.py): BP_RATIO 1.8, A0 0.60.
 #define BP_RATIO     1.8
@@ -2376,8 +2415,19 @@ float rand_triangular(inout uint state, float variance_scale) {
     return (u + v - 1.0) * 0.612 * variance_scale;
 }
 
-float gaussian_weight(float dx, float sigma) {
-    return exp(-0.5 * dx * dx / max(sigma * sigma, 1e-6));
+// Takes the VARIANCE so the grain_soften fold below needs no sqrt/square
+// round trip (D3D11 only promises sqrt to 1 ULP; this keeps soften 0 exact).
+float gaussian_weight_var(float dx, float sigma2) {
+    return exp(-0.5 * dx * dx / max(sigma2, 1e-6));
+}
+
+// grain_soften fold: cap first (calibration point), then widen by the common
+// capture sigma in quadrature. Gaussian * Gaussian = Gaussian, and the blur
+// is linear, so blur(DoG(s1, s2)) = DoG(soften(s1), soften(s2)). Returns the
+// widened VARIANCE; soft2 == 0 reproduces the legacy c*c exactly.
+float soften_var(float sigma, float soft2) {
+    float c = min(sigma, SIGMA_MAX);
+    return c * c + soft2;
 }
 
 void hook() {
@@ -2441,12 +2491,48 @@ void hook() {
         float s1r = mix(0.78, 1.02, soften_eff) * k_size;
         float s1g = mix(1.00, 1.22, soften_eff) * k_size;
         float s1b = mix(1.20, 1.40, soften_eff) * k_size;
-        dyn_wr[idx]  = gaussian_weight(dx, min(s1r, SIGMA_MAX));
-        dyn_wg[idx]  = gaussian_weight(dx, min(s1g, SIGMA_MAX));
-        dyn_wb[idx]  = gaussian_weight(dx, min(s1b, SIGMA_MAX));
-        dyn_wr2[idx] = gaussian_weight(dx, min(s1r * BP_RATIO, SIGMA_MAX));
-        dyn_wg2[idx] = gaussian_weight(dx, min(s1g * BP_RATIO, SIGMA_MAX));
-        dyn_wb2[idx] = gaussian_weight(dx, min(s1b * BP_RATIO, SIGMA_MAX));
+        // grain_soften: SUB-PIXEL CAPTURE MODEL (2026-08-22). A physical grain
+        // is a continuous object that a scanner/camera pixel integrates; it is
+        // not a dot sitting on the synthesis lattice. A lattice of random
+        // impulses blurred by the grain kernel is statistically the same as
+        // continuous-position grains at these sizes (lattice-vs-continuous
+        // covariance error 0.5% at sigma 0.78), so what the legacy generator
+        // lacked is the CAPTURE-side MTF: a common Gaussian (sigma in LATTICE
+        // samples -- picture-height units, a title property like every other
+        // size lever, NOT rescaled by the output raster; 0.29 = 1/sqrt(12),
+        // the minimal one-sample scan aperture; more = softer scan/optics)
+        // convolved into every channel. The composite's display-side footprint
+        // box at non-1:1 outputs and the panel's own hold are separate,
+        // legitimate apertures -- this one is the title's. Direction is
+        // supported by the master-PSD record (the DoG basis cannot reach the
+        // measured master coarseness), so a fitted value is a calibration
+        // follow-up; 0.29 is the minimal physical floor.
+        // Symmetric kernels commute with the composite's window flips and
+        // integer offsets, so folding it here equals filtering the assembled
+        // field at OUTPUT for zero per-present cost. Applied AFTER the
+        // SIGMA_MAX cap so 0 restores the legacy kernels exactly (verified
+        // byte-identical with MAX_TAPS pinned to 4; the wider support alone
+        // carries Gaussian tails 9 taps truncated, < 0.01% RMS) and the
+        // calibrated cap point never moves; bp_norm/field_norm/covariance below are analytic from
+        // these weights, so matched RMS holds (amplitude-preserving, like
+        // grain_contrast) on the generation lattice; at sub-2160 outputs the
+        // composite's footprint box (not RMS-renormalized by design) loses
+        // less of a softer field, so delivered RMS rises a little there
+        // (measured 1080p: +1/+4/+6% at 0.29/0.75/1.0; 4K: <= 0.34%). Red
+        // (the finest channel, ~33% of its power at periods < 4 px at the
+        // defaults vs 5% for blue; measured 0.338 at 4K) gives up the most
+        // ABSOLUTE fine power -- the per-pixel speckle grain_size cannot
+        // reach without coarsening green/blue along with it. Ordering note:
+        // the fold precedes value_warp, and a pointwise warp re-broadens the
+        // spectrum, so at value_warp >= ~2 the capture-MTF reading weakens;
+        // accepted (default warp 0), not a claim at high warp.
+        float soft2 = grain_soften * grain_soften;
+        dyn_wr[idx]  = gaussian_weight_var(dx, soften_var(s1r, soft2));
+        dyn_wg[idx]  = gaussian_weight_var(dx, soften_var(s1g, soft2));
+        dyn_wb[idx]  = gaussian_weight_var(dx, soften_var(s1b, soft2));
+        dyn_wr2[idx] = gaussian_weight_var(dx, soften_var(s1r * BP_RATIO, soft2));
+        dyn_wg2[idx] = gaussian_weight_var(dx, soften_var(s1g * BP_RATIO, soft2));
+        dyn_wb2[idx] = gaussian_weight_var(dx, soften_var(s1b * BP_RATIO, soft2));
     }
     barrier();
     if (regenerate && lid == 0u) {
@@ -2739,7 +2825,7 @@ void hook() {
 #define MP_FIELD_STD_OUT 0.0185
 // MUST equal PASS 1's MP_STATE_MAGIC (same translation-unit-sync rule as
 // MP_TONE_BINS_OUT / MP_FIELD_STD_OUT — no compile guard exists).
-#define MP_STATE_MAGIC_OUT 0.950820
+#define MP_STATE_MAGIC_OUT 0.951820
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
 // True per-channel variance of the canonical rendered field at the calibrated
@@ -2890,12 +2976,11 @@ float matched_grain_scale(float lum, float hdr_mode) {
     float white_fade = 1.0 - smoothstep(fade_start, fade_top, lum);
     float protection = shadow_toe * white_fade;
     float scale = sigma / MP_FIELD_STD_OUT * protection;
-    // Density multiplication contributes one factor of luma. Divide it back
-    // out so the absolute master-power curve survives into shadows; the small
-    // floor hands off continuously to the mean-neutral pedestal below.
-    if (density_combine > 0.5)
-        scale /= max(lum, 0.015);
-    return min(scale, 8.0);
+    // Returns the UNCLAMPED scale; each combine arm applies its own 8.0 roof
+    // at the call site (the density arm after its luma compensation). Clamping
+    // here first would change the density arm whenever scale > 8 and the
+    // work-domain luma is > 1 (PQ headroom chains at high grain_gain).
+    return scale;
 }
 
 // Multiplicative RGB density is not automatically colour-energy neutral. The
@@ -3268,11 +3353,27 @@ void hook() {
 
     float color_luma = dot(work_rgb, luma_coeff);
     float hdr_mode = hdr_bridge ? 1.0 : 0.0;
-    float tone_scale = matched_grain_scale(color_luma, hdr_mode);
-    vec3 scale_vec = vec3(tone_scale);
+    float tone_raw = matched_grain_scale(color_luma, hdr_mode);
+    float tone_add = min(tone_raw, 8.0);
+    // Density multiplication contributes one factor of luma. Divide it back
+    // out so the absolute master-power curve survives into shadows; the small
+    // floor hands off continuously to the mean-neutral pedestal below. Each
+    // arm takes the 8.0 roof on its OWN scale (pre-mix parity: the density
+    // roof applied after the division, and still does).
+    float tone_den = min(tone_raw / max(color_luma, 0.015), 8.0);
     vec3 pre_grain = work_rgb;
-    vec3 grain_delta;
-    if (density_combine > 0.5) {
+    // density_combine is a MIX, not a switch (2026-08-22): 0 = additive,
+    // 1 = multiplicative density, between = linear blend of the two deltas.
+    // Both arms ride the same field sample, so they are near-perfectly
+    // correlated and the blended RMS interpolates linearly (no sqrt dip at
+    // 0.5); on a neutral carrier the density delta equals the additive one to
+    // first order, so what the mix actually interpolates is the per-channel
+    // carrier weighting on saturated colours, the log-normal bright-biased
+    // skew, and the shadow handling (0.015 floor + pedestal vs flat). The
+    // headroom clamps below apply to the blended delta unchanged.
+    float density_w = clamp(density_combine, 0.0, 1.0);
+    vec3 grain_delta = vsum * tone_add;
+    if (density_w > 0.0) {
         // Density multiplication cannot express an absolute noise floor below
         // the 0.015 divisor. Extend only picture-bearing near-black values with
         // the same zero-mean RGB perturbation; literal black/mattes stay exact.
@@ -3285,22 +3386,26 @@ void hook() {
         float pedestal_signal = max(DENSITY_SHADOW_FLOOR
                                   - max(color_luma, 0.0), 0.0)
                               * pedestal_gate;
-        vec3 x = DENSITY_GAIN * vsum * scale_vec;
+        vec3 x = DENSITY_GAIN * vsum * tone_den;
         // Canonical-field log-normal bias correction. Footprint filtering
         // changes covariance, so non-native-density presentations retain a very small
         // conservative bias rather than pretending sum(weights^2) is exact
         // for the correlated DoG field.
         vec3 density_delta = exp(x - 0.5 * DENSITY_GAIN * DENSITY_GAIN
-                               * tone_scale * tone_scale * field_var) - 1.0;
-        grain_delta = work_rgb * density_delta;
-        grain_delta += vec3(pedestal_signal) * density_delta;
+                               * tone_den * tone_den * field_var) - 1.0;
+        vec3 density_grain = work_rgb * density_delta;
+        density_grain += vec3(pedestal_signal) * density_delta;
         // One post-density scalar preserves channel log-normal shapes, their
         // zero-mean correction, hue speckle, and spatial/RMS ratios exactly.
         // At a neutral carrier the cap is identically one.
-        grain_delta *= density_colour_energy_cap(
+        density_grain *= density_colour_energy_cap(
             work_rgb + vec3(pedestal_signal));
-    } else {
-        grain_delta = vsum * scale_vec;
+        // Exact endpoint: FXC lowers mix() to x + s*(y - x), which is an ulp
+        // or two off y at s == 1, so the shipped default 1.0 takes the
+        // density arm directly (uniform PARAM branch, no barrier follows).
+        grain_delta = (density_w >= 1.0)
+                    ? density_grain
+                    : mix(grain_delta, density_grain, density_w);
     }
 
     if (!hdr_bridge || grain_headroom < 0.5) {
@@ -3311,7 +3416,7 @@ void hook() {
         // defense applies.) Letting the display clamp those channels after grain would
         // remove positive excursions while retaining dark pits — temporally
         // conspicuous in tinted whites even though literal RGB white already
-        // has tone_scale == 0. Limit every channel symmetrically to its code
+        // has a zero tone scale. Limit every channel symmetrically to its code
         // headroom. Neutral highlights progressively share the tightest upper
         // headroom, so a tinted white with one clipped channel cannot retain
         // chromatic flicker; saturated colors keep their unclipped channels.

@@ -241,7 +241,12 @@ void hook() {
     for (uint i = gl_LocalInvocationIndex; i < isize.y * isize.x; i += num_threads) {
         uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
         ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy) + ivec2(local_pos) - ivec2(MAX_TAPS);
-        uvec2 global_pos = uvec2((global_coord_i % GEN_GRID + GEN_GRID) % GEN_GRID);
+        // global_coord_i >= -MAX_TAPS, so one added grid extent keeps the
+        // dividend non-negative. GLSL leaves % undefined on negative operands,
+        // and NVIDIA's Vulkan compiler really does wrap them as unsigned: the
+        // old (x % G + G) % G sent row 0 / column 0's halo to the wrong place
+        // and broke the torus at the field's wrap line.
+        uvec2 global_pos = uvec2((global_coord_i + GEN_GRID) % GEN_GRID);
 
         // Asymmetric seed: x*Prime1 + y*Prime2 to prevent mirroring.
         uint seed_init = (global_pos.x * 1664525u) + (global_pos.y * 22695477u) + (frame_seed * 314159265u);
@@ -349,8 +354,10 @@ vec3 grain_bilinear(vec2 fpos, ivec2 g) {
     ivec2 i0 = ivec2(floor(p));
     vec2 f = p - vec2(i0);
     ivec2 i1 = i0 + 1;
-    ivec2 w0 = (i0 % g + g) % g;
-    ivec2 w1 = (i1 % g + g) % g;
+    // i0 >= -1 (only when gscale < 1, at gid 0), so adding g once keeps both
+    // dividends non-negative — see the gen pass on % with negative operands.
+    ivec2 w0 = (i0 + g) % g;
+    ivec2 w1 = (i1 + g) % g;
     vec3 c00 = imageLoad(GRAIN_FIELD, ivec2(w0.x, w0.y)).rgb;
     vec3 c10 = imageLoad(GRAIN_FIELD, ivec2(w1.x, w0.y)).rgb;
     vec3 c01 = imageLoad(GRAIN_FIELD, ivec2(w0.x, w1.y)).rgb;

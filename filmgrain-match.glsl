@@ -56,29 +56,38 @@
 //
 //  == GRAIN LOOK (the dials to tune by eye) =================================
 //   grain_gain       overall grain AMOUNT/strength (1 = calibrated; up to 12).
-//   grain_size       grain SIZE: <1 finer, >1 coarser (1.2 = default). The
-//                    0.25 floor is dyadic on purpose: mpv rejects an opt that
-//                    sits exactly on a bound float can't represent (0.3 did),
-//                    and the kernels are already floored there.
+//   grain_size       grain SIZE: <1 finer, >1 coarser (1 = the calibrated
+//                    neutral scale; 1.34 = default, the restoration scan
+//                    character). Phase 4 folded the old grain_sharpness size
+//                    trim in: old size s at sharpness p is now s x (1 + 0.387 p).
+//                    The 0.25 floor is dyadic on purpose: mpv rejects an opt
+//                    that sits exactly on a bound float can't represent (0.3
+//                    did), and the kernels are already floored there.
 //   grain_contrast   spectral hardness: 0 = soft/lowpass, 1 = sandpaper bandpass, up to 2 =
 //                    more DC removed / peppery (difference-of-Gaussians).
 //   value_warp       VALUE-domain contrast: 0 = Gaussian (bit-identical), ~2 hard, ~3 extreme
 //                    = bimodal/high-per-grain-contrast (CyberCity "harsh"). Amplitude-
 //                    preserving; the value-domain cousin of grain_contrast.    [Alt+F3]
-//   grain_sharpness  size trim, neutral (0) to calibrated crisp (1); 0.3 default.
-//                    (Evidence-frozen: the observer no longer steers size.)
 //   grain_soften     sub-pixel CAPTURE softness in lattice samples (picture-
 //                    height units, a title property like grain_size): a common
 //                    scan-aperture/optical MTF folded into every channel's
-//                    kernel, RMS-preserving. 0 = point-sampled lattice (legacy;
-//                    exact fold, the 13-tap support alone shifts RMS < 0.01%);
-//                    0.29 = the minimal one-sample scan aperture (default);
-//                    0.6-1.0 = softer scan/optics by eye (at equal RMS the power
-//                    moves toward the CSF peak, so it READS stronger -- trim
-//                    grain_gain, don't call it a bug). Softens the red (finest)
-//                    channel most; grain_size would coarsen all three and its
-//                    G/B kernels already sit on the SIGMA_MAX cap above ~1.5.
-//                    Floors the effective sigma under small grain_size.
+//                    kernel. 0 = point-sampled lattice (legacy); 0.29 = the
+//                    minimal one-sample scan aperture (default); 1-2.5 = softer
+//                    scan/optics, up to smooth Gaussian-like grain at
+//                    value_warp 0 (the warp's tanh flattens soft blobs into
+//                    mesas). Softens the red (finest) channel most; grain_size
+//                    would coarsen all three and its G/B kernels already sit on
+//                    the SIGMA_MAX cap above ~1.5. Floors the effective sigma
+//                    under small grain_size.
+//                    SIZE, CONTRAST AND SOFTEN ARE AMOUNT-NORMALIZED (Phase 4):
+//                    each keeps the grain's RMS after a sigma-1.5-sample
+//                    visibility blur at the default kernel's, so grain_gain
+//                    sets the amount. Before Phase 4 they held RAW RMS, and
+//                    soft or coarse grain read up to ~1.65x stronger on that
+//                    model. The blur is a visibility MODEL, not a measured
+//                    match to the eye (a sitting calibrates it), and very fine
+//                    grain is capped (see VIS_GAIN_MAX): below ~size 0.85 it
+//                    reads progressively weaker at the same gain.
 //   grain_rate       visible temporal cadence: fraction of SOURCE frames that
 //                    choose a fresh on-screen arrangement (1 = on ones; 0.5 =
 //                    on twos). Source-locked and display-refresh independent.
@@ -86,9 +95,12 @@
 //                    visible grain ticks. 1 = every tick; 0.25 = every fourth.
 //                    Arrangement still rehashes on every visible tick, so this
 //                    is a small performance option, not a boil-speed control.
-//   grain_base_sat   explicit per-channel generator prior. 0.75 = calibrated
-//                    look; 0 = true mono. Off-default values drift per-channel
-//                    grain RMS by a few percent.
+//   grain_base_sat   colour noise of the grain (per-channel independence).
+//                    0 = mono; 0.75 = calibrated look; ~1.36 = red and blue
+//                    fully independent, like separate dye layers; up to 2 =
+//                    exaggerated colour noise beyond real film, for outlier
+//                    sources. The luma amount holds within 2% across the whole
+//                    range; only the colour noise grows (x1.35 at 1, x2.7 at 2).
 //
 //  == RESTORATION (how much grain to rebuild on degraded sources) ===========
 //   restore_gain     missing-power lane only: 0 = character complement C,
@@ -257,14 +269,14 @@
 1.0
 
 //!PARAM grain_size
-//!DESC Grain cell size. ↓ finer · ↑ coarser. Default 1.2 = restoration scan character; 1 = neutral scale.
+//!DESC Grain cell size. ↓ finer · ↑ coarser. Default 1.34 = restoration scan character (the old 1.2 at grain_sharpness 0.3, now folded in); 1 = neutral scale. Amount-normalized: the grain's visible strength stays about the same as size changes (very fine sizes read a little weaker).
 //!TYPE DYNAMIC float
 //!MINIMUM 0.25
 //!MAXIMUM 2.5
-1.2
+1.34
 
 //!PARAM grain_contrast
-//!DESC Spectral hardness (difference-of-Gaussians). ↓ toward 0 = soft/lowpass · ↑ toward 2 = crisper grain edges / more DC stripped. Default 2.
+//!DESC Spectral hardness (difference-of-Gaussians). ↓ toward 0 = soft/lowpass · ↑ toward 2 = crisper grain edges / more DC stripped. Default 2. Amount-normalized: visible strength stays about the same.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
@@ -277,18 +289,11 @@
 //!MAXIMUM 4.0
 0.0
 
-//!PARAM grain_sharpness
-//!DESC Size trim between the neutral generator (0) and the calibrated crisp point (1). Evidence-frozen: delivery texture no longer steers size. Default 0.3.
-//!TYPE DYNAMIC float
-//!MINIMUM 0.0
-//!MAXIMUM 1.0
-0.3
-
 //!PARAM grain_soften
-//!DESC Sub-pixel capture softness in grain-lattice samples (1/2160 of active picture height): sigma of a common scan-aperture/optical MTF folded into every channel's kernel, RMS-preserving on the generation lattice (sub-2160 outputs recover a little footprint loss), a title property like grain_size. 0 = legacy point-sampled lattice (grain sits on the lattice, no capture MTF) · 0.29 = the minimal one-sample scan aperture (default) · 0.6-1.0 = softer scan/optics by eye (reads stronger at equal RMS). Also floors the effective sigma under small grain_size.
+//!DESC Capture softness in grain-lattice samples (1/2160 of active picture height): sigma of a common scan-aperture/optical MTF folded into every channel's kernel, a title property like grain_size. 0 = point-sampled lattice · 0.29 = minimal one-sample scan aperture (default) · 1-2.5 = softer scan/optics, up to smooth Gaussian-like grain (at value_warp 0). Amount-normalized: visible strength stays about the same (grain_gain sets it). Also floors the effective sigma under small grain_size.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
-//!MAXIMUM 1.5
+//!MAXIMUM 2.5
 0.29
 
 //!PARAM grain_rate
@@ -306,10 +311,10 @@
 1.0
 
 //!PARAM grain_base_sat
-//!DESC Generator chroma prior. 0 = mono · ↑ = more channel independence. This is explicit prior character, not source-measured chroma.
+//!DESC Colour noise of the grain. 0 = mono · 0.75 = calibrated · ~1.36 = channels fully independent (dye layers) · up to 2 = exaggerated colour noise for outlier sources. The luma amount stays the same; only the colour noise grows. Explicit prior character, not source-measured chroma.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
-//!MAXIMUM 1.0
+//!MAXIMUM 2.0
 0.75
 
 //!PARAM restore_gain
@@ -416,7 +421,6 @@
 //!VAR float m_baked_grain_contrast
 //!VAR float m_baked_value_warp
 //!VAR float m_baked_grain_base_sat
-//!VAR float m_baked_grain_sharpness
 //!VAR float m_baked_grain_soften
 //!VAR float m_baked_match_grain
 //!VAR float prev_grid[4096]
@@ -436,6 +440,7 @@
 //!VAR float prev_probe[4096]
 //!VAR float m_pan_px
 //!VAR float m_bed_ema
+//!VAR float m_tpl_scale
 //!STORAGE
 
 //!TEXTURE GRAIN_FIELD
@@ -484,7 +489,7 @@
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
 #define MP_FIELD_STD           0.0185
-#define MP_STATE_MAGIC         0.951820
+#define MP_STATE_MAGIC         0.954120
 #define MP_MIN_BIN_SAMPLES     24u
 // Film-plausible evidence band. Per-frame sigma above this band is not
 // photographic grain (fireworks, confetti, dense near-field rain, damage):
@@ -744,11 +749,11 @@ void lean_observe() {
             m_field_var_r = 0.0;
             m_field_var_g = 0.0;
             m_field_var_b = 0.0;
+            m_tpl_scale = 1.0;
             m_baked_grain_size = -1.0;
             m_baked_grain_contrast = -1.0;
             m_baked_value_warp = -1.0;
             m_baked_grain_base_sat = -1.0;
-            m_baked_grain_sharpness = -1.0;
             m_baked_grain_soften = -1.0;
             m_baked_match_grain = -1.0;
             m_source_aspect = HOOKED_size.x / max(HOOKED_size.y, 1.0);
@@ -839,7 +844,6 @@ void lean_observe() {
                 || abs(m_baked_grain_contrast - grain_contrast) > 1.0e-6
                 || abs(m_baked_value_warp - value_warp) > 1.0e-6
                 || abs(m_baked_grain_base_sat - grain_base_sat) > 1.0e-6
-                || abs(m_baked_grain_sharpness - grain_sharpness) > 1.0e-6
                 || abs(m_baked_grain_soften - grain_soften) > 1.0e-6
                 || abs(m_baked_match_grain - match_grain) > 1.0e-6;
             m_regen = 0.0;
@@ -848,7 +852,6 @@ void lean_observe() {
                 m_baked_grain_contrast = grain_contrast;
                 m_baked_value_warp = value_warp;
                 m_baked_grain_base_sat = grain_base_sat;
-                m_baked_grain_sharpness = grain_sharpness;
                 m_baked_grain_soften = grain_soften;
                 m_baked_match_grain = match_grain;
                 m_regen_pending = 1.0;
@@ -2343,7 +2346,6 @@ void lean_observe() {
             || abs(m_baked_grain_contrast - grain_contrast) > 1.0e-6
             || abs(m_baked_value_warp - value_warp) > 1.0e-6
             || abs(m_baked_grain_base_sat - grain_base_sat) > 1.0e-6
-            || abs(m_baked_grain_sharpness - grain_sharpness) > 1.0e-6
             || abs(m_baked_grain_soften - grain_soften) > 1.0e-6
             || abs(m_baked_match_grain - match_grain) > 1.0e-6;
         // A cut still forces a fresh template so each shot gets its own
@@ -2362,7 +2364,6 @@ void lean_observe() {
             m_baked_grain_contrast = grain_contrast;
             m_baked_value_warp = value_warp;
             m_baked_grain_base_sat = grain_base_sat;
-            m_baked_grain_sharpness = grain_sharpness;
             m_baked_grain_soften = grain_soften;
             m_baked_match_grain = match_grain;
         }
@@ -2430,16 +2431,16 @@ void hook() {
 // GRAIN_FIELD is rgba16f: rgb = final signed grain (bandpass + warp),
 // a is unused.
 
-// 13-tap support (was 9, before that 7): the blue channel's base sigma (1.20)
+// 17-tap support (was 13, 9, 7): the blue channel's base sigma (1.20)
 // reaches ~1.15 even at the crisp neutral and higher when coarse, where 7 taps
 // (clean only to sigma ~1.0) truncate the Gaussian into a box and ripple the
 // spectrum. 9 taps held sigma up to ~1.5 (the SIGMA_MAX cap). grain_soften
-// (2026-08-22) widens every kernel AFTER that cap, up to sqrt(1.5^2 + 1.5^2)
-// = 2.12 at its ceiling; 13 taps hold ~2.2 cleanly (edge tap < 2% of peak).
-// Shared footprint 44x44x3 floats = 23 KB, under the 32 KB D3D11 limit.
+// widens every kernel AFTER that cap, up to sqrt(1.5^2 + 2.5^2) = 2.92 at its
+// Phase 4 ceiling; 17 taps hold that with the edge tap at 2.4% of peak.
+// Shared footprint 48x48x3 floats = 27.6 KB, under the 32 KB D3D11 limit.
 // Arrays/loops are parametrized on MAX_TAPS so the support can never drift
 // out of sync.
-#define MAX_TAPS 6
+#define MAX_TAPS 8
 
 // Neutral correlation-length calibration. The physical quantity is this sigma
 // divided by PICTURE_DENSITY: a fraction of active picture height. K=0.75 was
@@ -2470,7 +2471,7 @@ void hook() {
 // res-scaling can push a channel past it, so cap GRACEFULLY (slightly finer than
 // ideal at that extreme) rather than ripple the spectrum. The actual film range
 // (fine digital .. ~16mm) stays under it, so this never touches normal operation.
-// KEPT at 1.5 although the support is now 13 taps: the blue outer DoG sigma
+// KEPT at 1.5 although the support is now 17 taps: the blue outer DoG sigma
 // (1.2 * 1.8 = 2.16) is capped here at the calibration point, and raising the
 // cap would move the calibrated defaults. grain_soften widens post-cap (see
 // soften_var) and is what the wider support is for.
@@ -2488,6 +2489,45 @@ void hook() {
 // rises. Offline-locked to CyberCity (tools/mgt_bandpass_design.py): BP_RATIO 1.8, A0 0.60.
 #define BP_RATIO     1.8
 #define BP_ALPHA     0.60
+// VISIBLE-STRENGTH NORMALIZATION (Phase 4, 2026-09-29). Every shape knob
+// (grain_size, grain_contrast, grain_soften) holds the grain's VISIBLE RMS,
+// its RMS after a Gaussian of variance VIS_VAR lattice samples, at the value
+// the default kernel renders, so grain_gain alone sets the amount. field_norm
+// by itself pins RAW RMS, and at the 4K reference much of a fine field's top
+// octave is near-invisible: on this model, holding raw RMS made soft and
+// coarse grain read up to ~1.65x stronger than fine grain at the same gain.
+// Film measures granularity through a fixed aperture too (Kodak's 48 um ~
+// sigma 1.4-2.5 samples on 35 mm scans, by extraction); Barten's CSF halves
+// near sigma 1.35 (desk-distance 4K) to 2.1 (100 px/deg). 1.5 is a prior in
+// that range, not a measured match: near threshold the CSF is bandpass, and a
+// bandpass model rates soft grain weaker than this one does (evidence audit
+// 2026-09-29: soften 2.5 scores 0.49-1.16x across standard CSF models). The
+// author's gain-matching sitting calibrates it. Per
+// channel: each channel holds its own visible RMS, so the VISIBLE channel
+// balance of the default look survives every knob (red, the finest kernel,
+// gains the most visible fraction as grain softens or coarsens: a green-only
+// common scalar measured +6% luma and a visible red shift at the softest
+// setting). VIS_ANCHOR_* is the default look and MUST equal the grain_size /
+// grain_contrast / grain_soften PARAM defaults (no compile guard; the gains
+// are exactly 1 there).
+#define VIS_VAR             2.25
+// Fine-side ceiling on the visible-strength gain. Very fine kernels keep most
+// of their energy above the visibility cutoff, so holding their visible RMS
+// takes up to ~3x the default's RAW amplitude, and the density arm's
+// nonlinear steps (log-normal mean correction, symmetric headroom clamps, the
+// 8.0 tone roof) act on raw amplitude: they turn that invisible excess into
+// visible shadow darkening (review 2026-09-29: -12% mean at size 0.5 in a
+// deep shadow at 1080p). Past 1.5x, fine grain reads a little weaker than
+// the anchor instead; grain_gain still reaches it. Softer/coarser kernels
+// (gain < 1) are never limited.
+#define VIS_GAIN_MAX        1.5
+#define VIS_ANCHOR_SIZE     1.34
+#define VIS_ANCHOR_CONTRAST 2.0
+#define VIS_ANCHOR_SOFTEN   0.29
+// Composite tile scale reference: R = Var / Var(lag-1 difference) of the
+// green DoG field at the default kernel (1.8607 on 17 taps), with a 2% margin
+// so the default floors to a scale of exactly 1. See m_tpl_scale.
+#define TPL_R_DEFAULT       1.90
 // Chroma/energy calibration (2026-08): common generator amplitude scale plus a
 // corpus-fit saturation triple, verified against master RGB grain correlations
 // on both film families (correlation error ~0.02 vs ~0.33 uncalibrated; luma
@@ -2507,7 +2547,7 @@ void hook() {
 // this frozen neutral state point — the same point the size/hardness lever
 // calibration was measured at — and the observer keeps measuring for
 // diagnostics only (debug rows 14/15). Archetype-specific size/hardness
-// comes from the explicit levers (grain_size / grain_sharpness /
+// comes from the explicit levers (grain_size / grain_soften /
 // grain_contrast), not from evidence. MUST equal PASS 1's neutral state
 // init (m_shot_size/m_shot_hardness = 0.50) — same manual-sync rule as
 // PICTURE_DENSITY.
@@ -2559,6 +2599,35 @@ float soften_var(float sigma, float soft2) {
     return c * c + soft2;
 }
 
+// White-noise energy of the separable DoG w1 - a*w2 built from the variance
+// pair (v1, v2) exactly as the weight fill builds it (discrete, normalized,
+// 2*MAX_TAPS+1 taps). x = raw energy; y = VISIBLE energy, after the VIS_VAR
+// visibility Gaussian. Past that blur each kernel is Gaussian to good accuracy
+// at variance (its discrete second moment + VIS_VAR), so the visible term is
+// the continuous closed form: the 2-D inner product of unit Gaussians of
+// variances va, vb is 1/(2 pi (va + vb)). Offline check against measured
+// fields: visible fraction within 1.4% at every size/contrast/soften corner,
+// with a near-constant bias that cancels in the anchor ratio.
+vec2 dog_energy(float v1, float v2, float a) {
+    float n1 = 0.0, n2 = 0.0, q11 = 0.0, q22 = 0.0, q12 = 0.0;
+    float m1 = 0.0, m2 = 0.0;
+    for (int i = -MAX_TAPS; i <= MAX_TAPS; i++) {
+        float x = float(i);
+        float w1 = gaussian_weight_var(x, v1);
+        float w2 = gaussian_weight_var(x, v2);
+        n1 += w1; n2 += w2;
+        q11 += w1 * w1; q22 += w2 * w2; q12 += w1 * w2;
+        m1 += x * x * w1; m2 += x * x * w2;
+    }
+    float i1 = 1.0 / n1, i2 = 1.0 / n2;
+    q11 *= i1 * i1; q22 *= i2 * i2; q12 *= i1 * i2;
+    float raw = q11 * q11 - 2.0 * a * q12 * q12 + a * a * q22 * q22;
+    float V1 = m1 * i1 + VIS_VAR, V2 = m2 * i2 + VIS_VAR;
+    float vis = (0.5 / V1 - 2.0 * a / (V1 + V2) + 0.5 * a * a / V2)
+              * 0.15915494;
+    return vec2(raw, vis);
+}
+
 void hook() {
     uint lid = gl_LocalInvocationIndex;
     uint num_threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
@@ -2581,20 +2650,13 @@ void hook() {
         return;
 
     // Grain is generated on the picture-space implementation lattice. Size
-    // is evidence-FROZEN (see FROZEN_SHOT_SHAPE): the generator evaluates the
-    // observer path at the neutral state point, so delivery texture can never
+    // is evidence-FROZEN (see FROZEN_SHOT_SHAPE): delivery texture can never
     // morph rendered size — the m_shot_size estimate is measure-only now.
-    float k_neutral = K_NEUTRAL;
-    float observed_size = mix(1.35, 0.65,
-                              smoothstep(0.20, 0.85, FROZEN_SHOT_SHAPE));
-    float source_size = mix(k_neutral, observed_size,
-                            clamp(match_grain * grain_sharpness, 0.0, 1.0));
-    float k_size = source_size;
-    // grain_size: live size multiplier (1.0 = calibrated). <1 finer, >1 coarser. Lets
-    // you correct the per-source size by eye -- CyberCity currently renders too FINE
-    // (fineR read its hard edges as fineness); raising size also lets the bandpass bite.
-    k_size *= grain_size;
-    const float soften_eff = 0.0;
+    // grain_size scales the calibrated neutral correlation length directly.
+    // Phase 4 removed the grain_sharpness trim that sat between them (it
+    // mixed toward the frozen observer size 1.040); its default 0.3 lives on
+    // in grain_size's default 1.34 (k 1.005 vs the old 1.0045).
+    float k_size = K_NEUTRAL * grain_size;
 
     // CONTRAST/BANDPASS: build inner (s1) AND outer (s2 = BP_RATIO*s1) blur weights.
     // bp_alpha is UNIFORM across the workgroup (grain_contrast/match_grain are
@@ -2617,9 +2679,9 @@ void hook() {
     if (regenerate && lid < uint(2 * MAX_TAPS + 1)) {
         int idx = int(lid);
         float dx = float(idx - MAX_TAPS);
-        float s1r = mix(0.78, 1.02, soften_eff) * k_size;
-        float s1g = mix(1.00, 1.22, soften_eff) * k_size;
-        float s1b = mix(1.20, 1.40, soften_eff) * k_size;
+        float s1r = 0.78 * k_size;
+        float s1g = 1.00 * k_size;
+        float s1b = 1.20 * k_size;
         // grain_soften: SUB-PIXEL CAPTURE MODEL (2026-08-22). A physical grain
         // is a continuous object that a scanner/camera pixel integrates; it is
         // not a dot sitting on the synthesis lattice. A lattice of random
@@ -2637,17 +2699,20 @@ void hook() {
         // measured master coarseness), so a fitted value is a calibration
         // follow-up; 0.29 is the minimal physical floor.
         // Symmetric kernels commute with the composite's window flips and
-        // integer offsets, so folding it here equals filtering the assembled
-        // field at OUTPUT for zero per-present cost. Applied AFTER the
+        // integer offsets, so folding it here equals filtering each template
+        // window for zero per-present cost. (Not the assembled field: the
+        // composite's overlap crossfade is not a filter, which is why its band
+        // scales with the kernel -- m_tpl_scale below.) Applied AFTER the
         // SIGMA_MAX cap so 0 restores the legacy kernels exactly (verified
         // byte-identical with MAX_TAPS pinned to 4; the wider support alone
         // carries Gaussian tails 9 taps truncated, < 0.01% RMS) and the
         // calibrated cap point never moves; bp_norm/field_norm/covariance below are analytic from
-        // these weights, so matched RMS holds (amplitude-preserving, like
-        // grain_contrast) on the generation lattice; at sub-2160 outputs the
-        // composite's footprint box (not RMS-renormalized by design) loses
-        // less of a softer field, so delivered RMS rises a little there
-        // (measured 1080p: +1/+4/+6% at 0.29/0.75/1.0; 4K: <= 0.34%). Red
+        // these weights. The amplitude holds VISIBLE strength (field_gain
+        // below, Phase 4; it held raw RMS before) on the generation lattice;
+        // at sub-2160 outputs the composite's footprint box (not
+        // RMS-renormalized by design) loses less of a softer field, so
+        // delivered RMS rises a little there (measured 1080p before Phase 4:
+        // +1/+4/+6% at 0.29/0.75/1.0; 4K: <= 0.34%). Red
         // (the finest channel, ~33% of its power at periods < 4 px at the
         // defaults vs 5% for blue; measured 0.338 at 4K) gives up the most
         // ABSOLUTE fine power -- the per-pixel speckle grain_size cannot
@@ -2692,6 +2757,34 @@ void hook() {
                            - 2.0 * bp_alpha * (s12c[c]*s12c[c]) / r1;
             bp_norm[c] = inversesqrt(max(vr, 1e-4));
         }
+        // Visible-strength hold (see VIS_VAR): each channel's kernel pair
+        // against the same channel at the default kernel. Exactly 1 at the
+        // defaults (uniform PARAM branch), so the calibrated look is untouched.
+        vec3 field_gain = vec3(1.0);
+        if (abs(grain_size - VIS_ANCHOR_SIZE) > 1.0e-6
+            || abs(grain_contrast - VIS_ANCHOR_CONTRAST) > 1.0e-6
+            || abs(grain_soften - VIS_ANCHOR_SOFTEN) > 1.0e-6
+            || match_grain < 1.0) {
+            float live_soft2 = grain_soften * grain_soften;
+            float anchor_soft2 = VIS_ANCHOR_SOFTEN * VIS_ANCHOR_SOFTEN;
+            float anchor_k = K_NEUTRAL * VIS_ANCHOR_SIZE;
+            float anchor_alpha = min(BP_ALPHA * VIS_ANCHOR_CONTRAST
+                                     * render_hardness, 0.95);
+            const vec3 CHANNEL_SIGMA = vec3(0.78, 1.00, 1.20);
+            for (int c = 0; c < 3; c++) {
+                float kl = CHANNEL_SIGMA[c] * k_size;
+                float ka = CHANNEL_SIGMA[c] * anchor_k;
+                vec2 e_live = dog_energy(soften_var(kl, live_soft2),
+                                         soften_var(kl * BP_RATIO, live_soft2),
+                                         bp_alpha);
+                vec2 e_anchor = dog_energy(soften_var(ka, anchor_soft2),
+                                           soften_var(ka * BP_RATIO, anchor_soft2),
+                                           anchor_alpha);
+                field_gain[c] = min(sqrt((e_anchor.y * e_live.x)
+                                         / max(e_anchor.x * e_live.y, 1.0e-12)),
+                                    VIS_GAIN_MAX);
+            }
+        }
         // Two per-channel sigma families since the chroma/energy calibration.
         // GRAIN_STD is the FROZEN marginal std of the historical anchor mix —
         // it stays the field_norm denominator so the calibrated saturations
@@ -2730,6 +2823,9 @@ void hook() {
         field_norm[0] = 0.08318138 / max(GRAIN_STD.x * s1c[0], 1.0e-6);
         field_norm[1] = 0.06602582 / max(GRAIN_STD.y * s1c[1], 1.0e-6);
         field_norm[2] = 0.04909565 / max(GRAIN_STD.z * s1c[2], 1.0e-6);
+        field_norm[0] *= field_gain.r;
+        field_norm[1] *= field_gain.g;
+        field_norm[2] *= field_gain.b;
 
         // Analytic pre-warp RGB covariance of the field this dispatch builds.
         // H.274/AV1 model grain per colour component, and the generator's
@@ -2780,12 +2876,12 @@ void hook() {
         // field_norm keeps the historical GRAIN_STD anchors, so the rendered
         // field's true std is anchor * mix_std/GRAIN_STD — at the calibrated
         // defaults every channel now sits above its anchor (red most, ~1.17x)
-        // and it drifts further when base_sat is changed. Derive cap-only live
-        // diagonals from the actual mix. Do not feed these into the log-normal
-        // mean correction: that stays a static constant evaluated at the
-        // calibrated defaults (OUTPUT field_var).
+        // and it drifts further when base_sat is changed. Derive the live
+        // diagonals from the actual mix (and the amount normalization): OUTPUT
+        // uses them for the colour-energy cap AND, since Phase 4, for the
+        // log-normal mean correction.
         vec3 cap_field_std = vec3(0.08318138, 0.06602582, 0.04909565)
-                           * mix_std / GRAIN_STD;
+                           * mix_std / GRAIN_STD * field_gain;
         vec3 cap_field_var = cap_field_std * cap_field_std;
         // Schur product of two Gram matrices is PSD algebraically. Project the
         // third correlation into the valid interval implied by the first two;
@@ -2806,6 +2902,33 @@ void hook() {
         m_field_var_r = cap_field_var.r;
         m_field_var_g = cap_field_var.g;
         m_field_var_b = cap_field_var.b;
+        // Composite tile scale for this field (Phase 4 seam fix). The OUTPUT
+        // overlap crossfade (weights w, sum of squares 1, slope delta ~ pi/2OV)
+        // adds band gradient energy delta^2 (R - 1/2) relative to the
+        // field's own, where R = Var / Var(lag-1 difference) is its squared
+        // correlation length (the -1/2 is the w.A x dA cross term): the fixed
+        // 8-sample band that is seamless on the default kernel measured up to
+        // +20% on soft grain. Scale TPL_BLOCK and TPL_OV together by
+        // sqrt((R - 1/2) / (TPL_R_DEFAULT - 1/2)) to hold the default's excess,
+        // floored at exactly 1 so the default and every finer kernel keep
+        // the historical composite. R comes from the green DoG weights, exact
+        // for the discrete template (softening a bandpass field lengthens its
+        // correlation faster than its inner sigma, so no sigma proxy). Band
+        // fraction, fetch count and per-present cost stay flat; OV alone
+        // would put ~57% of pixels in multi-fetch bands at the softest
+        // setting.
+        float g11 = 0.0, g22 = 0.0, g12 = 0.0;
+        for (int i = 0; i < 2 * MAX_TAPS; i++) {
+            g11 += dyn_wg[i] * dyn_wg[i + 1];
+            g22 += dyn_wg2[i] * dyn_wg2[i + 1];
+            g12 += dyn_wg[i] * dyn_wg2[i + 1];
+        }
+        float lag1 = g11 * s1c[1] - 2.0 * bp_alpha * g12 * s12c[1]
+                   + a2 * g22 * s2c[1];
+        float corr_len2 = self_energy.y
+                        / max(2.0 * (self_energy.y - lag1), 1.0e-12);
+        m_tpl_scale = max(1.0, sqrt(max(corr_len2 - 0.5, 0.0)
+                                    / (TPL_R_DEFAULT - 0.5)));
         }
         if (value_warp > 0.05) {
             float num = 0.0, den = 0.0;
@@ -2827,7 +2950,14 @@ void hook() {
         uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
         ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy)
                              + ivec2(local_pos) - ivec2(MAX_TAPS);
-        uvec2 global_pos = uvec2((global_coord_i % GEN_GRID + GEN_GRID) % GEN_GRID);
+        // global_coord_i >= -MAX_TAPS, so one added grid extent keeps the
+        // dividend non-negative. GLSL leaves % undefined on negative operands,
+        // and NVIDIA's Vulkan compiler really does wrap them as unsigned
+        // (measured 2026-09-29: the template's row 0 and column 0 took their
+        // halo noise from columns 248..255 instead of 952..959 -- a torus seam
+        // that showed as moving line segments, 2.3x gradient energy at the
+        // defaults and 17x on soft grain).
+        uvec2 global_pos = uvec2((global_coord_i + GEN_GRID) % GEN_GRID);
         uint seed_init = (global_pos.x * 1664525u) + (global_pos.y * 22695477u)
                        + (frame_seed * 314159265u);
         float g_r = rand_triangular(seed_init, RED_VARIANCE_SCALE);
@@ -2839,16 +2969,34 @@ void hook() {
         grain_b[local_pos.y][local_pos.x] = mix(grain_lum, g_b, BLUE_SATURATION * grain_base_sat);
     }
     barrier();
-    if (regenerate) for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
-        float hsum_r = 0.0, hsum_g = 0.0, hsum_b = 0.0;
-        for (int x = 0; x < 2 * MAX_TAPS + 1; x++) {
-            hsum_r += dyn_wr[x] * grain_r[y][gl_LocalInvocationID.x + x];
-            hsum_g += dyn_wg[x] * grain_g[y][gl_LocalInvocationID.x + x];
-            hsum_b += dyn_wb[x] * grain_b[y][gl_LocalInvocationID.x + x];
+    // Horizontal pass, race-free: every lane reads its whole footprint into
+    // registers, a barrier, THEN the centre columns are overwritten. Written
+    // in place, a lane's store of column x+MAX_TAPS raced its neighbours'
+    // reads of it on any SIMD width below 32 (a 32-lane row only happened to
+    // sit in one NVIDIA warp / AMD wave). Each lane owns at most two rows:
+    // isize.y <= 2 * gl_WorkGroupSize.y while MAX_TAPS <= 16. The barrier is
+    // unconditional (regenerate is an SSBO read -> X3663).
+    uint hy0 = gl_LocalInvocationID.y;
+    uint hy1 = gl_LocalInvocationID.y + gl_WorkGroupSize.y;
+    float h0r = 0.0, h0g = 0.0, h0b = 0.0, h1r = 0.0, h1g = 0.0, h1b = 0.0;
+    if (regenerate) for (int x = 0; x < 2 * MAX_TAPS + 1; x++) {
+        uint sx = gl_LocalInvocationID.x + uint(x);
+        h0r += dyn_wr[x] * grain_r[hy0][sx];
+        h0g += dyn_wg[x] * grain_g[hy0][sx];
+        h0b += dyn_wb[x] * grain_b[hy0][sx];
+        if (hy1 < isize.y) {
+            h1r += dyn_wr[x] * grain_r[hy1][sx];
+            h1g += dyn_wg[x] * grain_g[hy1][sx];
+            h1b += dyn_wb[x] * grain_b[hy1][sx];
         }
-        grain_r[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_r;
-        grain_g[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_g;
-        grain_b[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_b;
+    }
+    barrier();
+    if (regenerate) {
+        uint cx = gl_LocalInvocationID.x + uint(MAX_TAPS);
+        grain_r[hy0][cx] = h0r; grain_g[hy0][cx] = h0g; grain_b[hy0][cx] = h0b;
+        if (hy1 < isize.y) {
+            grain_r[hy1][cx] = h1r; grain_g[hy1][cx] = h1g; grain_b[hy1][cx] = h1b;
+        }
     }
     barrier();
     float vsum1_r = 0.0, vsum1_g = 0.0, vsum1_b = 0.0;
@@ -2869,7 +3017,7 @@ void hook() {
             uvec2 local_pos = uvec2(i % isize.x, i / isize.x);
             ivec2 global_coord_i = ivec2(gl_WorkGroupID.xy * gl_WorkGroupSize.xy)
                                  + ivec2(local_pos) - ivec2(MAX_TAPS);
-            uvec2 global_pos = uvec2((global_coord_i % GEN_GRID + GEN_GRID) % GEN_GRID);
+            uvec2 global_pos = uvec2((global_coord_i + GEN_GRID) % GEN_GRID);
             uint seed_init = (global_pos.x * 1664525u) + (global_pos.y * 22695477u)
                            + (frame_seed * 314159265u);
             float g_r = rand_triangular(seed_init, RED_VARIANCE_SCALE);
@@ -2881,16 +3029,26 @@ void hook() {
             grain_b[local_pos.y][local_pos.x] = mix(grain_lum, g_b, BLUE_SATURATION * grain_base_sat);
         }
         barrier();
-        if (regenerate) for (uint y = gl_LocalInvocationID.y; y < isize.y; y += gl_WorkGroupSize.y) {
-            float hsum_r = 0.0, hsum_g = 0.0, hsum_b = 0.0;
-            for (int x = 0; x < 2 * MAX_TAPS + 1; x++) {
-                hsum_r += dyn_wr2[x] * grain_r[y][gl_LocalInvocationID.x + x];
-                hsum_g += dyn_wg2[x] * grain_g[y][gl_LocalInvocationID.x + x];
-                hsum_b += dyn_wb2[x] * grain_b[y][gl_LocalInvocationID.x + x];
+        // Same race-free horizontal pass as the inner blur.
+        h0r = 0.0; h0g = 0.0; h0b = 0.0; h1r = 0.0; h1g = 0.0; h1b = 0.0;
+        if (regenerate) for (int x = 0; x < 2 * MAX_TAPS + 1; x++) {
+            uint sx = gl_LocalInvocationID.x + uint(x);
+            h0r += dyn_wr2[x] * grain_r[hy0][sx];
+            h0g += dyn_wg2[x] * grain_g[hy0][sx];
+            h0b += dyn_wb2[x] * grain_b[hy0][sx];
+            if (hy1 < isize.y) {
+                h1r += dyn_wr2[x] * grain_r[hy1][sx];
+                h1g += dyn_wg2[x] * grain_g[hy1][sx];
+                h1b += dyn_wb2[x] * grain_b[hy1][sx];
             }
-            grain_r[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_r;
-            grain_g[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_g;
-            grain_b[y][gl_LocalInvocationID.x + MAX_TAPS] = hsum_b;
+        }
+        barrier();
+        if (regenerate) {
+            uint cx = gl_LocalInvocationID.x + uint(MAX_TAPS);
+            grain_r[hy0][cx] = h0r; grain_g[hy0][cx] = h0g; grain_b[hy0][cx] = h0b;
+            if (hy1 < isize.y) {
+                grain_r[hy1][cx] = h1r; grain_g[hy1][cx] = h1g; grain_b[hy1][cx] = h1b;
+            }
         }
         barrier();
         if (regenerate) for (int y = 0; y < 2 * MAX_TAPS + 1; y++) {
@@ -2954,22 +3112,12 @@ void hook() {
 #define MP_FIELD_STD_OUT 0.0185
 // MUST equal PASS 1's MP_STATE_MAGIC (same translation-unit-sync rule as
 // MP_TONE_BINS_OUT / MP_FIELD_STD_OUT — no compile guard exists).
-#define MP_STATE_MAGIC_OUT 0.951820
+#define MP_STATE_MAGIC_OUT 0.954120
 // MUST equal PASS 1's MEASURE_BLACK / MEASURE_WHITE (same no-guard sync rule).
 #define MEASURE_BLACK_OUT (16.0 / 255.0)
 #define MEASURE_WHITE_OUT (235.0 / 255.0)
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
-// True per-channel variance of the canonical rendered field at the calibrated
-// defaults: (anchor * mix_std/GRAIN_STD)^2 with PASS 1's chroma/energy-
-// calibrated mix (scales 1.027766, saturations 0.736/0.262/0.718, base_sat
-// 0.75). Static by design — the log-normal zero-mean correction stays pinned
-// to the calibration point; live diagonals are cap-only (see PASS 1). The
-// pre-calibration triple was the bare anchors 0.08318138/0.06602582/0.04909565
-// squared.
-const vec3 field_var = vec3(0.09695780 * 0.09695780,
-                            0.06967857 * 0.06967857,
-                            0.05353626 * 0.05353626);
 
 // Workgroup snapshot of every GRAIN_STATE scalar the live path reads. On the
 // NVIDIA Vulkan driver the per-pixel SSBO loads in this pass measured
@@ -2997,6 +3145,11 @@ shared float s_field_var_b;
 shared float s_field_cov_rg;
 shared float s_field_cov_rb;
 shared float s_field_cov_gb;
+shared float s_tpl_scale;
+shared float s_tpl_block;
+shared float s_tpl_ov;
+shared float s_tpl_block_inv;
+shared float s_tpl_ov_inv;
 shared float s_char_p[8];
 shared float s_restore_p[8];
 
@@ -3190,24 +3343,24 @@ uint pcg_hash(uint s) {
 // One block's grain sample for an arbitrary picture-lattice position pos. b is
 // the block index doing the presenting (possibly a neighbour of pos's own
 // block, when evaluating the overlap bands — intra then exceeds [0,BLOCK)
-// and the flip can go one period negative, bounded by -TPL_OV). One template
+// and the flip can go one period negative, bounded by -s_tpl_ov, <= 32). One template
 // extent is added before the fetch so the coordinate reaching grain_point's
 // integer wrap is ALWAYS non-negative: GLSL leaves % formally undefined on
 // negative operands, and since the 2026-07-23 perf round grain_point uses a
 // SINGLE mod — this add IS the correctness guarantee, not a spec nicety.
 // Removing it would feed negative coords to the wrap (worst case intra
-// >= -TPL_OV on flipped neighbour-overlap samples) and break the torus.
+// >= -s_tpl_ov on flipped neighbour-overlap samples) and break the torus.
 // Each block shows a randomized (integer offset + H/V
 // flip) window of the toroidal template, re-hashed per visible tick.
 vec3 tpl_sample(vec2 b, vec2 pos, float vseed, ivec2 g) {
-    vec2 intra = pos - b * TPL_BLOCK;
+    vec2 intra = pos - b * s_tpl_block;
     uint h0 = pcg_hash(uint(int(b.x)) * 374761393u
                      + uint(int(b.y)) * 3266489917u
                      + uint(vseed) * 668265263u);
     uint h1 = pcg_hash(h0);
     uint h2 = pcg_hash(h1);
-    if ((h2 & 1u) != 0u) intra.x = TPL_BLOCK - intra.x;
-    if ((h2 & 2u) != 0u) intra.y = TPL_BLOCK - intra.y;
+    if ((h2 & 1u) != 0u) intra.x = s_tpl_block - intra.x;
+    if ((h2 & 2u) != 0u) intra.y = s_tpl_block - intra.y;
     return grain_point(intra + vec2(g)
                        + vec2(float(h0 % uint(g.x)), float(h1 % uint(g.y))), g);
 }
@@ -3217,15 +3370,15 @@ vec3 tpl_sample(vec2 b, vec2 pos, float vseed, ivec2 g) {
 // reusing the centre pixel's block weights would crossfade the wrong shuffled
 // windows at block boundaries.
 vec3 picture_point(vec2 pos, float vseed, ivec2 g) {
-    vec2 b = floor(pos / TPL_BLOCK);
-    vec2 u = pos - b * TPL_BLOCK;
+    vec2 b = floor(pos * s_tpl_block_inv);
+    vec2 u = pos - b * s_tpl_block;
     float wxp = 0.0, wxc = 1.0, wyp = 0.0, wyc = 1.0;
-    if (u.x < TPL_OV) {
-        float t = u.x / TPL_OV * 1.5707963;
+    if (u.x < s_tpl_ov) {
+        float t = u.x * s_tpl_ov_inv * 1.5707963;
         wxp = cos(t); wxc = sin(t);
     }
-    if (u.y < TPL_OV) {
-        float t = u.y / TPL_OV * 1.5707963;
+    if (u.y < s_tpl_ov) {
+        float t = u.y * s_tpl_ov_inv * 1.5707963;
         wyp = cos(t); wyc = sin(t);
     }
     vec3 field = (wxc * wyc) * tpl_sample(b, pos, vseed, g);
@@ -3359,6 +3512,16 @@ void hook() {
         s_field_cov_rg = m_field_cov_rg;
         s_field_cov_rb = m_field_cov_rb;
         s_field_cov_gb = m_field_cov_gb;
+        // Tile geometry of the stored field (PASS 2 writes it with the field;
+        // never re-derived here). Valid state peaks near 3.5 (size >= 2,
+        // contrast 0, soften 2.5); the clamp only guards torn/foreign state.
+        // Reciprocals keep the per-tap divides out of picture_point (exact at
+        // the default scale 1: 1/64 and 1/8).
+        s_tpl_scale = clamp(m_tpl_scale, 1.0, 4.0);
+        s_tpl_block = TPL_BLOCK * s_tpl_scale;
+        s_tpl_ov = TPL_OV * s_tpl_scale;
+        s_tpl_block_inv = 1.0 / s_tpl_block;
+        s_tpl_ov_inv = 1.0 / s_tpl_ov;
         for (int i = 0; i < 8; i++) {
             s_char_p[i] = m_char_p[i];
             s_restore_p[i] = m_restore_p[i];
@@ -3470,7 +3633,9 @@ void hook() {
     // texel fetch at gscale == 1.0, as before.
     float vseed = s_arr_seed;
     uint j0 = pcg_hash(uint(vseed) * 2246822519u + 3u);
-    vec2 fj = fpos + vec2(float(j0 % 64u), float((j0 >> 8) % 64u));
+    // Whole-texel jitter across one (scaled) block period.
+    vec2 fj = fpos + floor(vec2(float(j0 % 64u), float((j0 >> 8) % 64u))
+                           * s_tpl_scale);
     vec3 vsum = picture_pixel(fj, gscale, vseed, gsize);
 
     // grain_hdr bridge: work in the measured SDR domain (see helpers above).
@@ -3529,12 +3694,19 @@ void hook() {
                                   - max(color_luma, 0.0), 0.0)
                               * pedestal_gate;
         vec3 x = DENSITY_GAIN * vsum * tone_den;
-        // Canonical-field log-normal bias correction. Footprint filtering
-        // changes covariance, so non-native-density presentations retain a very small
+        // Canonical-field log-normal bias correction, on the LIVE per-channel
+        // variance of the stored field (PASS 2's diagonals: mix, amount
+        // normalization and saturation included). It was a static triple
+        // pinned at base_sat 0.75 and the default kernel; Phase 4's shape
+        // knobs move raw variance 0.3-2.3x and base_sat up to 2 moves blue's
+        // 4.5x, and a stale variance shifts the density mean (brighter when
+        // too small, darker when too large). Footprint filtering changes
+        // covariance, so non-native-density presentations retain a small
         // conservative bias rather than pretending sum(weights^2) is exact
         // for the correlated DoG field.
         vec3 density_delta = exp(x - 0.5 * DENSITY_GAIN * DENSITY_GAIN
-                               * tone_den * tone_den * field_var) - 1.0;
+                               * tone_den * tone_den
+                               * vec3(s_field_var_r, s_field_var_g, s_field_var_b)) - 1.0;
         vec3 density_grain = work_rgb * density_delta;
         density_grain += vec3(pedestal_signal) * density_delta;
         // One post-density scalar preserves channel log-normal shapes, their

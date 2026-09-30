@@ -17,13 +17,20 @@
 // animation masters all carry acquisition/finishing noise: weak measurement shifts
 // weight toward the title prior, never toward a fictitious noiseless master.
 //
-// The observer is hidden scratch. It measures eight exposure-weighted luma zones,
-// three picture-relative spatial bands, temporal authenticity, coverage, motion,
-// cut distance and delivery rolloff. It updates the title posterior slowly. The
-// visible shot model may adapt quickly only in the short perceptual window after a
-// real cut; inside a shot all upward change is deliberately slow and motion can
-// only freeze learning. Independent source and synthetic powers combine in
-// quadrature over the untouched source.
+// What is automatic is the AMOUNT: per-luma grain power. The grain's character
+// (size, softness, hardness, value contrast, colour noise) comes from the look
+// knobs and is never measured -- delivery encodes destroy it. The observer is
+// hidden scratch. It measures one picture-relative grain band in eight
+// exposure-weighted luma zones, temporal authenticity, coverage, motion and cut
+// distance; a cell whose content moved is left out of that frame's reading.
+// A tone that has not yet earned authority learns its level fast, but only for
+// the first few evidence units of each shot, so speed follows the number of
+// shots that show grain (a grainy title is matched within minutes; a one-shot
+// noise effect stays small); earned authority stays slow. The visible shot
+// model may adapt quickly only in the short perceptual window after a real
+// cut; inside a shot all upward change is deliberately slow, and frames whose
+// flat areas mostly moved count less in both directions. Independent source
+// and synthetic powers combine in quadrature over the untouched source.
 //
 // Architecture (LUMA measure + source-locked template gen, OUTPUT composite):
 //   PASS 1 - Compute 32x32 at LUMA, measurement only: saves to a 1x1 dummy
@@ -33,24 +40,30 @@
 //            source raster with a fixed cut/matte probe, remaps the grain
 //            observer into the committed active picture, and writes only
 //            GRAIN_STATE.
-//   PASS 2 - Compute 32x32 at LUMA: conditionally regenerates the persistent
-//            960x540 grain vocabulary; skipped ticks retain it while PASS 3
-//            still chooses a fresh arrangement.
+//   PASS 2 - Compute 32x32 at LUMA: regenerates the persistent 960x540 grain
+//            vocabulary on every visible tick (and on a look edit); between
+//            ticks it is retained and PASS 3 repeats the arrangement.
 //   PASS 3 - Compute 32x32 at OUTPUT: assembles the picture-space field from
 //            randomized template windows and composites it only
 //            inside the committed active picture.
 //
-// Runtime params. Only match_grain / debug_match / value_warp are on keys (F3 / Ctrl+F3 /
-// Alt+F3 via shader-toggle.lua); the rest are tuned by editing the DEFAULT value under each
-// param block below and reloading (the lua no longer overrides them). The param blocks are
-// ordered to match these groups. (Comments cannot sit between the param blocks -- the parser
-// rejects it -- so every param is documented HERE.)
+// Runtime params. Every param is DYNAMIC and tuned live through glsl-shader-opts
+// (shampv: match_grain / debug_match are its toggles); the defaults below are the
+// calibrated values. The param blocks are ordered to match these groups. (Comments
+// cannot sit between the param blocks -- the parser rejects it -- so every param is
+// documented HERE.)
 //
 //  == CONTROL ===============================================================
 //   match_grain      0 = no synthetic output, 1 = Match Grain+; observation
-//                    continues so live A/B does not cold-start.                [F3]
-//   debug_match      compact 52-row machine-readable posterior/geometry overlay. [Ctrl+F3]
-//   state_epoch      harness reset token; bump once per source file.
+//                    continues so live A/B does not cold-start. Between 0 and 1
+//                    it is a pure output mix: the template does not change.
+//   debug_match      compact 52-row machine-readable posterior/geometry overlay.
+//   state_epoch      persisted-state token, two parts. mod 4096 = the title
+//                    or series: any change is a cold start (bump by 1 per file
+//                    for a cold start per file). floor(x / 4096) = the file in
+//                    that series: a change of that part alone carries the
+//                    title's learned grain into the next episode at a quarter
+//                    of its authority. Machine-owned (shampv epoch-param).
 //   grain_pause      machine-owned pause input; freezes temporal state; baked
 //                    look edits may rebuild the standing field in place.
 //
@@ -67,7 +80,7 @@
 //                    more DC removed / peppery (difference-of-Gaussians).
 //   value_warp       VALUE-domain contrast: 0 = Gaussian (bit-identical), ~2 hard, ~3 extreme
 //                    = bimodal/high-per-grain-contrast (CyberCity "harsh"). Amplitude-
-//                    preserving; the value-domain cousin of grain_contrast.    [Alt+F3]
+//                    preserving; the value-domain cousin of grain_contrast.
 //   grain_soften     sub-pixel CAPTURE softness in lattice samples (picture-
 //                    height units, a title property like grain_size): a common
 //                    scan-aperture/optical MTF folded into every channel's
@@ -91,12 +104,12 @@
 //   grain_rate       visible temporal cadence: fraction of SOURCE frames that
 //                    choose a fresh on-screen arrangement (1 = on ones; 0.5 =
 //                    on twos). Source-locked and display-refresh independent.
-//   grain_gen_rate   template-vocabulary regeneration rate as a fraction of
-//                    visible grain ticks. 1 = every tick; 0.25 = every fourth.
-//                    Arrangement still rehashes on every visible tick, so this
-//                    is a small performance option, not a boil-speed control.
+//                    The 0.0625 floor is dyadic for the same reason as size's.
 //   grain_base_sat   colour noise of the grain (per-channel independence).
-//                    0 = mono; 0.75 = calibrated look; ~1.36 = red and blue
+//                    0 = one shared noise -- not mono: the per-channel kernel
+//                    sizes still leave fine colour speckle (R-B sigma ~0.46x a
+//                    channel's at the default size); 0.75 = calibrated look;
+//                    ~1.36 = red and blue
 //                    fully independent, like separate dye layers; up to 2 =
 //                    exaggerated colour noise beyond real film, for outlier
 //                    sources. The luma amount holds within 2% across the whole
@@ -104,14 +117,41 @@
 //
 //  == RESTORATION (how much grain to rebuild on degraded sources) ===========
 //   restore_gain     missing-power lane only: 0 = character complement C,
-//                    1 = inferred target, >1 = explicit amplitude override;
+//                    1 = inferred target, >1 = explicit amplitude override. The
+//                    restored AMPLITUDE scales linearly with it (power with its
+//                    square) at every value;
 //                    values near 5 are aggressive shot-specific overrides,
 //                    not a preset; 6 is the expert ceiling.
 //   grain_extreme    per-title admission scale for grain HEAVIER than the
 //                    normal film model (the plausibility band rejects it as
 //                    fireworks/damage otherwise). 1 = exactly neutral; ~2 for
 //                    the sandpaper OVA class whose measured grain sits at
-//                    4-8x normal; set from a profile, not a look knob.
+//                    4-8x normal; set from a profile, not a look knob. It
+//                    widens the plausibility band and raises the learned-
+//                    amount ceilings (the title level may reach 3.24 x its
+//                    square x the clean level). Since 5B it no longer scales
+//                    the stillness test: the titles that test starved
+//                    (Utena, Gunbuster) are credited at 1, and 2 moves them
+//                    by only 5-7% (replay, 2026-09-30).
+//   grain_floor      the engine's built-in MINIMUM added grain -- what a title
+//                    with no grain evidence (a clean title) gets -- as a level:
+//                    1 = as calibrated (default, exact), 0.5 = half, 0 = no
+//                    added grain on clean titles, 1.5 = +50%, 2 = double.
+//                    Titles the engine recognises as grainy already add more
+//                    (~1.7-7x the clean amount once learned: Kuroneko 1.7,
+//                    Cyber City 4.4, Utena 7.1). Raising only lifts titles
+//                    below the new
+//                    level (so above ~1.7 it reaches those titles too);
+//                    lowering only reduces titles at the minimum and eases out
+//                    by 1.5x it, so a
+//                    title rising through that band while the engine learns it
+//                    never steps. One factor per title: the tone shape is kept.
+//                    Titles whose grain the engine does not credit sit at the
+//                    minimum and follow the knob like clean titles, as does
+//                    every title before its first grainy shots are learned
+//                    (the first minutes of a grainy title). restore_gain
+//                    and grain_gain stay
+//                    relative trims on top.
 //
 //  == PIPELINE / SIZING =====================================================
 //   density_combine  0 = additive, 1 = multiplicative density, between = linear
@@ -230,6 +270,7 @@
 //@shampv choice grain_source_trc gamma pq
 //@shampv step grain_gain 0.05
 //@shampv step density_combine 0.05
+//@shampv step grain_floor 0.05
 //@shampv step grain_soften 0.05
 //@shampv measures LUMA
 
@@ -248,7 +289,7 @@
 0.0
 
 //!PARAM state_epoch
-//!DESC Persisted-state reset token — bump by at least 1 to wipe saved grain state live (once per source file). The magnitude itself is meaningless.
+//!DESC Persisted-state token. mod 4096 = the title or series: any change wipes the saved grain state (bump by 1 per file for a cold start per file). floor(x / 4096) = the file within that series: a change of that part alone carries the title's learned grain into the next episode at a quarter of its authority.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 65535.0
@@ -299,29 +340,29 @@
 //!PARAM grain_rate
 //!DESC Visible arrangement cadence in SOURCE frames. 1 = fresh arrangement every frame / on ones · 0.5 = on twos. ↓ slows the boil. Display-refresh independent. 0.333 ≈ on-threes.
 //!TYPE DYNAMIC float
-//!MINIMUM 0.1
-//!MAXIMUM 1.0
-1.0
-
-//!PARAM grain_gen_rate
-//!DESC Template regeneration rate as a fraction of visible grain ticks. 1 = every tick (default) · 0.25 = every fourth. Arrangement still rehashes per tick; lower = cheaper, not identical.
-//!TYPE DYNAMIC float
-//!MINIMUM 0.1
+//!MINIMUM 0.0625
 //!MAXIMUM 1.0
 1.0
 
 //!PARAM grain_base_sat
-//!DESC Colour noise of the grain. 0 = mono · 0.75 = calibrated · ~1.36 = channels fully independent (dye layers) · up to 2 = exaggerated colour noise for outlier sources. The luma amount stays the same; only the colour noise grows. Explicit prior character, not source-measured chroma.
+//!DESC Colour noise of the grain. 0 = one shared noise (fine colour speckle remains from the per-channel sizes) · 0.75 = calibrated · ~1.36 = channels fully independent (dye layers) · up to 2 = exaggerated colour noise for outlier sources. The luma amount stays the same; only the colour noise grows. Explicit prior character, not source-measured chroma.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
 0.75
 
 //!PARAM restore_gain
-//!DESC Missing-power authority. 0 = complement only · 1 = inferred missing-power target · above 2 restored power rises ~quadratically and can overgrain intact material · 6 = expert ceiling.
+//!DESC Missing-power authority. 0 = complement only · 1 = inferred missing-power target · restored amplitude scales linearly with it (power with its square); high values can overgrain intact material · 6 = expert ceiling.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 6.0
+1.0
+
+//!PARAM grain_floor
+//!DESC Level of the built-in minimum grain (what a clean title gets). 1 = as calibrated · 0.5 = half · 0 = none on clean titles · 1.5 = +50% · 2 = double. Raising lifts only titles adding less than the chosen level; lowering reduces only titles near the minimum (eased out by 1.5x). Grainy titles the engine does not credit read as clean.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 2.0
 1.0
 
 //!PARAM density_combine
@@ -332,7 +373,7 @@
 1.0
 
 //!PARAM grain_extreme
-//!DESC Extreme-grain admission. 1 = normal film model (exactly neutral) · 2 = admit ~2x heavier grain (sandpaper OVA class) · above ~2.5 only for the heaviest scans. Scales the plausibility band, the temporal/still instruments, and the evidence ceilings together.
+//!DESC Extreme-grain admission. 1 = normal film model (exactly neutral) · 2 = admit ~2x heavier grain (sandpaper OVA class) · above ~2.5 only for the heaviest scans. Scales the plausibility band and the evidence ceilings together.
 //!TYPE DYNAMIC float
 //!MINIMUM 1.0
 //!MAXIMUM 4.0
@@ -355,7 +396,7 @@
 //!PARAM grain_fade
 //!DESC Work-domain luma of full fade-out. 1.10 = stock top (clip-limited chains cap at 0.95) · 0.2-0.3 confines grain low · with grain_headroom = 1 it is the above-ref-white reach — by eye.
 //!TYPE DYNAMIC float
-//!MINIMUM 0.2
+//!MINIMUM 0.1875
 //!MAXIMUM 2.5
 1.10
 
@@ -375,7 +416,6 @@
 
 //!BUFFER GRAIN_STATE
 //!VAR float m_observed
-//!VAR float m_structure_ratio
 //!VAR float m_measured
 //!VAR float m_prev_ready
 //!VAR float m_state_magic
@@ -385,29 +425,23 @@
 //!VAR float m_cut_score
 //!VAR float m_gen_frame
 //!VAR float m_eff_render
-//!VAR float m_title_conf
 //!VAR float m_title_power
 //!VAR float m_temporal_support
-//!VAR float m_est_missing
-//!VAR float m_loss_conf
-//!VAR float m_loss_mix
-//!VAR float m_tone_conf
-//!VAR float m_title_size
-//!VAR float m_title_hardness
-//!VAR float m_shot_size
-//!VAR float m_shot_hardness
+//!VAR float m_evidence
+//!VAR float m_ev_gate
+//!VAR float m_auth_mean
+//!VAR float m_acq_max
+//!VAR float m_q_random
+//!VAR float m_q_source
 //!VAR float m_shot_age
-//!VAR float m_shot_conf
 //!VAR float m_shot_gain
+//!VAR float m_shot_ev
 //!VAR float m_shot_restore_boost
 //!VAR float m_master_p[8]
 //!VAR float m_master_w[8]
-//!VAR float m_shot_obs_p[8]
-//!VAR float m_shot_obs_w[8]
 //!VAR float m_char_p[8]
 //!VAR float m_restore_p[8]
 //!VAR float m_arr_seed
-//!VAR float m_field_seed
 //!VAR float m_regen
 //!VAR float m_regen_pending
 //!VAR float m_field_valid
@@ -422,9 +456,9 @@
 //!VAR float m_baked_value_warp
 //!VAR float m_baked_grain_base_sat
 //!VAR float m_baked_grain_soften
-//!VAR float m_baked_match_grain
 //!VAR float prev_grid[4096]
 //!VAR float prev_grid_off[4096]
+//!VAR float prev_mean[4096]
 //!VAR float m_source_aspect
 //!VAR float m_active_inset_x
 //!VAR float m_active_inset_y
@@ -437,9 +471,12 @@
 //!VAR float m_geom_blackout
 //!VAR float m_geom_blackout_y
 //!VAR float m_geom_changed
+//!VAR float m_geom_shrink_x
+//!VAR float m_geom_shrink_y
+//!VAR float m_geom_shrink_cand_x
+//!VAR float m_geom_shrink_cand_y
 //!VAR float prev_probe[4096]
 //!VAR float m_pan_px
-//!VAR float m_bed_ema
 //!VAR float m_tpl_scale
 //!STORAGE
 
@@ -462,9 +499,26 @@
 #define MP_GRID_H              64
 #define MP_GRID_N              (MP_GRID_W * MP_GRID_H)
 #define MP_TONE_BINS           8
-#define MP_BANDS               3
-#define MP_AMP_MAX             0.008
-#define MP_TEMP_MAX            0.002
+// Log-spaced amplitude histograms (5B, audit lane A change 2). Bin 0 holds
+// |values| below MP_LOG_LO and reads as exact zero, so mathematically flat
+// input still cannot manufacture evidence. Bins 1..30 span MP_LOG_LO..1.6e-2
+// at 2^(1/MP_LOG_BPO) = ~21% per bin; bin 31 is the overflow (>= 1.6e-2, read
+// as one more 21% bin -- above the plausibility band at every grain_extreme
+// <= 4, so it only ever lowers evidence). The old linear
+// bins made a per-bin sigma either exactly 0 or >= 0.664e-3 -- the prior
+// 0.55e-3 could not be represented -- and the temporal range clamped at
+// 3.75e-3 x grain_extreme, below the plausibility band, so heavy grain failed
+// its randomness test (Cyber City per-bin temporal ratios 0.46-0.64 clamped,
+// 0.95-0.98 unclamped; audit 2026-09-30).
+#define MP_LOG_LO              5.0e-5
+#define MP_LOG_BPO             3.6049338
+// Per-cell stillness (5B, audit lane A change 1): a cell whose local 9-tap
+// mean moved more than this since the previous frame is left out of this
+// frame's grain statistics. The mean averages grain away (~3x), so the test
+// sees content motion, not the grain's own frame-to-frame swing -- the old
+// single-point test tripped on coarse grain at 2 sigma (Utena, Cyber City)
+// and read heavy grain low when used per cell.
+#define MP_STILL_MEAN          0.018
 #define MP_HP_TO_SOURCE        1.7888544
 #define MP_MEDABS_TO_STD       1.4826022
 #define MP_COMPLEMENT_POWER    0.150
@@ -475,25 +529,24 @@
 #define MP_PICTURE_DENSITY     2160.0
 // MUST equal PICTURE_DENSITY / PICTURE_DENSITY_OUT in PASS 2 / PASS 3.
 // These are separate translation units and have no compile-time cross-check.
-// Surviving delivered grain is DAMAGED evidence — clumped, blocked,
-// DCT-mushed — so it counts against the restoration deficit at its
-// fidelity, never at its raw energy (author spec 2026-07-17: the shader
-// lays an even bed of restoration-grade grain across the picture; a
-// JND-level addition on grainy titles is a failure, because even inside
-// surviving grain we are repairing compressed patches and clumping).
-// 0.50 = provisional: delivered grain is at best half restoration-grade.
-// Future: key this to measured delivery health (m_structure_ratio) and
-// the ProRes master-vs-degraded erasure calibration.
-#define MP_SURVIVOR_FIDELITY   0.50
+// Restoration bed: the share of the missing-power model that is presented,
+// constant since 5B (2026-09-30). The per-shot survivor bed it replaces (the
+// surviving delivered grain discounted at fidelity 0.5, plus a title EMA of
+// it) sat at its floor on 11 of 12 audited titles (median 0.51-0.61) while its
+// per-shot swings made ~90% of the churn at cuts; a constant 0.55 moves
+// converged levels by <= +-9% and cuts the p95 cut step by 25-97% (audit lane
+// B, replay of 18 full episodes). An even bed of restoration-grade grain
+// across the picture remains the intent (author spec 2026-07-17).
+#define MP_BED                 0.55
 #define MP_PRIOR_SIGMA         0.00055
 // Effective midtone output RMS of a unit control after density application and
 // the measured tone basis.
 #define MP_FIELD_STD           0.0185
-#define MP_STATE_MAGIC         0.954120
+#define MP_STATE_MAGIC         0.956340
 #define MP_MIN_BIN_SAMPLES     24u
 // Film-plausible evidence band. Per-frame sigma above this band is not
 // photographic grain (fireworks, confetti, dense near-field rain, damage):
-// soft-reject it from BOTH the per-bin master update and title presence,
+// soft-reject it from BOTH the per-bin master update and shot refinement,
 // upstream of every lane, so implausible evidence cannot enter the
 // persistent posterior at all. Calibrated ABOVE the heaviest catalogued
 // legitimate grain — Golden Spurtle Super35 reads sigma 0.0026-0.0035 in
@@ -517,10 +570,26 @@
 #define MP_BLACKOUT_SIGNAL_MAX 8u
 #define MP_BLACKOUT_LATCH_MAX  4.0
 #define MP_GEOM_X_BOOTSTRAP    24.0
-#define MP_GEOM_Y_BOOTSTRAP    3.0
+#define MP_GEOM_Y_BOOTSTRAP    12.0
+// Release of a too-large committed bar (5A, 2026-09-30). Dark and fade-in
+// frames make picture rows next to a bar read as matte, and before this path
+// only a hard cut could undo such a commit (audit A: The Thin Red Line held a
+// 0.198 bar over a true 0.119 for 74 s after its dark opening, Utena 0.1455 on
+// 4:3 content for 13 s after a black fade, Gunbuster 14 px per side through a
+// sub-cell refine error). Picture inside a bar is strong evidence: dark picture
+// reads as matte on every dark frame, while a matte reads as picture only when
+// bright content sits in the bar (hardsubs, logos, credits crossing the bars).
+// So a CLEAN candidate (symmetric, picture beside both bars -- one-bar
+// subtitles fail it) at least 1.5 refine steps (1/8 cell each) smaller than
+// the committed bar, holding steady within one refine step for
+// MP_GEOM_RELEASE frames, re-commits at the candidate (moving in-bar content
+// restarts the count, and so does a hard cut). Nothing grows a bar except the
+// existing cut/blackout/bootstrap paths.
+#define MP_GEOM_RELEASE        12.0
+#define MP_GEOM_SHRINK_MIN     (1.5 / 512.0)
 // S4 evidence veto -- global-translation (pan/shake) gate. A translating
-// texture is a per-frame grain twin: it decorrelates band0 while q_still's
-// absolute per-point threshold stays blind on dark content and q_random's
+// texture is a per-frame grain twin: it decorrelates band0 while the
+// absolute stillness threshold stays blind on dark content and q_random's
 // innovation/spatial ratio lands in the grain band (measured: Odyssey
 // 160-330 s, m_motion 0.0 throughout the shake, eff 2.64x staircase). A
 // grid-level single-step Lucas-Kanade translation estimate is the tell:
@@ -541,7 +610,7 @@
 #define MP_PAN_HI              1.00
 
 // Flattened for conservative SPIRV-Cross/D3D11 lowering.
-shared uint s_hist[MP_TONE_BINS * MP_BANDS * AMP_BINS];
+shared uint s_hist[MP_TONE_BINS * AMP_BINS];
 shared uint s_content_hist[AMP_BINS];
 shared uint s_luma_now[MP_TONE_BINS];
 shared uint s_luma_prev[MP_TONE_BINS];
@@ -556,6 +625,7 @@ shared float s_refine_probe[512];
 shared uint s_state_ok;
 shared uint s_prev_ready;
 shared uint s_raster_changed;
+shared uint s_new_file;
 shared uint s_picture_signal;
 shared uint s_raster_signal;
 shared uint s_probe_count;
@@ -571,6 +641,8 @@ shared uint s_candidate_valid_x;
 shared uint s_candidate_valid_y;
 shared uint s_candidate_immediate_x;
 shared uint s_candidate_immediate_y;
+shared uint s_candidate_clean_x;
+shared uint s_candidate_clean_y;
 shared uint s_scan_x0;
 shared uint s_scan_x1;
 shared uint s_scan_y0;
@@ -578,12 +650,8 @@ shared uint s_scan_y1;
 shared float s_scan_inset_x;
 shared float s_scan_inset_y;
 shared uint s_valid_count;
+shared uint s_flat_count;
 shared uint s_changed_count;
-shared uint s_fine_energy;
-shared uint s_mid_energy;
-shared uint s_coarse_energy;
-shared uint s_structure_fine;
-shared uint s_structure_broad;
 shared uint s_lk_gxx;
 shared uint s_lk_gyy;
 shared uint s_lk_gxy_p;
@@ -609,8 +677,8 @@ float measure_luma(vec2 uv) {
 // nits -> SDR-equivalent BT.1886 2.4 code at grain_ref_white -> back into the
 // limited coordinate. Black maps to black and ref white to limited white. The
 // result is clamped at the SDR container ceiling (1.0): SDR LUMA codes never
-// exceed it, and the gates that are not behind the flat test (changed-cell count
-// -> q_still, the LK pan terms, the structure sums, the cut probe) must not see
+// exceed it, and the gates that are not behind the flat test (the changed-cell
+// count, the LK pan terms, the cut probe) must not see
 // expanded highlights at 2-5x their SDR range; flat_ok (c < 0.985) already kept
 // those cells out of the estimator, so the clamp costs no evidence.
 // Luma-only: Y' is treated as a PQ-coded luminance -- exact on neutrals;
@@ -662,6 +730,20 @@ float grain_sample(vec2 uv, vec2 vsize, int ntaps) {
     return s;
 }
 
+int amp_bin(float a) {
+    if (a < MP_LOG_LO) return 0;
+    return clamp(1 + int(log2(a / MP_LOG_LO) * MP_LOG_BPO), 1, AMP_BINS - 1);
+}
+
+// Median of one log-spaced histogram, interpolated inside its bin in the log
+// domain. A bin-0 median (below MP_LOG_LO) is exact zero.
+float amp_median(int med_bin, uint target, uint acc_before, uint in_bin) {
+    if (med_bin == 0) return 0.0;
+    float frac = clamp((float(target) - float(acc_before))
+                       / max(float(in_bin), 1.0), 0.0, 1.0);
+    return MP_LOG_LO * exp2((float(med_bin - 1) + frac) / MP_LOG_BPO);
+}
+
 int tone_bin(float y) {
     return clamp(int(sqrt(clamp(y, 0.0, 1.0)) * float(MP_TONE_BINS)),
                  0, MP_TONE_BINS - 1);
@@ -681,9 +763,9 @@ float prior_tone_shape(int b) {
 // set): picture-wide missing power measures ~0.39 at remux/UHD-BD
 // tier, 0.55-0.75 in AVC 5M film mids, ~0 on modern digital anime AVC
 // deliveries — against the old 0.80-0.92 profile. Because the restore
-// target multiplies this by an evidence-reduced bed_deficit whose
-// flat-cell survivor credit is optimistic (flats are where censoring
-// is weakest), the end-to-end exact value is tier-dependent: ~0.46 at
+// target multiplies this by the bed (MP_BED 0.55, the level the old
+// optimistic flat-cell survivor bed typically sat at -- flats are where
+// censoring is weakest), the end-to-end exact value is tier-dependent: ~0.46 at
 // remux/UHD-BD, ~0.7-0.9 at AVC 5M film. This profile sits at the
 // remux-exact end. The function below is the legacy film-exact CEILING
 // (author-validated on heavy-grain titles); MP_MISSING_FLOOR_SCALE
@@ -696,10 +778,9 @@ float prior_tone_shape(int b) {
 // tone slope is retained from the legacy profile; per-bin shape
 // evidence is thin and class-contradictory (film brights censor
 // hardest, anime brights survive AVC) and supports no recalibrated
-// shape. Recovering the erased-evidence cells needs the
-// delivery-health keying planned above (m_structure_ratio), which
-// requires its own evidence audit first — that keying's natural home
-// is this same floor scale.
+// shape. Recovering the erased-evidence cells needs a delivery-health
+// keying (not built), which requires its own evidence audit first —
+// that keying's natural home is this same floor scale.
 #define MP_MISSING_FLOOR_SCALE 0.60
 float prior_missing_fraction(int b) {
     float q = (float(b) + 0.5) / float(MP_TONE_BINS);
@@ -714,13 +795,21 @@ void lean_observe() {
     uint lid = gl_LocalInvocationIndex;
     uint nthreads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
     if (lid == 0u) {
+        // state_epoch carries two tokens (see its DESC): mod 4096 = the title
+        // or series (a change starts cold), floor(x / 4096) = the file within
+        // it (a change of that part alone is the next episode: a soft reset
+        // that carries, below).
         bool ok = abs(m_state_magic - MP_STATE_MAGIC) < 0.0001
-               && abs(m_state_epoch - state_epoch) < 0.5;
+               && (uint(max(m_state_epoch, 0.0) + 0.5) & 4095u)
+                  == (uint(max(state_epoch, 0.0) + 0.5) & 4095u);
+        bool new_file = ok && abs(m_state_epoch - state_epoch) > 0.5;
         float raster_aspect = HOOKED_size.x / max(HOOKED_size.y, 1.0);
         bool raster_changed = ok && abs(m_source_aspect - raster_aspect) > 0.001;
         s_state_ok = ok ? 1u : 0u;
         s_raster_changed = raster_changed ? 1u : 0u;
-        s_prev_ready = (ok && m_prev_ready > 0.5 && !raster_changed) ? 1u : 0u;
+        s_new_file = new_file ? 1u : 0u;
+        s_prev_ready = (ok && m_prev_ready > 0.5 && !raster_changed
+                        && !new_file) ? 1u : 0u;
     }
     barrier();
     bool state_ok = s_state_ok != 0u;
@@ -730,6 +819,7 @@ void lean_observe() {
         for (uint k = lid; k < uint(MP_GRID_N); k += nthreads) {
             prev_grid[k] = -1.0;
             prev_grid_off[k] = 0.0;
+            prev_mean[k] = 0.0;
             prev_probe[k] = 0.0;
         }
         if (lid == 0u) {
@@ -739,7 +829,6 @@ void lean_observe() {
             m_measured = 0.0;
             m_gen_frame = 0.0;
             m_arr_seed = 0.0;
-            m_field_seed = 0.0;
             m_regen = 1.0;
             m_regen_pending = 1.0;
             m_field_valid = 0.0;
@@ -755,7 +844,6 @@ void lean_observe() {
             m_baked_value_warp = -1.0;
             m_baked_grain_base_sat = -1.0;
             m_baked_grain_soften = -1.0;
-            m_baked_match_grain = -1.0;
             m_source_aspect = HOOKED_size.x / max(HOOKED_size.y, 1.0);
             m_active_inset_x = 0.0;
             m_active_inset_y = 0.0;
@@ -768,46 +856,41 @@ void lean_observe() {
             m_geom_blackout = 0.0;
             m_geom_blackout_y = 0.0;
             m_geom_changed = 0.0;
+            m_geom_shrink_x = 0.0;
+            m_geom_shrink_y = 0.0;
+            m_geom_shrink_cand_x = 0.0;
+            m_geom_shrink_cand_y = 0.0;
             m_observed = 0.0;
-            m_structure_ratio = 1.0;
             m_coverage = 0.0;
             m_motion = 0.0;
             m_cut_score = 0.0;
             m_pan_px = 0.0;
             m_temporal_support = 0.0;
-            m_title_conf = 0.0;
             m_title_power = MP_PRIOR_SIGMA * MP_PRIOR_SIGMA;
-            // 0.50 = the neutral state point. MUST equal PASS 2's
-            // FROZEN_SHOT_SHAPE: the render freeze is "the calibration
-            // point" only while these inits and that constant agree.
-            m_title_size = 0.50;
-            m_title_hardness = 0.50;
-            m_shot_size = 0.50;
-            m_shot_hardness = 0.50;
             m_shot_age = 0.0;
-            m_shot_conf = 0.0;
             m_shot_gain = 1.0;
+            m_shot_ev = 0.0;
+            // Reserved slot for the parked shot-restore design; nothing reads
+            // it (the neutral boost arithmetic was removed in 5A).
             m_shot_restore_boost = 1.0;
-            // Cold start assumes the full deficit, exactly the old fixed
-            // prior; evidenced shots then teach the title-typical bed level.
-            m_bed_ema = 1.0;
-            m_est_missing = 0.0;
-            m_loss_conf = 0.35;
-            m_loss_mix = 0.0;
-            m_tone_conf = 0.0;
+            m_evidence = 0.0;
+            m_ev_gate = 0.0;
+            m_auth_mean = 0.0;
+            m_acq_max = 1.0;
+            m_q_random = 0.0;
+            m_q_source = 1.0;
             float eff_sum = 0.0;
             for (int b = 0; b < MP_TONE_BINS; b++) {
                 float s = MP_PRIOR_SIGMA * prior_tone_shape(b);
                 float p = s * s;
                 m_master_p[b] = p;
                 m_master_w[b] = 0.0;
-                m_shot_obs_p[b] = 0.0;
-                m_shot_obs_w[b] = 0.0;
                 m_char_p[b] = MP_COMPLEMENT_POWER * p;
                 // This is the acquisition posterior, not a decorative floor:
                 // absent delivery evidence, all capture paths still imply a
                 // conservative amount of master grain throughout the range.
-                m_restore_p[b] = MP_MISSING_FLOOR_SCALE
+                // Cold start = the clean level (prior masters, constant bed).
+                m_restore_p[b] = MP_BED * MP_MISSING_FLOOR_SCALE
                                * prior_missing_fraction(b) * p;
                 eff_sum += m_char_p[b] + restore_gain * restore_gain
                          * m_restore_p[b];
@@ -817,13 +900,41 @@ void lean_observe() {
     }
     barrier();
 
-    if (lid == 0u && s_raster_changed != 0u) {
+    if (lid == 0u && (s_raster_changed != 0u || s_new_file != 0u)) {
         m_geom_known = 0.0;
         m_geom_known_y = 0.0;
         m_geom_streak = 0.0;
         m_geom_streak_y = 0.0;
         m_geom_blackout = 0.0;
         m_geom_blackout_y = 0.0;
+        m_geom_shrink_x = 0.0;
+        m_geom_shrink_y = 0.0;
+        m_geom_shrink_cand_x = 0.0;
+        m_geom_shrink_cand_y = 0.0;
+    }
+    // Series carry (5B, audit lane B 5.3): the next file of the SAME series
+    // keeps the title's learned grain -- the masters, and so the derived title
+    // level -- at a quarter of its authority: the episode starts near the
+    // series' level and re-earns authority from its own evidence. What belongs
+    // to the old picture starts fresh: geometry (above), the pan EMA
+    // (m_measured restarts it) and the shot, through the forced boundary
+    // (prev_ready is false this frame), which also commits the carried
+    // presentation at once. Authority x 0.25, not 0.5: at 0.5 an end-card grain
+    // look-alike carried +58% (5B replay +70%) into the next episode's start
+    // (Dandadan e02); at 0.25 nothing. With the derived title level the carried
+    // start is partial (Utena e02 starts at ~4.5 units, 6.8 converged; a cold
+    // start takes ~1.5 min to pass it).
+    if (lid == 0u && s_new_file != 0u) {
+        m_state_epoch = state_epoch;
+        // The boundary is forced through m_prev_ready, not only this frame's
+        // s_prev_ready: a file loaded PAUSED runs this block and then returns
+        // at the pause gate, and its first observed frame must still be a
+        // boundary (no comparison with the previous file's history, an
+        // immediate letterbox commit, a fresh shot).
+        m_prev_ready = 0.0;
+        m_measured = 0.0;
+        for (int b = 0; b < MP_TONE_BINS; b++)
+            m_master_w[b] *= 0.25;
     }
     barrier();
 
@@ -844,8 +955,7 @@ void lean_observe() {
                 || abs(m_baked_grain_contrast - grain_contrast) > 1.0e-6
                 || abs(m_baked_value_warp - value_warp) > 1.0e-6
                 || abs(m_baked_grain_base_sat - grain_base_sat) > 1.0e-6
-                || abs(m_baked_grain_soften - grain_soften) > 1.0e-6
-                || abs(m_baked_match_grain - match_grain) > 1.0e-6;
+                || abs(m_baked_grain_soften - grain_soften) > 1.0e-6;
             m_regen = 0.0;
             if (baked_params_changed) {
                 m_baked_grain_size = grain_size;
@@ -853,7 +963,6 @@ void lean_observe() {
                 m_baked_value_warp = value_warp;
                 m_baked_grain_base_sat = grain_base_sat;
                 m_baked_grain_soften = grain_soften;
-                m_baked_match_grain = match_grain;
                 m_regen_pending = 1.0;
             }
             // A baked edit may have arrived while the generator was disabled.
@@ -882,6 +991,8 @@ void lean_observe() {
         s_candidate_valid_y = 0u;
         s_candidate_immediate_x = 0u;
         s_candidate_immediate_y = 0u;
+        s_candidate_clean_x = 0u;
+        s_candidate_clean_y = 0u;
     }
     barrier();
     for (uint k = lid; k < uint(MP_GRID_N); k += nthreads) {
@@ -1042,24 +1153,39 @@ void lean_observe() {
         bool full_x = signal_ok && !bars_x
                    && full_left_support >= 2 && full_right_support >= 2;
 
+        // "Clean" means unambiguous: symmetric bars (within one cell) with
+        // picture (fewer than 3/4 dark samples) on BOTH inner edges. A dark or
+        // fading frame lets dark picture rows join one bar; requiring bright
+        // picture beside both bars rejects most such reads. The bootstraps and
+        // the release (many frames) need clean; "immediate" (a single-frame
+        // commit: first frame, hard cut, blackout) also needs bars of at least
+        // four cells. A full-picture read is both.
         if (bars_x) {
+            bool clean_x = abs(left - right) <= 1
+                        && left_support >= 2 && right_support >= 2;
             s_candidate_inset_x = coarse_x;
             s_candidate_valid_x = 1u;
-            s_candidate_immediate_x = (min(left, right) >= 4
-                                    && abs(left - right) <= 1) ? 1u : 0u;
+            s_candidate_clean_x = clean_x ? 1u : 0u;
+            s_candidate_immediate_x = (clean_x && min(left, right) >= 4)
+                                    ? 1u : 0u;
         } else if (full_x) {
             s_candidate_inset_x = 0.0;
             s_candidate_valid_x = 1u;
+            s_candidate_clean_x = 1u;
             s_candidate_immediate_x = 1u;
         }
         if (bars_y) {
+            bool clean_y = abs(top - bottom) <= 1
+                        && top_support >= 2 && bottom_support >= 2;
             s_candidate_inset_y = coarse_y;
             s_candidate_valid_y = 1u;
-            s_candidate_immediate_y = (min(top, bottom) >= 4
-                                    && abs(top - bottom) <= 1) ? 1u : 0u;
+            s_candidate_clean_y = clean_y ? 1u : 0u;
+            s_candidate_immediate_y = (clean_y && min(top, bottom) >= 4)
+                                    ? 1u : 0u;
         } else if (full_y) {
             s_candidate_inset_y = 0.0;
             s_candidate_valid_y = 1u;
+            s_candidate_clean_y = 1u;
             s_candidate_immediate_y = 1u;
         }
     }
@@ -1274,20 +1400,26 @@ void lean_observe() {
 
         float cell_x = 1.0 / float(MP_GRID_W);
         float cell_y = 1.0 / float(MP_GRID_H);
-        bool pending_ready_x = m_geom_streak >= MP_GEOM_X_BOOTSTRAP;
-        bool pending_ready_y = m_geom_streak_y >= MP_GEOM_Y_BOOTSTRAP;
+        // The streak and blackout counters are carried in LOCALS and stored
+        // once at the end of this block (FXC per-arm-store rule, see
+        // m_shot_gain): the arms below mix constant stores with
+        // read-modify-writes of the same scalars.
+        float streak_x = m_geom_streak;
+        float streak_y = m_geom_streak_y;
+        float blackout_x = m_geom_blackout;
+        float blackout_y = m_geom_blackout_y;
+        bool pending_ready_x = streak_x >= MP_GEOM_X_BOOTSTRAP;
+        bool pending_ready_y = streak_y >= MP_GEOM_Y_BOOTSTRAP;
         bool pending_match_y = pending_ready_y
                             && s_candidate_valid_y != 0u
                             && abs(s_candidate_inset_y - m_pending_inset_y)
                                <= 0.5 * cell_y;
         bool blackout_frame = s_raster_signal <= MP_BLACKOUT_SIGNAL_MAX;
-        bool blackout_armed_x = m_geom_blackout >= 3.0;
-        bool blackout_armed_y = m_geom_blackout_y >= 3.0;
+        bool blackout_armed_x = blackout_x >= 3.0;
+        bool blackout_armed_y = blackout_y >= 3.0;
         if (blackout_frame) {
-            m_geom_blackout = min(m_geom_blackout + 1.0,
-                                   MP_BLACKOUT_LATCH_MAX);
-            m_geom_blackout_y = min(m_geom_blackout_y + 1.0,
-                                     MP_BLACKOUT_LATCH_MAX);
+            blackout_x = min(blackout_x + 1.0, MP_BLACKOUT_LATCH_MAX);
+            blackout_y = min(blackout_y + 1.0, MP_BLACKOUT_LATCH_MAX);
         }
 
         bool valid_x = s_candidate_valid_x != 0u;
@@ -1299,44 +1431,42 @@ void lean_observe() {
                    && abs(s_candidate_inset_y - m_active_inset_y)
                       > 0.5 * cell_y;
         if (!blackout_frame && valid_x)
-            m_geom_blackout = diff_x
-                            ? max(m_geom_blackout - 1.0, 0.0) : 0.0;
+            blackout_x = diff_x ? max(blackout_x - 1.0, 0.0) : 0.0;
         if (!blackout_frame && valid_y)
-            m_geom_blackout_y = diff_y
-                              ? max(m_geom_blackout_y - 1.0, 0.0) : 0.0;
+            blackout_y = diff_y ? max(blackout_y - 1.0, 0.0) : 0.0;
 
         if (diff_x) {
             bool same = abs(s_candidate_inset_x - m_pending_inset_x)
                       <= 0.5 * cell_x;
             if (same)
-                m_geom_streak = min(m_geom_streak + 1.0, 65535.0);
+                streak_x = min(streak_x + 1.0, 65535.0);
             else {
                 m_pending_inset_x = s_candidate_inset_x;
-                m_geom_streak = 1.0;
+                streak_x = 1.0;
             }
         } else if (valid_x) {
             m_pending_inset_x = m_active_inset_x;
-            m_geom_streak = 0.0;
+            streak_x = 0.0;
             m_geom_known = 1.0;
         } else {
-            m_geom_streak = max(m_geom_streak - 1.0, 0.0);
+            streak_x = max(streak_x - 1.0, 0.0);
         }
 
         if (diff_y) {
             bool same = abs(s_candidate_inset_y - m_pending_inset_y)
                       <= 0.5 * cell_y;
             if (same)
-                m_geom_streak_y = min(m_geom_streak_y + 1.0, 65535.0);
+                streak_y = min(streak_y + 1.0, 65535.0);
             else {
                 m_pending_inset_y = s_candidate_inset_y;
-                m_geom_streak_y = 1.0;
+                streak_y = 1.0;
             }
         } else if (valid_y) {
             m_pending_inset_y = m_active_inset_y;
-            m_geom_streak_y = 0.0;
+            streak_y = 0.0;
             m_geom_known_y = 1.0;
         } else {
-            m_geom_streak_y = max(m_geom_streak_y - 1.0, 0.0);
+            streak_y = max(streak_y - 1.0, 0.0);
         }
 
         bool commit_x = false;
@@ -1348,7 +1478,8 @@ void lean_observe() {
                      || ((hard_cut || blackout_armed_x)
                          && s_candidate_immediate_x != 0u)
                      || (m_geom_known < 0.5
-                         && m_geom_streak >= MP_GEOM_X_BOOTSTRAP));
+                         && streak_x >= MP_GEOM_X_BOOTSTRAP
+                         && s_candidate_clean_x != 0u));
         } else if (hard_cut && !valid_x && pending_ready_x
                    && abs(m_pending_inset_x - m_active_inset_x)
                       > 0.5 * cell_x) {
@@ -1360,9 +1491,10 @@ void lean_observe() {
                      || (hard_cut
                          && (s_candidate_immediate_y != 0u
                              || pending_match_y))
-                     || blackout_armed_y
+                     || (blackout_armed_y && s_candidate_immediate_y != 0u)
                      || (m_geom_known_y < 0.5
-                         && m_geom_streak_y >= MP_GEOM_Y_BOOTSTRAP));
+                         && streak_y >= MP_GEOM_Y_BOOTSTRAP
+                         && s_candidate_clean_y != 0u));
         } else if (hard_cut && !valid_y && pending_ready_y
                    && abs(m_pending_inset_y - m_active_inset_y)
                       > 0.5 * cell_y) {
@@ -1370,23 +1502,66 @@ void lean_observe() {
             commit_inset_y = m_pending_inset_y;
         }
 
+        // Release (see MP_GEOM_RELEASE). Counters live in locals with one
+        // store each (FXC per-arm-store rule, see m_shot_gain): a shrinking
+        // clean read counts up; any other valid read, or a hard cut, resets;
+        // an invalid (dark/ambiguous) frame holds.
+        bool shrink_x = valid_x && s_candidate_clean_x != 0u
+                     && s_candidate_inset_x
+                        < m_active_inset_x - MP_GEOM_SHRINK_MIN;
+        bool shrink_y = valid_y && s_candidate_clean_y != 0u
+                     && s_candidate_inset_y
+                        < m_active_inset_y - MP_GEOM_SHRINK_MIN;
+        // A run continues only while the candidate stays within one refine
+        // step of the run's last candidate; a jump restarts it at 1.
+        bool steady_x = abs(s_candidate_inset_x - m_geom_shrink_cand_x)
+                     <= 1.0 / 512.0;
+        bool steady_y = abs(s_candidate_inset_y - m_geom_shrink_cand_y)
+                     <= 1.0 / 512.0;
+        float shrink_run_x = shrink_x
+            ? (steady_x ? min(m_geom_shrink_x + 1.0, 65535.0) : 1.0)
+            : ((valid_x || hard_cut) ? 0.0 : m_geom_shrink_x);
+        float shrink_run_y = shrink_y
+            ? (steady_y ? min(m_geom_shrink_y + 1.0, 65535.0) : 1.0)
+            : ((valid_y || hard_cut) ? 0.0 : m_geom_shrink_y);
+        float shrink_cand_x = shrink_x ? s_candidate_inset_x
+                                       : m_geom_shrink_cand_x;
+        float shrink_cand_y = shrink_y ? s_candidate_inset_y
+                                       : m_geom_shrink_cand_y;
+        m_geom_shrink_cand_x = shrink_cand_x;
+        m_geom_shrink_cand_y = shrink_cand_y;
+        if (shrink_x && shrink_run_x >= MP_GEOM_RELEASE) {
+            commit_x = true;
+            commit_inset_x = s_candidate_inset_x;
+        }
+        if (shrink_y && shrink_run_y >= MP_GEOM_RELEASE) {
+            commit_y = true;
+            commit_inset_y = s_candidate_inset_y;
+        }
+        m_geom_shrink_x = commit_x ? 0.0 : shrink_run_x;
+        m_geom_shrink_y = commit_y ? 0.0 : shrink_run_y;
+
         bool commit = commit_x || commit_y;
         if (commit_x) {
             m_active_inset_x = clamp(commit_inset_x, 0.0,
                                      MP_ACTIVE_INSET_MAX);
             m_pending_inset_x = m_active_inset_x;
-            m_geom_streak = 0.0;
+            streak_x = 0.0;
             m_geom_known = 1.0;
-            m_geom_blackout = 0.0;
+            blackout_x = 0.0;
         }
         if (commit_y) {
             m_active_inset_y = clamp(commit_inset_y, 0.0,
                                      MP_ACTIVE_INSET_MAX);
             m_pending_inset_y = m_active_inset_y;
-            m_geom_streak_y = 0.0;
+            streak_y = 0.0;
             m_geom_known_y = 1.0;
-            m_geom_blackout_y = 0.0;
+            blackout_y = 0.0;
         }
+        m_geom_streak = streak_x;
+        m_geom_streak_y = streak_y;
+        m_geom_blackout = blackout_x;
+        m_geom_blackout_y = blackout_y;
         s_active_inset_x = m_active_inset_x;
         s_active_inset_y = m_active_inset_y;
         s_probe_hist_l1 = probe_hist;
@@ -1398,12 +1573,8 @@ void lean_observe() {
 
     if (lid == 0u) {
         s_valid_count = 0u;
+        s_flat_count = 0u;
         s_changed_count = 0u;
-        s_fine_energy = 0u;
-        s_mid_energy = 0u;
-        s_coarse_energy = 0u;
-        s_structure_fine = 0u;
-        s_structure_broad = 0u;
         s_lk_gxx = 0u;
         s_lk_gyy = 0u;
         s_lk_gxy_p = 0u;
@@ -1414,18 +1585,19 @@ void lean_observe() {
         s_lk_by_n = 0u;
     }
     for (uint k = lid;
-         k < uint(MP_TONE_BINS * MP_BANDS * AMP_BINS); k += nthreads)
+         k < uint(MP_TONE_BINS * AMP_BINS); k += nthreads)
         s_hist[k] = 0u;
     for (uint k = lid; k < uint(AMP_BINS); k += nthreads)
         s_content_hist[k] = 0u;
     barrier();
 
     // Offsets are normalized picture-height coordinates expressed on the
-    // finite MP_PICTURE_DENSITY analysis lattice. Derive the
-    // horizontal UV pitch from the actual LUMA raster aspect so the crosses
-    // remain isotropic on 4:3, scope and portrait sources instead of silently
-    // source-raster mapping from the active picture rather than assuming an
-    // output resolution. Three nested crosses provide a compact spectral body.
+    // finite MP_PICTURE_DENSITY analysis lattice, mapped from the active
+    // picture rather than an assumed output resolution. The horizontal UV
+    // pitch comes from the actual LUMA raster aspect, so the crosses stay
+    // isotropic on 4:3, scope and portrait sources. The 2-sample cross
+    // isolates the grain band; the 12-sample cross only measures edges for
+    // the flat gate.
     vec2 active_inset = vec2(s_active_inset_x, s_active_inset_y);
     vec2 active_extent = vec2(1.0) - 2.0 * active_inset;
     float uvx_per_vtex = active_extent.y * HOOKED_size.y
@@ -1433,8 +1605,6 @@ void lean_observe() {
     float uvy_per_vtex = active_extent.y / MP_PICTURE_DENSITY;
     vec2 dx1 = vec2(2.0 * uvx_per_vtex, 0.0);
     vec2 dy1 = vec2(0.0, 2.0 * uvy_per_vtex);
-    vec2 dx3 = vec2(6.0 * uvx_per_vtex, 0.0);
-    vec2 dy3 = vec2(0.0, 6.0 * uvy_per_vtex);
     vec2 dx6 = vec2(12.0 * uvx_per_vtex, 0.0);
     vec2 dy6 = vec2(0.0, 12.0 * uvy_per_vtex);
     // Picture-relative footprint (see grain_sample): one tap at <= 1080 lines.
@@ -1452,10 +1622,6 @@ void lean_observe() {
         float xp1 = grain_sample(uv + dx1, fp_vsize, fp_taps);
         float ym1 = grain_sample(uv - dy1, fp_vsize, fp_taps);
         float yp1 = grain_sample(uv + dy1, fp_vsize, fp_taps);
-        float xm3 = grain_sample(uv - dx3, fp_vsize, fp_taps);
-        float xp3 = grain_sample(uv + dx3, fp_vsize, fp_taps);
-        float ym3 = grain_sample(uv - dy3, fp_vsize, fp_taps);
-        float yp3 = grain_sample(uv + dy3, fp_vsize, fp_taps);
         float xm6 = grain_sample(uv - dx6, fp_vsize, fp_taps);
         float xp6 = grain_sample(uv + dx6, fp_vsize, fp_taps);
         float ym6 = grain_sample(uv - dy6, fp_vsize, fp_taps);
@@ -1464,23 +1630,23 @@ void lean_observe() {
             c = measure_bridge(c);
             xm1 = measure_bridge(xm1); xp1 = measure_bridge(xp1);
             ym1 = measure_bridge(ym1); yp1 = measure_bridge(yp1);
-            xm3 = measure_bridge(xm3); xp3 = measure_bridge(xp3);
-            ym3 = measure_bridge(ym3); yp3 = measure_bridge(yp3);
             xm6 = measure_bridge(xm6); xp6 = measure_bridge(xp6);
             ym6 = measure_bridge(ym6); yp6 = measure_bridge(yp6);
         }
 
         float lp1 = (4.0 * c + xm1 + xp1 + ym1 + yp1) * 0.125;
-        float lp3 = (4.0 * c + xm3 + xp3 + ym3 + yp3) * 0.125;
-        float lp6 = (4.0 * c + xm6 + xp6 + ym6 + yp6) * 0.125;
         float band0 = c - lp1;
-        float band1 = lp1 - lp3;
-        float band2 = lp3 - lp6;
         float edge = 0.25 * (abs(xp6 - xm6) + abs(yp6 - ym6));
         bool flat_ok = c > 0.002 && c < 0.985 && edge < 0.026;
         bool prev_flat = s_history_ready != 0u && prev_grid[k] > 0.0;
         float prev_c = (s_history_ready != 0u)
                      ? max(abs(prev_grid[k]) - 1.0, 0.0) : c;
+        // Per-cell stillness on the local mean (see MP_STILL_MEAN). Without
+        // history every cell counts as still.
+        float local_mean = (c + xm1 + xp1 + ym1 + yp1 + xm6 + xp6 + ym6 + yp6)
+                         * (1.0 / 9.0);
+        bool still = s_history_ready == 0u
+                  || abs(local_mean - prev_mean[k]) <= MP_STILL_MEAN;
 
         int now_lb = tone_bin(c);
         if (s_history_ready != 0u
@@ -1544,39 +1710,17 @@ void lean_observe() {
                           uint(min(-lk_by * MP_LK_SCALE, MP_LK_CLAMP)));
         }
 
-        // One continuous delivery-rolloff observation over all content. This is
-        // deliberately not a classifier: it merely records how much of the local
-        // structure survives in the fine band relative to the six-texel band.
-        float structure_fine = band0;
-        float structure_broad = c - lp6;
-        atomicAdd(s_structure_fine,
-                  uint(min(structure_fine * structure_fine * 1.0e8, 1000000.0)));
-        atomicAdd(s_structure_broad,
-                  uint(min(structure_broad * structure_broad * 1.0e8, 1000000.0)));
-
-        if (flat_ok) {
-            float bands[MP_BANDS];
-            bands[0] = band0; bands[1] = band1; bands[2] = band2;
-            for (int j = 0; j < MP_BANDS; j++) {
-                int ab = clamp(int(abs(bands[j]) / MP_AMP_MAX
-                                   * float(AMP_BINS)), 0, AMP_BINS - 1);
-                int hi = (now_lb * MP_BANDS + j) * AMP_BINS + ab;
-                atomicAdd(s_hist[hi], 1u);
-            }
+        // Only flat AND still cells feed the grain statistics: a moving object
+        // removes its own cells instead of vetoing the whole frame.
+        if (flat_ok)
+            atomicAdd(s_flat_count, 1u);
+        if (flat_ok && still) {
+            atomicAdd(s_hist[now_lb * AMP_BINS + amp_bin(abs(band0))], 1u);
             atomicAdd(s_valid_count, 1u);
-            atomicAdd(s_fine_energy,
-                      uint(min(band0 * band0 * 1.0e9, 1000000.0)));
-            atomicAdd(s_mid_energy,
-                      uint(min(band1 * band1 * 1.0e9, 1000000.0)));
-            atomicAdd(s_coarse_energy,
-                      uint(min(band2 * band2 * 1.0e9, 1000000.0)));
 
             if (prev_flat) {
                 float dhp = abs(band0 - prev_grid_off[k]);
-                int tb = clamp(int(dhp / (MP_TEMP_MAX * grain_extreme)
-                                   * float(AMP_BINS)),
-                               0, AMP_BINS - 1);
-                atomicAdd(s_content_hist[tb], 1u);
+                atomicAdd(s_content_hist[amp_bin(dhp)], 1u);
             }
         }
 
@@ -1584,65 +1728,41 @@ void lean_observe() {
         // the next frame can reconstruct a cut histogram without another SSBO.
         prev_grid[k] = flat_ok ? 1.0 + c : -(1.0 + c);
         prev_grid_off[k] = band0;
+        prev_mean[k] = local_mean;
     }
     barrier();
 
     if (lid == 0u) {
-        float sigma_band[MP_TONE_BINS * MP_BANDS];
+        float sigma_band[MP_TONE_BINS];
         uint tone_count[MP_TONE_BINS];
         float sigma_sum = 0.0;
         float sigma_weight = 0.0;
         for (int b = 0; b < MP_TONE_BINS; b++) {
-            uint count0 = 0u;
-            for (int a = 0; a < AMP_BINS; a++)
-                count0 += s_hist[(b * MP_BANDS) * AMP_BINS + a];
-            tone_count[b] = count0;
-            for (int j = 0; j < MP_BANDS; j++) {
-                uint count = 0u;
-                int base = (b * MP_BANDS + j) * AMP_BINS;
-                for (int a = 0; a < AMP_BINS; a++) count += s_hist[base + a];
-                uint target = (count + 1u) / 2u;
-                uint acc = 0u;
-                int med_bin = 0;
-                uint acc_before = 0u;
-                for (int a = 0; a < AMP_BINS; a++) {
-                    acc += s_hist[base + a];
-                    if (acc >= target) {
-                        med_bin = a;
-                        acc_before = acc - s_hist[base + a];
-                        break;
-                    }
+            uint count = 0u;
+            int base = b * AMP_BINS;
+            for (int a = 0; a < AMP_BINS; a++) count += s_hist[base + a];
+            tone_count[b] = count;
+            uint target = (count + 1u) / 2u;
+            uint acc = 0u;
+            int med_bin = 0;
+            uint acc_before = 0u;
+            for (int a = 0; a < AMP_BINS; a++) {
+                acc += s_hist[base + a];
+                if (acc >= target) {
+                    med_bin = a;
+                    acc_before = acc - s_hist[base + a];
+                    break;
                 }
-                // Interpolated grouped median (linear CDF inside the median
-                // bin). The old bin-CENTER dequantization made per-frame
-                // sigma a 5-rung lattice with nothing between 0 and
-                // 0.994e-3 (M1 instrument audit, 2026-08-20) — faint grain
-                // read exact zero and every lane consumed rung-snapped
-                // values. Exact-zero rule preserved: a bin-0 median stays
-                // exact zero, so mathematically flat input still cannot
-                // manufacture evidence. The SPATIAL clean-lane ceilings
-                // (<= 0.3e-3) stay satisfiable only by true zero (nonzero
-                // floor ~6.6e-4); the temporal gate's boolean has a ~2%-of-
-                // bin-1 sliver above its 1.17e-4 floor, held to ~1% effect
-                // by its multiplicative smoothstep (review 2026-08-20).
-                float med_abs;
-                if (med_bin == 0) med_abs = 0.0;
-                else {
-                    float in_bin = float(s_hist[base + med_bin]);
-                    float frac = clamp((float(target) - float(acc_before))
-                                       / max(in_bin, 1.0), 0.0, 1.0);
-                    med_abs = (float(med_bin) + frac) * MP_AMP_MAX
-                            / float(AMP_BINS);
-                }
-                float sigma = med_abs * MP_MEDABS_TO_STD;
-                if (j == 0) sigma *= MP_HP_TO_SOURCE;
-                sigma_band[b * MP_BANDS + j] =
-                    (count >= MP_MIN_BIN_SAMPLES) ? sigma : 0.0;
             }
-            float sigma0 = sigma_band[b * MP_BANDS];
-            if (count0 >= MP_MIN_BIN_SAMPLES) {
-                sigma_sum += sigma0 * float(count0);
-                sigma_weight += float(count0);
+            // Grouped median, interpolated in the log domain inside its
+            // bin (amp_median); a bin-0 median stays exact zero.
+            float med_abs = amp_median(med_bin, target, acc_before,
+                                       s_hist[base + med_bin]);
+            float sigma = med_abs * MP_MEDABS_TO_STD * MP_HP_TO_SOURCE;
+            sigma_band[b] = (count >= MP_MIN_BIN_SAMPLES) ? sigma : 0.0;
+            if (count >= MP_MIN_BIN_SAMPLES) {
+                sigma_sum += sigma * float(count);
+                sigma_weight += float(count);
             }
         }
         float observed = (sigma_weight > 0.0) ? sigma_sum / sigma_weight : 0.0;
@@ -1661,31 +1781,19 @@ void lean_observe() {
                 break;
             }
         }
-        // Same interpolated grouped median as the spatial estimator above,
-        // same exact-zero rule — temporal_ratio must compare a continuous
-        // numerator against the now-continuous observed denominator.
-        float tmed_abs;
-        if (tcount == 0u || tmed_bin == 0) tmed_abs = 0.0;
-        else {
-            float t_in = float(s_content_hist[tmed_bin]);
-            float t_frac = clamp((float(ttarget) - float(tacc_before))
-                                 / max(t_in, 1.0), 0.0, 1.0);
-            tmed_abs = (float(tmed_bin) + t_frac)
-                     * (MP_TEMP_MAX * grain_extreme) / float(AMP_BINS);
-        }
+        // Same log-domain grouped median and exact-zero rule as the spatial
+        // estimator, on the same log scale (no grain_extreme range any more).
+        float tmed_abs = (tcount == 0u) ? 0.0
+                       : amp_median(tmed_bin, ttarget, tacc_before,
+                                    s_content_hist[tmed_bin]);
         float temporal = tmed_abs * MP_MEDABS_TO_STD
                        * MP_HP_TO_SOURCE * 0.70710678;
         float temporal_ratio = temporal / max(observed, 1.0e-6);
-        float fine_e = float(s_fine_energy);
-        float mid_e = float(s_mid_energy);
-        float coarse_e = float(s_coarse_energy);
-        float spectral_sum = max(fine_e + mid_e + coarse_e, 1.0);
-        float frame_size = (0.95 * fine_e + 0.55 * mid_e
-                          + 0.20 * coarse_e) / spectral_sum;
-        float frame_hardness = fine_e / max(fine_e + mid_e, 1.0);
-        float structure_ratio = float(s_structure_fine)
-                              / max(float(s_structure_broad), 1.0);
         float coverage = float(s_valid_count) / float(MP_GRID_N);
+        // Share of the flat cells that stayed still (1 without history). Grain
+        // cannot trip it (local-mean test), so it measures content motion.
+        float still_share = (s_flat_count > 0u)
+                          ? float(s_valid_count) / float(s_flat_count) : 1.0;
         float changed = (s_history_ready != 0u)
                       ? float(s_changed_count) / float(MP_GRID_N) : 0.0;
         float hist_l1 = s_probe_hist_l1;
@@ -1727,17 +1835,19 @@ void lean_observe() {
         float q_cov = smoothstep(0.08, 0.28, coverage);
         float q_random = 1.0 - smoothstep(0.35, 0.90,
                                           abs(log2(max(temporal_ratio, 0.01))));
-        float q_still = 1.0 - smoothstep(0.03, 0.18, changed);
+        // Stillness is judged per cell in the lattice loop (5B): coverage
+        // counts only flat AND still cells, so q_cov carries the frame's
+        // stillness and a moving object no longer vetoes the whole frame
+        // (the frame-level test tripped on coarse grain and film weave).
         // S4 evidence-quality veto. Applied as a SEPARATE factor on the
-        // rise-capable lanes only -- never folded into q_cov/q_random/
-        // q_still themselves, because spatial_reliability (the reduce-only
-        // survivor lane) consumes the raw q_cov and vetoing a reduce-only
-        // lane would RAISE rendered power on moving textured content.
+        // rise-capable lanes only -- never folded into q_cov/q_random
+        // themselves, because the downward lanes consume the raw q_cov and
+        // vetoing a reduce-only lane would RAISE rendered power on moving
+        // textured content.
         float q_source = 1.0 - smoothstep(MP_PAN_LO, MP_PAN_HI, m_pan_px);
         float static_gate_raw = (s_history_ready != 0u && !hard_cut)
-                              ? q_cov * q_random * q_still : 0.0;
+                              ? q_cov * q_random : 0.0;
         float static_gate = static_gate_raw * q_source;
-        float evidence_raw = q_amp * static_gate_raw;
         float evidence = q_amp * static_gate;
 
         // Estimate shot sensitivity after dividing out the title's luma curve.
@@ -1745,14 +1855,14 @@ void lean_observe() {
         // with noise sensitivity, especially across bright/dark cuts. The
         // divisor must be EXACTLY the unit-gain curve presentation renders
         // (title curve blended with the per-bin master by local evidence) —
-        // dividing by the bare per-bin master lets title-borrowed presence
+        // dividing by the bare per-bin master lets the title-borrowed level
         // re-enter through shot gain and double-count into the committed
         // presentation.
         float prior_base_p = MP_PRIOR_SIGMA * MP_PRIOR_SIGMA;
         float gain_log_sum = 0.0;
         float gain_weight = 0.0;
         for (int b = 0; b < MP_TONE_BINS; b++) {
-            float sigma0 = sigma_band[b * MP_BANDS];
+            float sigma0 = sigma_band[b];
             float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
             float amp_r = smoothstep(0.00012, 0.00070, sigma0);
             float w = count_r * amp_r;
@@ -1761,9 +1871,10 @@ void lean_observe() {
                 float title_unit = m_title_power * shape * shape;
                 float local_q = smoothstep(0.10, 0.35, m_master_w[b]);
                 // Floor the divisor at a quarter of the acquisition prior:
-                // a clean-lane-drained title must not read the first grainy
-                // shot as gain-4 sensitivity and then suppress its own
-                // master establishment through the gain-normalized update.
+                // a title far below its prior must not read the first grainy
+                // shot as gain-4 sensitivity and then suppress its own master
+                // establishment (a guard; 5B's master floor keeps titles at or
+                // above the prior).
                 float unit_master = max(mix(title_unit, m_master_p[b],
                                             local_q),
                                         0.25 * shape * shape * prior_base_p);
@@ -1780,154 +1891,9 @@ void lean_observe() {
         // steeper confidence curve: once temporal behaviour is convincingly
         // stochastic, amplitude comes from measured power, not from how far
         // inside the authenticity band this frame happened to land.
-        float shot_auth = gain_weight_support * q_cov * q_still * q_source
+        float shot_auth = gain_weight_support * q_cov * q_source
                         * smoothstep(0.02, 0.15, q_random);
 
-        // Title character is a hidden posterior. It only learns from stable,
-        // photographic evidence and never decays because a shot or region is
-        // difficult to observe.
-        if (evidence > 0.0) {
-            float a_title = 0.0015 * evidence;
-            m_title_size = mix(m_title_size, frame_size, a_title);
-            m_title_hardness = mix(m_title_hardness, frame_hardness, a_title);
-            m_title_conf += 0.005 * evidence * (1.0 - m_title_conf);
-        } else if (evidence_raw <= 0.0) {
-            // Staleness: title confidence is re-earned across scenes (tau
-            // ~4.6 min at 24p), never session-permanent. Odyssey benchmark:
-            // conf saturated at 0.975 and held full learned authority plus a
-            // 4x-annealed drain for the rest of the session. Decay can only
-            // REDUCE authority, so motion/quiet stretches stay charter-safe;
-            // a grainy title re-earns 0->0.5 in ~6 s of good evidence.
-            // Freeze-not-drain: when the S4 veto is the ONLY suppressor
-            // (evidence exists but is motion-poisoned) confidence HOLDS --
-            // a continuously handheld grainy title must not bleed authority
-            // for the length of the film. Decay is reserved for genuinely
-            // evidence-free stretches.
-            m_title_conf *= (1.0 - 1.5e-4);
-        }
-
-        // Grain presence is a title property, not eight independent detection
-        // gates. One temporally authenticated tone may establish the title-wide
-        // base; unavailable tones then inherit the same film-shaped curve.
-        // Sustained, broadly observable near-zero evidence pulls the base back
-        // toward the level it actually measures — at ANY confidence, so a
-        // transient misread can always be walked back — while implausibly hot
-        // evidence never enters. Ambiguous, moving and boundary evidence leave
-        // the base unchanged.
-        float presence_rise = 0.0;
-        int presence_bins = 0;
-        float clean_peak = 0.0;
-        float represented_peak = 0.0;
-        int clean_bins = 0;
-        int clean_first = MP_TONE_BINS;
-        int clean_last = -1;
-        for (int b = 0; b < MP_TONE_BINS; b++) {
-            float sigma0 = sigma_band[b * MP_BANDS];
-            float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
-            float amp_r = smoothstep(0.00012, 0.00070, sigma0);
-            float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
-                                           MP_SIGMA_PLAUS_HI,
-                                           sigma0 / grain_extreme);
-            // Presence is a rise-only lane: the S4 veto applies in full.
-            float reliability = count_r * amp_r * plaus
-                              * q_cov * q_random * q_still * q_source;
-            float master_auth = smoothstep(0.10, 0.35, m_master_w[b])
-                              * smoothstep(0.08, 0.20, m_title_conf);
-            if (reliability > 0.0 && master_auth > 0.0) {
-                float shape = prior_tone_shape(b);
-                float candidate_gain = m_master_p[b]
-                                     / max(shape * shape * prior_base_p,
-                                           1.0e-12);
-                // The candidate is the measured bin's FULL level (capped by
-                // the plausibility roof): shrinking the target instead of the
-                // rate would equilibrate erased tones permanently below the
-                // measured ones and hold a step between them. Caution lives
-                // in the approach rate below, annealed by how many tones
-                // corroborate, so one outlier bin transfers slowly while
-                // broad agreement transfers at full weight.
-                float candidate = min(candidate_gain,
-                                      3.24 * grain_extreme * grain_extreme)
-                                * prior_base_p;
-                float candidate_auth = reliability * master_auth;
-                float rise = candidate_auth
-                           * max(candidate - m_title_power, 0.0);
-                presence_rise = max(presence_rise, rise);
-                // Breadth counts bins that CORROBORATE the rise, not bins
-                // that merely qualified: a single outlier tone must anneal
-                // at the slow rate even when other tones are measurable.
-                if (rise > 0.0) presence_bins++;
-            }
-
-            if (tone_count[b] >= MP_MIN_BIN_SAMPLES)
-                represented_peak = max(represented_peak, sigma0);
-
-            if (tone_count[b] >= 96u) {
-                clean_bins++;
-                clean_first = min(clean_first, b);
-                clean_last = max(clean_last, b);
-                clean_peak = max(clean_peak, sigma0);
-            }
-        }
-        bool broad_clean = clean_bins >= 3
-                        && clean_last - clean_first >= 2
-                        // The span must reach the mids: AVC censoring is
-                        // near-total in crushed darks, so a dark-only clean
-                        // read is uninformative (see the rate note below).
-                        && clean_last >= 3
-                        && coverage >= 0.35
-                        && q_still >= 0.80
-                        && clean_peak <= 0.00018
-                        && represented_peak <= 0.00030
-                        && temporal <= 0.00012
-                        && observed <= 0.00030;
-        float clean_q = broad_clean
-                      ? smoothstep(0.35, 0.55, coverage)
-                      * smoothstep(0.80, 1.0, q_still)
-                      * (1.0 - smoothstep(0.00012, 0.00018, clean_peak))
-                      * (1.0 - smoothstep(0.00008, 0.00012, temporal))
-                      * (1.0 - smoothstep(0.00018, 0.00030, observed))
-                      : 0.0;
-        bool title_update_ok = s_history_ready != 0u
-                            && !shot_boundary && !geometry_only
-                            && m_shot_age >= 24.0;
-        if (title_update_ok && presence_rise > 0.0) {
-            float breadth = mix(0.35, 1.0,
-                                smoothstep(1.0, 3.0, float(presence_bins)));
-            m_title_power += 0.010 * breadth * presence_rise;
-        } else if (title_update_ok && clean_q > 0.0) {
-            // Downward target is the level the clean window actually measures
-            // (floored), never a fixed drain: reversibility means converging
-            // to the evidence, not to zero. The rate carries the censoring
-            // model: clean evidence comes from flat, still regions, and the
-            // 2026-08-20 paired-encode audit measured FLAT-STILL reads (not
-            // picture-wide loss) as 80-100% trustworthy on AVC-class
-            // deliveries — so they get ~half of face-value weight, not the
-            // old ~0.12 survival complement. That is 4x the previous rate
-            // at EVERY confidence (the anneal floor now equals the old
-            // full rate), which is safe only because eligibility requires
-            // the clean span to reach a mid tone bin: darks censor
-            // near-totally on AVC, so a dark still hold inside a grainy
-            // title reads clean there, and at 4x it would hole the base
-            // between presence refills (presence runs ~10x faster) — the
-            // shape of the 2026-07-17 field bug, where a 0.002 FULL-RATE
-            // UNGATED lane drained titles to the floor during long quiet
-            // scenes and whole shots rendered no grain at all. Mids survive
-            // AVC on every measured class, so a grainy title cannot qualify
-            // anywhere its grain is actually erased; a genuinely clean
-            // title still converges within an episode.
-            float clean_target = max(represented_peak * represented_peak,
-                                     0.25 * prior_base_p);
-            float clean_rate = 0.001 * clean_q
-                             * mix(1.0, 0.25,
-                                   smoothstep(0.05, 0.50, m_title_conf));
-            m_title_power = mix(m_title_power, clean_target, clean_rate);
-        }
-        // The floor keeps a drained title at half the cold-start bed: a
-        // measured-clean master renders a subtle acquisition layer, never
-        // nothing (charter: a zero-grain master is never authorized).
-        m_title_power = clamp(m_title_power, 0.25 * prior_base_p,
-                              3.24 * grain_extreme * grain_extreme
-                              * prior_base_p);
 
         // A real cut commits only the authenticated title presentation. Spatial
         // evidence on the boundary cannot distinguish grain from picture texture;
@@ -1938,47 +1904,30 @@ void lean_observe() {
         // boundary arm assigning the constant 1.0, the other arms
         // read-modify-writing the same SSBO scalar -- FXC/D3D11 DROPPED the
         // boundary arm's reset while every sibling store in that same arm
-        // (m_shot_age, m_shot_conf, m_shot_size, m_shot_hardness,
-        // m_shot_obs_w) landed correctly, so the 4-frame refinement window ran
-        // on the PREVIOUS shot's gain and the error compounded across cuts
-        // (measured 2026-07-29: 1.633 vs 1.0 at the same m_shot_age, d3d11 vs
-        // vulkan, bit-reproducible across runs; every other state scalar in the
-        // pass was bit-identical). Same NitMeter PASS 2 nm_maxcll class -- see
-        // that comment. Do not re-split this into per-arm SSBO stores.
+        // landed correctly, so the 4-frame refinement window ran on the
+        // PREVIOUS shot's gain and the error compounded across cuts (measured
+        // 2026-07-29: 1.633 vs 1.0 at the same m_shot_age, d3d11 vs vulkan,
+        // bit-reproducible across runs). Same NitMeter PASS 2 nm_maxcll class
+        // -- see that comment. Do not re-split this into per-arm SSBO stores.
         float shot_gain = m_shot_gain;
         if (shot_boundary) {
             shot_gain = 1.0;
             m_shot_age = 0.0;
-            m_shot_conf = 0.0;
-            m_shot_size = m_title_size;
-            m_shot_hardness = m_title_hardness;
-            for (int b = 0; b < MP_TONE_BINS; b++)
-                m_shot_obs_w[b] = 0.0;
         } else if (m_shot_age < 4.0 && !geometry_only) {
             float frame_gain = clamp(frame_gain_est, 0.50, 4.0);
             float gain_target = mix(1.0, frame_gain, shot_auth);
             shot_gain = mix(shot_gain, gain_target, 0.35);
-            m_shot_conf = mix(m_shot_conf, shot_auth, 0.25);
-            if (evidence > 0.0) {
-                float shape_rate = 0.18 * evidence;
-                m_shot_size = mix(m_shot_size, frame_size, shape_rate);
-                m_shot_hardness = mix(m_shot_hardness, frame_hardness,
-                                      shape_rate);
-            }
         } else if (evidence > 0.0) {
             float frame_gain = clamp(frame_gain_est, 0.50, 4.0);
             shot_gain = mix(shot_gain, frame_gain, 0.0015 * evidence);
-            m_shot_conf += 0.003 * evidence * (1.0 - m_shot_conf);
-            m_shot_size = mix(m_shot_size, frame_size, 0.0008 * evidence);
-            m_shot_hardness = mix(m_shot_hardness, frame_hardness,
-                                  0.0008 * evidence);
         }
         // Single store; must precede the first reader below (pobs_title).
         m_shot_gain = shot_gain;
-        // Grain presence establishes amount, not proof of delivery loss. The
-        // legacy boost lane remains neutral until a genuine loss estimator can
-        // authorize it without counting the same grain evidence twice.
-        m_shot_restore_boost = 1.0;
+        // Evidence mass this shot has spent (the acquisition budget below):
+        // local carry, one unconditional store (FXC rule, see above).
+        float shot_ev = shot_boundary ? 0.0 : m_shot_ev;
+        bool fast_shot = shot_ev < 3.0;
+        m_shot_ev = shot_ev + evidence;
 
         // Scene tone centroid (sqrt-bin domain, bar/matte-excluded histogram).
         // Master evidence from bins far ABOVE it is exposure-suspect: bright
@@ -2006,13 +1955,25 @@ void lean_observe() {
         }
         float scene_centroid = (cent_n > 0.0) ? cent_s / cent_n : 3.5;
 
-        float title_sum = 0.0;
         float weight_sum = 0.0;
         float char_sum = 0.0;
         float restore_sum = 0.0;
-        float target_missing_sum = 0.0;
+        float acq_max = 1.0;
+        // Masters learn only from frames with history and no hard cut: band0
+        // compared across a cut (or against nothing) reads as fresh noise and
+        // passes q_random at 0.77-0.88 (5B review; the removed frame q_still
+        // used to block these frames).
+        bool learn_ok = s_history_ready != 0u && !hard_cut;
+        // Evidence quality: a frame whose flat cells mostly moved counts less,
+        // in BOTH directions. Encoders thin grain in motion (within one shot,
+        // YUA reads 17-23% lower on moving frames), and the old frame-level
+        // gate preferred static evidence. Symmetric on purpose: weighting only
+        // the downward rate shifted the tracker's quantile instead (its lift
+        // survived shuffling the still share); this weight's lift does not
+        // (3-15% under shuffling). YUA 2.41 -> 2.84 units, TRL 1.48 -> 1.69.
+        float still_w = smoothstep(0.80, 0.97, still_share);
         for (int b = 0; b < MP_TONE_BINS; b++) {
-            float sigma0 = sigma_band[b * MP_BANDS];
+            float sigma0 = sigma_band[b];
             float pobs = sigma0 * sigma0;
             float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
             float amp_r = smoothstep(0.00012, 0.00070, sigma0);
@@ -2020,7 +1981,8 @@ void lean_observe() {
                                            MP_SIGMA_PLAUS_HI,
                                            sigma0 / grain_extreme);
             float spatial_reliability = count_r * amp_r * plaus * q_cov;
-            float reliability_raw = spatial_reliability * q_random * q_still;
+            float reliability_raw = learn_ok
+                                  ? spatial_reliability * q_random : 0.0;
             float reliability = reliability_raw * q_source;
 
             // Best-preserved evidence updates the absolute title master curve.
@@ -2028,8 +1990,8 @@ void lean_observe() {
             // erasure is more likely than a physically noiseless master. The
             // master is TITLE-referenced: divide the current shot sensitivity
             // out of the observation, or one long high-gain shot leaks its
-            // sensitivity into the persistent curve and, via presence, the
-            // title-wide base. The absolute ceiling is the film-plausible
+            // sensitivity into the persistent curve and, through the derived
+            // title level, the title-wide base. The absolute ceiling is the film-plausible
             // roof for sustained band-edge evidence the soft reject passes.
             if (reliability_raw > 0.0) {
                 // Sensitivity normalization deflates hot shots only. Dividing
@@ -2045,12 +2007,20 @@ void lean_observe() {
                 clipped = min(clipped,
                               MP_MASTER_P_MAX * grain_extreme
                               * grain_extreme);
+                // Floor at the prior (5B): the prior is the engine's clean
+                // level, its conservative acquisition-grain assumption, so a
+                // master never learns below it. The log-spaced histograms make
+                // clean titles' low noise measurable; without this floor their
+                // masters would drain below the clean level the way the old
+                // clean lane drained My Gift (1.22 -> 0.55 units). A master
+                // still walks back down to the prior after an upward misread.
+                float m_shape = prior_tone_shape(b);
+                clipped = max(clipped, m_shape * m_shape * prior_base_p);
                 // 3:1, not 10:1: a blind rate asymmetry rectifies fluctuating
                 // evidence (fire/texture sigma jitter) into a one-way climb.
                 // The erasure prior still earns a downward discount, but down
-                // reads here carry measurable grain (amp_r > 0), unlike the
-                // clean lane's censored flats. Calibration point for the
-                // ProRes ground-truth pass.
+                // reads here carry measurable grain (amp_r > 0). Calibration
+                // point for the ProRes ground-truth pass.
                 // The S4 veto gates the RISE and the authority earn only:
                 // translation decorrelation can only INFLATE sigma, so a
                 // sub-master read under motion is a valid one-sided bound
@@ -2058,9 +2028,39 @@ void lean_observe() {
                 float above = max(float(b) - scene_centroid, 0.0);
                 float exposure_guard = 1.0
                                      - 0.65 * smoothstep(1.5, 3.5, above);
+                // Per-shot acquisition budget (5B, audit lane B 5.2 option): a
+                // bin that has not yet earned authority (w < 0.5) learns its
+                // level 16x faster while the shot's first 3 units of evidence
+                // are being spent. Speed then follows the number of shots that
+                // show grain, not frames, so a one-shot noise effect cannot
+                // move a bin far (My Gift's 2 s look-alike at 14 min: 1.39
+                // units for 0.9 min, vs 1.80 for 5.5 min with a per-bin 8x
+                // gain). The meter counts the frame's evidence (with q_amp and
+                // the pan veto), while the bins spend their own reliability:
+                // under the pan veto the budget is not spent, so DOWNWARD
+                // learning stays fast for that whole shot -- which is what
+                // walks look-alikes back on clean titles. Up and down share
+                // the gain, so the 3:1 ratio and the exposure-guard ordering
+                // hold. The authority earn below keeps its base rate: it is
+                // the in-band-twin defense.
+                float acq = (fast_shot && m_master_w[b] < 0.5) ? 16.0 : 1.0;
+                acq_max = max(acq_max, acq);
+                // In the fast lane the stored level may not run ahead of what
+                // the bin PRESENTS by more than 2x: authority opens slowly, so
+                // an unbounded fast rise stayed invisible and then appeared at
+                // once when local_q opened (5B review: Gunbuster x2.2 in one
+                // cut, x3 within a minute; now x1.7 / x1.7). A stored level
+                // already above the cap is pulled down toward it.
+                if (acq > 1.0 && clipped > m_master_p[b]) {
+                    float lq_now = smoothstep(0.10, 0.35, m_master_w[b]);
+                    float presented = mix(m_title_power * m_shape * m_shape,
+                                          m_master_p[b], lq_now);
+                    clipped = min(clipped, 2.0 * presented);
+                }
                 float master_rate = (clipped > m_master_p[b])
-                                  ? 0.003 * q_source * exposure_guard
-                                  : 0.001;
+                                  ? 0.003 * acq * q_source * exposure_guard
+                                    * still_w
+                                  : 0.001 * acq * still_w;
                 m_master_p[b] = mix(m_master_p[b], clipped,
                                     master_rate * reliability_raw);
                 m_master_w[b] += 0.005 * reliability * exposure_guard
@@ -2069,98 +2069,39 @@ void lean_observe() {
             } else {
                 // Staleness: per-bin authority is re-earned, not permanent.
                 // Evidence-free stretches relax local_q back toward the title
-                // curve (tau ~4.6 min at 24p). The learned LEVEL stays --
-                // absence is not evidence of a clean master. Keyed on RAW
+                // curve (tau ~4.6 min at 24p). The learned LEVEL stays stored
+                // -- absence is not evidence of a clean master -- but since the
+                // title level is derived from authority-weighted masters (5B),
+                // a long drought also relaxes the PRESENTED level toward the
+                // prior; it returns as authority is re-earned. Keyed on RAW
                 // evidence: motion-vetoed frames HOLD authority rather than
                 // drain it (freeze-not-drain, S4).
                 m_master_w[b] *= (1.0 - 1.5e-4);
             }
 
-            // A spatial survivor read may only reduce restoration. It is
-            // therefore safe to acquire at a boundary before temporal
-            // authentication — a cut into grain-rich surviving content must
-            // not commit the full deficit on top of that grain for even one
-            // window; title/master learning above remains temporal.
-            if (shot_boundary && spatial_reliability > 0.0) {
-                m_shot_obs_p[b] = pobs;
-                m_shot_obs_w[b] = 0.80 * spatial_reliability;
-            } else if (shot_boundary) {
-                m_shot_obs_p[b] = pobs;
-                m_shot_obs_w[b] = 0.0;
-            } else {
-                bool acquire = m_shot_age < 4.0 && !geometry_only;
-                // Survivor tracking is reduce-only, so it stays on RAW
-                // reliability -- the S4 veto never withholds evidence that
-                // can only reduce restoration.
-                float obs_support = acquire ? spatial_reliability
-                                            : reliability_raw;
-                if (obs_support > 0.0) {
-                    float obs_rate = acquire ? 0.35 * obs_support
-                                             : 0.0020 * obs_support;
-                    m_shot_obs_p[b] = mix(m_shot_obs_p[b], pobs, obs_rate);
-                    m_shot_obs_w[b] += (acquire ? 0.35 : 0.004) * obs_support
-                                       * (1.0 - m_shot_obs_w[b]);
-                }
-            }
-
         }
 
-        // Title-wide survived fraction -> ONE bed level. The added layer
-        // keeps the rendition curve's SHAPE: per-bin survivor differencing
-        // inverted the film bell — zero added exactly in the measurable
-        // mids, full deficit at the crushed/clipped extremes — an
-        // anti-physical tonal profile (author spec, 2026-07-17 night).
-        // Survivors therefore modulate the bed's LEVEL through one
-        // fidelity-discounted aggregate; per-bin evidence keeps informing
-        // the master curve, never the added field's tonal shape. With
-        // fidelity 0.5 the bed level stays in [~0.5, 1] x missing fraction:
-        // an even, film-shaped bed that lossy survivors can halve but never
-        // extinguish — surviving delivered grain is damaged evidence
-        // (clumping, blocking, compressed patches), and no lossy delivery
-        // is a ProRes master.
-        // The prior mass anchors at the title's own recent bed level
-        // (m_bed_ema), not at the full missing fraction. The old fixed 1.0
-        // prior made an EMPTY survivor read commit the full deficit, so the
-        // cleanest scenes rendered MORE restore grain than grainy ones and
-        // grain stepped ~1.3x in sigma at those cuts (M3 field trace,
-        // Aldnoah E01 2026-08-20: daylight crowds hit the run-max eff 0.057,
-        // equal to the darkest shots). An empty read is censored, not
-        // evidence of survival, so it inherits what evidenced shots of this
-        // title typically show instead of snapping to the worst case. Cold
-        // start (m_bed_ema = 1.0) is exactly the old behavior.
-        float surv_wsum = 0.0;
-        float surv_dsum = 0.0;
-        for (int b = 0; b < MP_TONE_BINS; b++) {
-            float w = clamp(m_shot_obs_w[b], 0.0, 1.0);
-            if (w <= 0.0) continue;
-            float shape = prior_tone_shape(b);
-            float title_curve = m_title_power * shape * shape * m_shot_gain;
-            float learned_master = m_master_p[b] * m_shot_gain;
-            float local_q = smoothstep(0.10, 0.35, m_master_w[b]);
-            float master_b = mix(title_curve, learned_master, local_q);
-            float healthy = MP_SURVIVOR_FIDELITY
-                          * min(m_shot_obs_p[b] / max(master_b, 1.0e-12),
-                                1.0);
-            surv_wsum += w;
-            surv_dsum += w * (1.0 - healthy);
+        // Title level, derived each frame (5B, audit lane B 5.1): the
+        // authority-weighted log-mean of the per-bin masters in prior units
+        // (bins 2-7; bins 0-1 sit below limited-range black), shrunk to the
+        // prior with pseudo-weight 1 so one weak bin cannot set the title. It
+        // replaces the rise-only presence integrator, the clean lane and title
+        // confidence: no state of its own, no drift, bounded by the prior (the
+        // masters' floor) and the plausibility roof. Unevidenced tones borrow
+        // it through the presentation mix below.
+        float tl_sum = 0.0;
+        float tl_w = 0.0;
+        for (int b = 2; b < MP_TONE_BINS; b++) {
+            float tl_q = smoothstep(0.10, 0.35, m_master_w[b]);
+            float tl_shape = prior_tone_shape(b);
+            tl_sum += tl_q * log(max(m_master_p[b]
+                                     / (tl_shape * tl_shape * prior_base_p),
+                                     1.0e-6));
+            tl_w += tl_q;
         }
-        float bed_prior = clamp(m_bed_ema, 0.0, 1.0);
-        float bed_deficit = (0.5 * bed_prior + surv_dsum)
-                          / (0.5 + surv_wsum);
-        // Learn the recent delivery-health bed only from frames with real
-        // survivor mass (evidence-only ratio, prior excluded), on a ~20 s
-        // horizon of evidenced frames. The temporal gate matters: survivor
-        // reads are spatial-only and cannot distinguish grain from picture
-        // texture (see the acquire comment above), which was safe while the
-        // lane was shot-local reduce-only but must not teach a
-        // title-persistent statistic unauthenticated (design review
-        // 2026-08-20). Read-modify-write kept as one unconditional store
-        // (FXC per-arm-store rule, see m_shot_gain).
-        float bed_meas = (surv_wsum > 1.0e-6) ? surv_dsum / surv_wsum
-                                              : bed_prior;
-        float bed_rate = 0.002 * smoothstep(0.25, 1.0, surv_wsum)
-                       * q_random * q_still;
-        m_bed_ema = mix(bed_prior, bed_meas, bed_rate);
+        m_title_power = clamp(exp(tl_sum / (tl_w + 1.0)), 1.0,
+                              3.24 * grain_extreme * grain_extreme)
+                      * prior_base_p;
 
         // Title-class certificate for the censoring key below: only
         // exposure-safe DARK-bin evidence may certify heavy grain. The
@@ -2193,14 +2134,14 @@ void lean_observe() {
         }
 
         for (int b = 0; b < MP_TONE_BINS; b++) {
-            float sigma0 = sigma_band[b * MP_BANDS];
+            float sigma0 = sigma_band[b];
             float count_r = smoothstep(24.0, 96.0, float(tone_count[b]));
             float amp_r = smoothstep(0.00012, 0.00070, sigma0);
             float plaus = 1.0 - smoothstep(MP_SIGMA_PLAUS_LO,
                                            MP_SIGMA_PLAUS_HI,
                                            sigma0 / grain_extreme);
             float spatial_reliability = count_r * amp_r * plaus * q_cov;
-            float reliability_raw = spatial_reliability * q_random * q_still;
+            float reliability_raw = spatial_reliability * q_random;
             float reliability = reliability_raw * q_source;
             float shape = prior_tone_shape(b);
             float title_curve = m_title_power * shape * shape * m_shot_gain;
@@ -2228,9 +2169,8 @@ void lean_observe() {
                        * smoothstep(1.3, 2.8, ev_ratio);
             float missing_fraction = prior_missing_fraction(b)
                                    * mix(MP_MISSING_FLOOR_SCALE, 1.0, ev_q);
-            float obs_weight = clamp(m_shot_obs_w[b], 0.0, 1.0);
             float char_target = MP_COMPLEMENT_POWER * master;
-            float restore_target = bed_deficit * missing_fraction * master;
+            float restore_target = MP_BED * missing_fraction * master;
 
             float char_up_rate, char_down_rate;
             float restore_up_rate, restore_down_rate;
@@ -2252,27 +2192,23 @@ void lean_observe() {
                 restore_down_rate = 1.0;
             } else if (m_shot_age < 4.0) {
                 // Upward post-boundary refinement requires temporal
-                // authentication; the survivor read is downward-only, so its
-                // shedding stays motion-ungated — disappearing proof must
-                // revoke toward the title baseline even inside a moving cut.
+                // authentication; downward refinement stays motion-ungated --
+                // disappearing proof must revoke toward the title baseline even
+                // inside a moving cut.
                 char_up_rate = 0.20 * evidence;
-                char_down_rate = 0.50 * max(m_shot_obs_w[b],
-                                            reliability_raw);
+                char_down_rate = 0.50 * reliability_raw;
                 restore_up_rate = 0.35 * reliability;
-                restore_down_rate = 0.50 * max(m_shot_obs_w[b],
-                                               spatial_reliability);
+                restore_down_rate = 0.50 * spatial_reliability;
             } else {
                 // Once the shot is established, presentation moves on a
                 // roughly ten-minute horizon. The observer may keep learning
                 // quickly internally without making that learning visible;
-                // title-lane movement surfaces at the next boundary commit,
-                // never mid-shot. The survivor-driven pullback is the one
-                // faster lane: it can only shed restoration that visible
-                // surviving grain contradicts.
+                // title-level movement surfaces at the next boundary commit,
+                // never mid-shot.
                 char_up_rate = 0.00004 * static_gate;
                 char_down_rate = 0.00008;
                 restore_up_rate = 0.00006 * static_gate;
-                restore_down_rate = max(0.00008, 0.04 * obs_weight);
+                restore_down_rate = 0.00008;
             }
             float ar = (char_target > m_char_p[b])
                      ? char_up_rate : char_down_rate;
@@ -2281,30 +2217,21 @@ void lean_observe() {
             m_char_p[b] = mix(m_char_p[b], char_target, ar);
             m_restore_p[b] = mix(m_restore_p[b], restore_target, rr);
 
-            title_sum += master;
             weight_sum += m_master_w[b];
             char_sum += m_char_p[b];
             restore_sum += m_restore_p[b];
-            target_missing_sum += restore_target;
         }
 
         float avg_w = weight_sum / float(MP_TONE_BINS);
-        // The retained boost lane is neutral in the current estimator; keep
-        // this arithmetic synchronized with OUTPUT for state compatibility.
-        float boost_q = clamp(m_shot_restore_boost - 1.0, 0.0, 1.0);
-        float effective_restore = (restore_gain <= 2.0)
-                                ? mix(restore_gain,
-                                      min(2.0, 2.0 * restore_gain), boost_q)
-                                : restore_gain;
-        float p_total = char_sum / float(MP_TONE_BINS)
-                      + effective_restore * effective_restore
-                      * restore_sum / float(MP_TONE_BINS);
-        float p_restore = effective_restore * effective_restore
+        // Same power sum as OUTPUT's composite (char + restore_gain^2 x restore).
+        float p_restore = restore_gain * restore_gain
                         * restore_sum / float(MP_TONE_BINS);
-        m_loss_mix = (p_total > 1.0e-12) ? p_restore / p_total : 0.0;
-        m_loss_conf = clamp(target_missing_sum
-                          / max(title_sum, 1.0e-12), 0.0, 1.0);
-        m_est_missing = sqrt(max(restore_sum / float(MP_TONE_BINS), 0.0));
+        float p_total = char_sum / float(MP_TONE_BINS) + p_restore;
+        m_evidence = evidence;
+        m_ev_gate = ev_gate;
+        m_acq_max = acq_max;
+        m_q_random = q_random;
+        m_q_source = q_source;
         // Underlying renderable power, deliberately independent of live
         // gain/match knobs. OUTPUT gates and scales those controls directly;
         // caching them here made pause-time off->on toggles inherit a stale
@@ -2313,8 +2240,7 @@ void lean_observe() {
         m_eff_render = clamp(m_eff_render, 0.0, 0.75);
         m_observed = observed;
         m_temporal_support = temporal;
-        m_structure_ratio = structure_ratio;
-        m_tone_conf = max(m_title_conf, avg_w);
+        m_auth_mean = avg_w;
         m_coverage = coverage;
         m_motion = changed;
         m_cut_score = hist_l1;
@@ -2322,10 +2248,9 @@ void lean_observe() {
         m_measured = min(m_measured + 1.0, 65535.0);
         m_prev_ready = 1.0;
 
-        // Two clocks, two jobs. m_arr_seed is the visible arrangement and
-        // follows grain_rate; m_field_seed is the standing template vocabulary
-        // and follows grain_gen_rate. A skipped template tick therefore still
-        // presents a fresh block layout/jitter whenever the visible clock ticks.
+        // One clock. m_arr_seed follows grain_rate and seeds both the visible
+        // arrangement (PASS 3) and the template (PASS 2): every visible tick
+        // regenerates the template, so a tick always shows fresh grain.
         float prev_gen_frame = m_gen_frame;
         // Float SSBO counters stop accepting +1 at 2^24. Wrap well before
         // that boundary; the seed hash intentionally tolerates this roughly
@@ -2338,34 +2263,23 @@ void lean_observe() {
         if (visible_tick)
             m_arr_seed = visible_seed;
 
-        bool scheduled_regen = visible_tick
-            && floor(visible_seed * grain_gen_rate)
-             != floor(prev_visible_seed * grain_gen_rate);
         bool baked_params_changed =
                abs(m_baked_grain_size - grain_size) > 1.0e-6
             || abs(m_baked_grain_contrast - grain_contrast) > 1.0e-6
             || abs(m_baked_value_warp - value_warp) > 1.0e-6
             || abs(m_baked_grain_base_sat - grain_base_sat) > 1.0e-6
-            || abs(m_baked_grain_soften - grain_soften) > 1.0e-6
-            || abs(m_baked_match_grain - match_grain) > 1.0e-6;
-        // A cut still forces a fresh template so each shot gets its own
-        // vocabulary even at a reduced gen rate. The old post-cut fast-
-        // acquisition regens died with the size/hardness evidence freeze:
-        // GRAIN_FIELD content is params + seed only now, so a mid-window
-        // regen without a seed change rebuilt a bit-identical template.
-        bool fast_character = shot_boundary;
-        if (scheduled_regen || fast_character || baked_params_changed) {
-            if (visible_tick)
-                m_field_seed = m_arr_seed;
+            || abs(m_baked_grain_soften - grain_soften) > 1.0e-6;
+        // GRAIN_FIELD content is params + seed only, so a cut without a
+        // visible tick keeps its template (a rebuild would be bit-identical).
+        // A look edit rebuilds under the current seed.
+        if (visible_tick || baked_params_changed)
             m_regen_pending = 1.0;
-        }
         if (baked_params_changed) {
             m_baked_grain_size = grain_size;
             m_baked_grain_contrast = grain_contrast;
             m_baked_value_warp = value_warp;
             m_baked_grain_base_sat = grain_base_sat;
             m_baked_grain_soften = grain_soften;
-            m_baked_match_grain = match_grain;
         }
 
         // PASS 2 can be disabled by its PARAM-only WHEN. Snapshot a sticky
@@ -2378,9 +2292,9 @@ void lean_observe() {
             m_regen = 1.0;
             m_regen_pending = 0.0;
         }
-        // OUTPUT is the full presentation canvas after placement. Preserve the
-        // source raster aspect so its active destination rectangle can be
-        // recovered independently of window/display aspect ratio.
+        // Raster-change detector only (see s_raster_changed): a new LUMA
+        // aspect resets the geometry commits. OUTPUT does not read it -- its
+        // canvas is the picture (5A removed the old rectangle recovery).
         m_source_aspect = HOOKED_size.x / max(HOOKED_size.y, 1.0);
         imageStore(out_image, ivec2(0), vec4(0.0));
     }
@@ -2540,18 +2454,9 @@ void hook() {
 #define RED_SATURATION       0.736
 #define GREEN_SATURATION     0.262
 #define BLUE_SATURATION      0.718
-// SIZE/HARDNESS EVIDENCE FREEZE (2026-08): delivery-grade encodes destroy
-// per-title size/softness identity (master-side separation collapses to noise
-// after 5 Mbps AVC/AV1, with rank flips), so the observer's size/hardness
-// estimates are codec texture, not source character. The render evaluates at
-// this frozen neutral state point — the same point the size/hardness lever
-// calibration was measured at — and the observer keeps measuring for
-// diagnostics only (debug rows 14/15). Archetype-specific size/hardness
-// comes from the explicit levers (grain_size / grain_soften /
-// grain_contrast), not from evidence. MUST equal PASS 1's neutral state
-// init (m_shot_size/m_shot_hardness = 0.50) — same manual-sync rule as
-// PICTURE_DENSITY.
-#define FROZEN_SHOT_SHAPE 0.50
+// Per-channel base sigma ratios: the generator's chromatic grain-size
+// signature (red finest, blue coarsest), in units of k_size.
+const vec3 CHANNEL_SIGMA = vec3(0.78, 1.00, 1.20);
 
 const uvec2 isize = uvec2(gl_WorkGroupSize) + uvec2(2 * MAX_TAPS);
 
@@ -2632,9 +2537,10 @@ void hook() {
     uint lid = gl_LocalInvocationIndex;
     uint num_threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
 
-    // The observer already produced the complete amount and character record.
-    // Generation is source-locked; m_regen is this frame's immutable request.
-    uint frame_seed = uint(max(0.0, m_field_seed));
+    // The observer already produced the complete amount record. Generation is
+    // source-locked; m_regen is this frame's immutable request, and the
+    // template is seeded by the visible arrangement tick (one clock).
+    uint frame_seed = uint(max(0.0, m_arr_seed));
     bool regenerate = m_regen > 0.5;
     if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u)
         imageStore(out_image, ivec2(0), vec4(0.0));
@@ -2649,39 +2555,37 @@ void hook() {
     if ((grain_gain <= 0.0 || match_grain <= 0.0) && debug_match <= 0.5)
         return;
 
-    // Grain is generated on the picture-space implementation lattice. Size
-    // is evidence-FROZEN (see FROZEN_SHOT_SHAPE): delivery texture can never
-    // morph rendered size — the m_shot_size estimate is measure-only now.
-    // grain_size scales the calibrated neutral correlation length directly.
+    // Grain is generated on the picture-space implementation lattice. Size and
+    // hardness are explicit levers, never evidence: delivery-grade encodes
+    // destroy per-title size identity (master-side separation collapses to
+    // noise after 5 Mbps AVC/AV1; our own generated sizes, re-measured after
+    // a 6 Mbps 1080p encode, fell below per-frame SNR 0.5), so the observer
+    // measures amount only. grain_size scales the calibrated neutral correlation length directly.
     // Phase 4 removed the grain_sharpness trim that sat between them (it
     // mixed toward the frozen observer size 1.040); its default 0.3 lives on
     // in grain_size's default 1.34 (k 1.005 vs the old 1.0045).
     float k_size = K_NEUTRAL * grain_size;
 
     // CONTRAST/BANDPASS: build inner (s1) AND outer (s2 = BP_RATIO*s1) blur weights.
-    // bp_alpha is UNIFORM across the workgroup (grain_contrast/match_grain are
-    // uniform cbuffer reads; hardness is the frozen constant), and the outer blur below runs
-    // UNCONDITIONALLY (X3663 rework), so every barrier stays in uniform
-    // control flow. bp_alpha=0 -> vsum2 multiplied out in the combine,
-    // bp_norm=1, grain = blur(s1) = the old lowpass generator (A/B-safe).
-    float render_hardness = smoothstep(0.25, 0.82, FROZEN_SHOT_SHAPE);
-    float bp_alpha = BP_ALPHA * grain_contrast * match_grain
-                   * render_hardness;
-    // DoG positivity guard: when both blur sigmas clamp at SIGMA_MAX the
-    // kernels coincide and the covariance zero-crossing sits at alpha 1.0
-    // (>1 for any distinct pair, by Cauchy-Schwarz). Capping alpha below 1
-    // guarantees the combined field stays positively correlated with the
-    // inner blur on every channel at every grain_size — the coarse-shot
-    // blue-channel inversion (audit bug #6) becomes unreachable. bp_norm
-    // re-normalizes RMS, so the cap only limits how much DC the hardest
-    // settings strip.
-    bp_alpha = min(bp_alpha, 0.95);
+    // bp_alpha is UNIFORM across the workgroup (a cbuffer PARAM times a
+    // constant), and the outer blur below runs UNCONDITIONALLY (X3663 rework),
+    // so every barrier stays in uniform control flow. bp_alpha=0 -> vsum2
+    // multiplied out in the combine, bp_norm=1, grain = blur(s1) = the
+    // lowpass generator. render_hardness is the calibration point the
+    // hardness lever was measured at (the former frozen observer state 0.50),
+    // kept as the same expression so the kernels stay bit-identical. The max
+    // alpha is 0.6 x 2 x 0.408 = 0.49; the DoG stays positively correlated with
+    // its inner blur (zero-crossing at alpha 1), so no cap is needed while
+    // grain_contrast stays <= 4. match_grain is an OUTPUT mix only: it no
+    // longer reaches the kernels.
+    float render_hardness = smoothstep(0.25, 0.82, 0.50);
+    float bp_alpha = BP_ALPHA * grain_contrast * render_hardness;
     if (regenerate && lid < uint(2 * MAX_TAPS + 1)) {
         int idx = int(lid);
         float dx = float(idx - MAX_TAPS);
-        float s1r = 0.78 * k_size;
-        float s1g = 1.00 * k_size;
-        float s1b = 1.20 * k_size;
+        float s1r = CHANNEL_SIGMA.r * k_size;
+        float s1g = CHANNEL_SIGMA.g * k_size;
+        float s1b = CHANNEL_SIGMA.b * k_size;
         // grain_soften: SUB-PIXEL CAPTURE MODEL (2026-08-22). A physical grain
         // is a continuous object that a scanner/camera pixel integrates; it is
         // not a dot sitting on the synthesis lattice. A lattice of random
@@ -2763,14 +2667,11 @@ void hook() {
         vec3 field_gain = vec3(1.0);
         if (abs(grain_size - VIS_ANCHOR_SIZE) > 1.0e-6
             || abs(grain_contrast - VIS_ANCHOR_CONTRAST) > 1.0e-6
-            || abs(grain_soften - VIS_ANCHOR_SOFTEN) > 1.0e-6
-            || match_grain < 1.0) {
+            || abs(grain_soften - VIS_ANCHOR_SOFTEN) > 1.0e-6) {
             float live_soft2 = grain_soften * grain_soften;
             float anchor_soft2 = VIS_ANCHOR_SOFTEN * VIS_ANCHOR_SOFTEN;
             float anchor_k = K_NEUTRAL * VIS_ANCHOR_SIZE;
-            float anchor_alpha = min(BP_ALPHA * VIS_ANCHOR_CONTRAST
-                                     * render_hardness, 0.95);
-            const vec3 CHANNEL_SIGMA = vec3(0.78, 1.00, 1.20);
+            float anchor_alpha = BP_ALPHA * VIS_ANCHOR_CONTRAST * render_hardness;
             for (int c = 0; c < 3; c++) {
                 float kl = CHANNEL_SIGMA[c] * k_size;
                 float ka = CHANNEL_SIGMA[c] * anchor_k;
@@ -3100,7 +3001,6 @@ void hook() {
 // stays fetch + key + apply. All grain generation and every scalar that used
 // to be derived here (eff_render/mid/steep, conf, shape_w) now come from the
 // source-locked gen pass via GRAIN_STATE / GRAIN_FIELD.
-#define DENSITY_GAIN 1.0
 #define DENSITY_SHADOW_FLOOR 0.015
 #define PICTURE_DENSITY_OUT 2160.0
 // MUST equal MP_PICTURE_DENSITY / PICTURE_DENSITY in PASS 1 / PASS 2.
@@ -3112,10 +3012,21 @@ void hook() {
 #define MP_FIELD_STD_OUT 0.0185
 // MUST equal PASS 1's MP_STATE_MAGIC (same translation-unit-sync rule as
 // MP_TONE_BINS_OUT / MP_FIELD_STD_OUT — no compile guard exists).
-#define MP_STATE_MAGIC_OUT 0.954120
+#define MP_STATE_MAGIC_OUT 0.956340
 // MUST equal PASS 1's MEASURE_BLACK / MEASURE_WHITE (same no-guard sync rule).
 #define MEASURE_BLACK_OUT (16.0 / 255.0)
 #define MEASURE_WHITE_OUT (235.0 / 255.0)
+// grain_floor's unit, FROZEN on purpose: the summed added power over the
+// rendered tone bins 2-7 (restore_gain 1) of a clean title at the defaults --
+// 0.67 x the no-evidence reset level (My Gift / Dandadan settle at 0.81-0.83
+// in sigma), from the 2026-09-30 survey. A literal, not derived from PASS 1's
+// prior constants: retuning those later must not silently rescale every
+// profile's grain_floor. Do not retune.
+#define FLOOR_UNIT_SUM 7.059e-7
+// Lowering the floor eases out between the clean level (1) and this amount
+// (sigma units of FLOOR_UNIT_SUM): titles the engine recognises as grainy
+// sit at ~1.7-7 once learned (5B replay, 2026-09-30) and keep their amount.
+#define FLOOR_KNEE 1.5
 
 const vec3 luma_coeff = vec3(0.2126, 0.7152, 0.0722);
 
@@ -3134,11 +3045,9 @@ shared float s_state_magic;
 shared float s_state_epoch;
 shared float s_field_valid;
 shared float s_eff_render;
-shared float s_source_aspect;
 shared float s_active_inset_x;
 shared float s_active_inset_y;
 shared float s_arr_seed;
-shared float s_shot_restore_boost;
 shared float s_field_var_r;
 shared float s_field_var_g;
 shared float s_field_var_b;
@@ -3152,6 +3061,7 @@ shared float s_tpl_block_inv;
 shared float s_tpl_ov_inv;
 shared float s_char_p[8];
 shared float s_restore_p[8];
+shared float s_floor_lift2;
 
 // --- HDR (PQ BT.2020 output) domain bridge, grain_hdr=1. The grain model is
 // measured on gamma-encoded SDR source codes at LUMA, but whenever the player
@@ -3217,14 +3127,9 @@ float matched_grain_scale(float lum, float hdr_mode) {
     float char_p = mix(s_char_p[i0], s_char_p[i1], fract(p));
     float restore_p = mix(s_restore_p[i0], s_restore_p[i1], fract(p));
     // Keep this expression identical to PASS 1's p_total accounting.
-    // The retained boost lane is neutral in the current estimator; keep this
-    // arithmetic synchronized with PASS 1 for state compatibility.
-    float boost_q = clamp(s_shot_restore_boost - 1.0, 0.0, 1.0);
-    float effective_restore = (restore_gain <= 2.0)
-                            ? mix(restore_gain,
-                                  min(2.0, 2.0 * restore_gain), boost_q)
-                            : restore_gain;
-    float power = char_p + effective_restore * effective_restore * restore_p;
+    float power = char_p + restore_gain * restore_gain * restore_p;
+    if (abs(grain_floor - 1.0) > 1.0e-6)
+        power *= s_floor_lift2;
     float sigma = grain_gain * match_grain * sqrt(max(power, 0.0));
     float black_lo = mix(0.0010, 0.00025, hdr_mode);
     float black_hi = mix(0.0120, 0.00600, hdr_mode);
@@ -3256,12 +3161,12 @@ float matched_grain_scale(float lum, float hdr_mode) {
     // gate reaches full grain almost immediately, which makes a 0.2 fade
     // read as a hard band. Below 0.5, widen the rise and shorten its
     // full-strength shelf.
-    // OUTPUT's symmetric room clamp and flash-guard ceiling key on the same
-    // top; the black gate stays container-keyed on hdr_mode.
+    // OUTPUT's per-channel clip room keys on the same top; the black gate
+    // stays container-keyed on hdr_mode.
     float white_hdr = hdr_mode * step(0.5, grain_headroom);
     // Floored at the declared PARAM minimum: a degenerate override would
     // collapse the smoothstep edges below (NaN through the whole tone scale).
-    float fade_user = max(grain_fade, 0.2);
+    float fade_user = max(grain_fade, 0.1875);
     float fade_top = mix(min(fade_user, 0.95), fade_user, white_hdr);
     float low_fade_q = 1.0 - smoothstep(0.30, 0.50, fade_top);
     float wide_q = 1.0 - smoothstep(0.70, 0.95, fade_top);
@@ -3501,11 +3406,9 @@ void hook() {
         s_state_epoch = m_state_epoch;
         s_field_valid = m_field_valid;
         s_eff_render = m_eff_render;
-        s_source_aspect = m_source_aspect;
         s_active_inset_x = m_active_inset_x;
         s_active_inset_y = m_active_inset_y;
         s_arr_seed = m_arr_seed;
-        s_shot_restore_boost = m_shot_restore_boost;
         s_field_var_r = m_field_var_r;
         s_field_var_g = m_field_var_g;
         s_field_var_b = m_field_var_b;
@@ -3522,9 +3425,36 @@ void hook() {
         s_tpl_ov = TPL_OV * s_tpl_scale;
         s_tpl_block_inv = 1.0 / s_tpl_block;
         s_tpl_ov_inv = 1.0 / s_tpl_ov;
+        float floor_have = 0.0;
         for (int i = 0; i < 8; i++) {
             s_char_p[i] = m_char_p[i];
             s_restore_p[i] = m_restore_p[i];
+            // Rendered bins only: the lookup floors at bin 2 (sub-black below).
+            if (i >= 2) floor_have += s_char_p[i] + s_restore_p[i];
+        }
+        // grain_floor: ONE factor per title, moving the engine's built-in
+        // minimum. a = the title's added amount at restore_gain 1 in sigma
+        // units of the clean level (clean titles sit at ~1.0). Raising (L > 1)
+        // lifts titles below L to L; lowering (L < 1) scales titles at or
+        // below the clean level by L and ramps back to identity at
+        // FLOOR_KNEE, continuous and monotone, so no title steps while the
+        // engine learns it. Every pixel's live power scales by the same
+        // factor: the learned tone shape is kept (a per-bin max raised only
+        // the tails of partially credited titles -- review 2026-09-30) and
+        // restore_gain / grain_gain remain relative trims on top. Uniform
+        // PARAM branch: 1 is exact.
+        s_floor_lift2 = 1.0;
+        if (abs(grain_floor - 1.0) > 1.0e-6) {
+            float a = sqrt(max(floor_have, 1.0e-12) / FLOOR_UNIT_SUM);
+            float lvl = max(grain_floor, 0.0);
+            float a_new = a;
+            if (lvl > 1.0)
+                a_new = max(a, lvl);
+            else if (a <= 1.0)
+                a_new = a * lvl;
+            else if (a < FLOOR_KNEE)
+                a_new = lvl + (a - 1.0) * (FLOOR_KNEE - lvl) / (FLOOR_KNEE - 1.0);
+            s_floor_lift2 = (a_new * a_new) / (a * a);
         }
     }
     barrier();
@@ -3552,30 +3482,26 @@ void hook() {
         return;
     }
 
-    // Source-locked grain lives in canonical active-picture coordinates.
-    // First recover the full source-raster placement (display-added padding),
-    // then nest the committed baked-picture rectangle inside it. Neither kind
-    // of matte may resize or rephase the field.
+    // Source-locked grain lives in canonical active-picture coordinates: the
+    // committed baked-picture rectangle (letterbox/pillarbox burned into the
+    // video) nested inside the canvas. The canvas IS the displayed picture:
+    // libplacebo runs OUTPUT hooks on the target crop, so display padding never
+    // reaches this pass (probed 2026-09-30: contain, pos, cover-crop). The old
+    // raster recovery assumed padding and, from the LUMA storage aspect,
+    // masked real picture out -- anamorphic 720x480 SAR 32:27 lost 15.6% of
+    // its width, a cover crop 10% of its rows. Known gap (older than 5A): the
+    // baked inset is a fraction of the whole LUMA raster, so with panscan /
+    // video-zoom / video-crop on a source WITH baked bars the mask lands inside
+    // the cropped picture. Mapping through the source crop would need the
+    // LUMA dimensions in the state; not built.
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     // Compile-time template dims: constant divisors let every wrap mod below
     // strength-reduce to multiply/shift instead of a hardware integer divide
     // per tap. MUST equal the GRAIN_FIELD SIZE directive and PASS 2's
     // GEN_GRID (960 x 540) — same hand-kept lockstep rule, no compile guard.
     ivec2 gsize = ivec2(960, 540);
-    vec2 canvas = HOOKED_size;
-    float source_aspect = (s_source_aspect > 0.01)
-                        ? s_source_aspect
-                        : canvas.x / max(canvas.y, 1.0);
-    float canvas_aspect = canvas.x / max(canvas.y, 1.0);
-    vec2 raster_size = canvas;
+    vec2 raster_size = HOOKED_size;
     vec2 raster_origin = vec2(0.0);
-    if (canvas_aspect > source_aspect + 0.0001) {
-        raster_size.x = canvas.y * source_aspect;
-        raster_origin.x = 0.5 * (canvas.x - raster_size.x);
-    } else if (canvas_aspect < source_aspect - 0.0001) {
-        raster_size.y = canvas.x / source_aspect;
-        raster_origin.y = 0.5 * (canvas.y - raster_size.y);
-    }
     vec2 baked_inset = clamp(vec2(s_active_inset_x, s_active_inset_y),
                              vec2(0.0), vec2(0.24));
     vec2 active_origin = raster_origin + baked_inset * raster_size;
@@ -3590,7 +3516,15 @@ void hook() {
                       + (baked_inset + mask_guard) * raster_size);
     vec2 mask_hi = floor(raster_origin + raster_size
                        - (baked_inset + mask_guard) * raster_size);
-    if (debug_match <= 0.5
+    // The debug overlay may sit over a bar: only its own rectangle bypasses
+    // the matte mask (the rest of the frame stays exactly as rendered). These
+    // literals MUST match the overlay's X_OFF/Y_OFF/ANCHOR/NBITS/BW/NROWS/BH
+    // at the end of this pass (hand-kept lockstep; that block's text is
+    // pinned by external decoders, so it keeps its own constants).
+    bool in_overlay = debug_match > 0.5
+                   && gid.x >= 24 && gid.x < 24 + 10 + 16 * 10
+                   && gid.y >= 400 && gid.y < 400 + 52 * 10;
+    if (!in_overlay
         && (float(gid.x) < mask_lo.x || float(gid.y) < mask_lo.y
          || float(gid.x) >= mask_hi.x || float(gid.y) >= mask_hi.y)) {
         imageStore(out_image, gid, color);
@@ -3600,6 +3534,18 @@ void hook() {
     // lattice, not the physical template extent;
     // gsize only wraps each shuffled template-window fetch.
     float gscale = PICTURE_DENSITY_OUT / max(active_size.y, 1.0);
+    // Snap to a whole lattice step when within 6%: just off an integer the
+    // tent/grid estimators paint a STATIC strength pattern (the jitter moves
+    // the lattice in whole texels only) and lose ~10% RMS -- a 24.7 px beat for
+    // 1.85:1 at 4K, 269 px for a 2 px inset (audit 2026-09-30). The usual case
+    // is a step just ABOVE an integer (a letterboxed or cropped picture: 1.04
+    // -> 1, 2.08 -> 2), where the snapped grain is up to 6% COARSER relative to
+    // picture height and its amount returns to the integer-step value (+11%
+    // over the unsnapped tent); below the size JND. Just outside the window the
+    // beat remains (e.g. 1.90:1 at 4K, step 1.069: cv 0.026, 14.5 px) -- open.
+    float gscale_n = max(1.0, floor(gscale + 0.5));
+    if (abs(gscale / gscale_n - 1.0) < 0.06)
+        gscale = gscale_n;
     vec2 fpos = (pixel_centre - active_origin) * gscale;
     // KNOWN LIMIT (audit 2026-07-10): the overlap blend preserves variance
     // exactly (weights' squares sum to 1) but not DISTRIBUTION SHAPE — a
@@ -3680,20 +3626,20 @@ void hook() {
     // headroom clamps below apply to the blended delta unchanged.
     float density_w = clamp(density_combine, 0.0, 1.0);
     vec3 grain_delta = vsum * tone_add;
+    // Expected per-channel grain sigma of the delta (field std x tone scale),
+    // for the clip-room gain below. Density rides the carrier, so its sigma
+    // scales with each channel's own level.
+    vec3 field_sd = sqrt(max(vec3(s_field_var_r, s_field_var_g, s_field_var_b),
+                             vec3(0.0)));
+    vec3 delta_sd = tone_add * field_sd;
     if (density_w > 0.0) {
         // Density multiplication cannot express an absolute noise floor below
-        // the 0.015 divisor. Extend only picture-bearing near-black values with
-        // the same zero-mean RGB perturbation; literal black/mattes stay exact.
-        float ped_lo = mix(0.0010, 0.00025, hdr_mode);
-        float ped_hi = mix(0.0060, 0.00300, hdr_mode);
-        float pedestal_gate = smoothstep(ped_lo, ped_hi,
-                                         max(color_luma, 0.0))
-                            * (1.0 - smoothstep(0.015, 0.030,
-                                                max(color_luma, 0.0)));
+        // the 0.015 divisor. Extend near-black values with the same zero-mean
+        // RGB perturbation; literal black and mattes stay exact through the
+        // shadow toe (zero tone scale there).
         float pedestal_signal = max(DENSITY_SHADOW_FLOOR
-                                  - max(color_luma, 0.0), 0.0)
-                              * pedestal_gate;
-        vec3 x = DENSITY_GAIN * vsum * tone_den;
+                                  - max(color_luma, 0.0), 0.0);
+        vec3 x = vsum * tone_den;
         // Canonical-field log-normal bias correction, on the LIVE per-channel
         // variance of the stored field (PASS 2's diagonals: mix, amount
         // normalization and saturation included). It was a static triple
@@ -3704,87 +3650,69 @@ void hook() {
         // covariance, so non-native-density presentations retain a small
         // conservative bias rather than pretending sum(weights^2) is exact
         // for the correlated DoG field.
-        vec3 density_delta = exp(x - 0.5 * DENSITY_GAIN * DENSITY_GAIN
-                               * tone_den * tone_den
+        vec3 density_delta = exp(x - 0.5 * tone_den * tone_den
                                * vec3(s_field_var_r, s_field_var_g, s_field_var_b)) - 1.0;
         vec3 density_grain = work_rgb * density_delta;
         density_grain += vec3(pedestal_signal) * density_delta;
         // One post-density scalar preserves channel log-normal shapes, their
         // zero-mean correction, hue speckle, and spatial/RMS ratios exactly.
         // At a neutral carrier the cap is identically one.
-        density_grain *= density_colour_energy_cap(
+        float energy_cap = density_colour_energy_cap(
             work_rgb + vec3(pedestal_signal));
+        density_grain *= energy_cap;
+        vec3 density_sd = tone_den * field_sd
+                        * abs(work_rgb + vec3(pedestal_signal)) * energy_cap;
         // Exact endpoint: FXC lowers mix() to x + s*(y - x), which is an ulp
         // or two off y at s == 1, so the shipped default 1.0 takes the
         // density arm directly (uniform PARAM branch, no barrier follows).
         grain_delta = (density_w >= 1.0)
                     ? density_grain
                     : mix(grain_delta, density_grain, density_w);
+        delta_sd = (density_w >= 1.0) ? density_sd
+                                      : mix(delta_sd, density_sd, density_w);
     }
 
-    if (!hdr_bridge || grain_headroom < 0.5) {
-        // Luma can remain below 1.0 when only one or two RGB channels are
-        // clipped. (With grain_headroom = 0 the same source clipping survives
-        // inside a PQ container at work-domain 1.0, where the encode-side
-        // ref-white clip below reproduces the display's clamp — so the same
-        // defense applies.) Letting the display clamp those channels after grain would
-        // remove positive excursions while retaining dark pits — temporally
-        // conspicuous in tinted whites even though literal RGB white already
-        // has a zero tone scale. Limit every channel symmetrically to its code
-        // headroom. Neutral highlights progressively share the tightest upper
-        // headroom, so a tinted white with one clipped channel cannot retain
-        // chromatic flicker; saturated colors keep their unclipped channels.
-        // Under the bridge (headroom = 0) a negative signed-gamma component
-        // (out-of-709 color) gets zero headroom = zero grain on that channel;
-        // intentional — such values are fp/gamut noise for ceiling-limited content.
-        vec3 channel_headroom = max(min(pre_grain, vec3(1.0) - pre_grain),
-                                    vec3(0.0));
-        float rgb_peak = max(max(pre_grain.r, pre_grain.g), pre_grain.b);
-        float rgb_floor = min(min(pre_grain.r, pre_grain.g), pre_grain.b);
-        float neutral_highlight = smoothstep(0.80, 0.95, rgb_floor);
-        float shared_upper = max(1.0 - rgb_peak, 0.0);
-        vec3 code_headroom = mix(channel_headroom, vec3(shared_upper),
-                                 neutral_highlight);
-        grain_delta = clamp(grain_delta, -code_headroom, code_headroom);
-    } else {
-        // CelFlare/PQ path: the same defense one octave up. The flash-guard
-        // ceiling below is one-sided -- inside the open fade band a positive
-        // excursion used to clip at the pixel's own level while the fade
-        // still passed amplitude, leaving rectified negative-only pits on
-        // expanded highlights (charter-audit P3), per-channel on tinted ones.
-        // Bound the delta symmetrically against the sanctioned grain domain
-        // instead: where grain cannot go up it may not go down. Neutral
-        // highlights share the tightest upper room exactly like the SDR
-        // limiter, scaled to the clamp top. No floor arm here -- the PQ
-        // pedestal owns near-black and work-domain black is not a clip.
-        // The clamp top floors at ref white: overshoot physics only exists
-        // at/above 1.0. A grain_fade below ref white is a purely cosmetic
-        // target owned by the LUMA fade -- enforcing it per channel would
-        // delete grain from bright saturated channels (R 0.95 at luma 0.43)
-        // while their neighbours keep full grain: colored, directional
-        // suppression on ordinary unclipped content (re-base audit P1).
-        float clamp_top = max(grain_fade, 1.0);
-        vec3 up_room = max(vec3(clamp_top) - pre_grain, vec3(0.0));
-        float rgb_peak = max(max(pre_grain.r, pre_grain.g), pre_grain.b);
-        float rgb_floor = min(min(pre_grain.r, pre_grain.g), pre_grain.b);
-        float neutral_highlight = smoothstep(0.80 * clamp_top,
-                                             0.95 * clamp_top, rgb_floor);
-        float shared_upper = max(clamp_top - rgb_peak, 0.0);
-        vec3 code_room = mix(up_room, vec3(shared_upper), neutral_highlight);
-        grain_delta = clamp(grain_delta, -code_room, code_room);
-    }
+    // CLIP ROOM, one rule for every chain. Each channel may move only as far
+    // as it can move symmetrically inside the sanctioned domain [0, top]:
+    // where grain cannot go up it may not go down, or the display (SDR) / the
+    // encode (PQ) clamp would keep the dark pits and drop the bright
+    // excursions -- temporally conspicuous on tinted whites. Clip-limited
+    // chains (plain SDR, or SDR in a PQ container: grain_headroom 0) have
+    // top = 1 and a floor arm at 0. Headroom chains (an upstream SDR->HDR
+    // expansion) have top = max(grain_fade, 1) -- overshoot physics only
+    // exists at/above ref white; a lower grain_fade is the LUMA fade's
+    // cosmetic job, and enforcing it per channel would strip grain from
+    // bright saturated channels (re-base audit P1) -- and no floor arm (the
+    // PQ pedestal owns near-black; work-domain black is not a clip). Neutral
+    // highlights share the tightest upper room, so a tinted white with one
+    // clipped channel cannot keep chromatic flicker. Under the bridge a
+    // negative signed-gamma component (out-of-709) gets zero room = zero
+    // grain on that channel: fp/gamut noise for ceiling-limited content.
+    bool floor_arm = !hdr_bridge || grain_headroom < 0.5;
+    float clip_top = floor_arm ? 1.0 : max(grain_fade, 1.0);
+    vec3 up_room = max(vec3(clip_top) - pre_grain, vec3(0.0));
+    vec3 channel_room = floor_arm ? max(min(pre_grain, up_room), vec3(0.0))
+                                  : up_room;
+    float rgb_peak = max(max(pre_grain.r, pre_grain.g), pre_grain.b);
+    float rgb_floor = min(min(pre_grain.r, pre_grain.g), pre_grain.b);
+    float neutral_highlight = smoothstep(0.80 * clip_top, 0.95 * clip_top,
+                                         rgb_floor);
+    float shared_upper = max(clip_top - rgb_peak, 0.0);
+    vec3 code_room = mix(channel_room, vec3(shared_upper), neutral_highlight);
+    // Room-aware gain BEFORE the clamp: a channel with less than ~2 sigma of
+    // room is scaled down instead of hard-clamped, so saturated near-clip
+    // colours keep a Gaussian-looking grain instead of two-level dots (audit
+    // 2026-09-30: density put 4-4.6x grey's amplitude into the lit channel;
+    // a channel at 0.995 sat at the bound in 43% of samples at gain 1, 79% at
+    // gain 3, kurtosis down to 1.13; with this gain <= 5% at bound, kurtosis
+    // ~2.4). Exactly 1 wherever room >= 2 sigma. The clamp stays as the
+    // backstop; with it the delta never leaves the domain, so the old HDR
+    // flash guard (a min() after this clamp) was a no-op and is gone.
+    grain_delta *= min(vec3(1.0), code_room / max(2.0 * delta_sd, vec3(1.0e-9)));
+    grain_delta = clamp(grain_delta, -code_room, code_room);
     work_rgb += grain_delta;
 
     if (hdr_bridge) {
-        // Grain is texture, not signal: it may never push a pixel above
-        // max(its own pre-grain level, the sanctioned grain ceiling) -- ref
-        // white for clip-limited content, the user's fade top under an
-        // upstream expansion. The symmetric room clamp above already bounds
-        // the delta inside that domain, so this stays a flash guard against
-        // large density excursions re-encoding toward display peak
-        // (design-audit finding, 2026-07-04), never a tone shaper.
-        float ceil_top = (grain_headroom < 0.5) ? 1.0 : max(grain_fade, 1.0);
-        work_rgb = min(work_rgb, max(pre_grain, vec3(ceil_top)));
         vec3 linear_709 = signed_pow(work_rgb, 2.4);
         vec3 out_nits = grain_ref_white * max(bt709_to_bt2020(linear_709), vec3(0.0));
         color.rgb = vec3(pq_oetf_code(out_nits.r), pq_oetf_code(out_nits.g),
@@ -3805,21 +3733,22 @@ void hook() {
             else if (row == 1)  v = sqrt(max(m_title_power, 0.0)) * 2000000.0;
             else if (row == 2)  v = m_shot_gain * 20000.0;
             else if (row == 3)  v = m_temporal_support * 2000000.0;
-            else if (row == 4)  v = m_est_missing * 2000000.0;
-            else if (row == 5)  v = m_loss_conf * 65000.0;
-            else if (row == 6)  v = m_title_conf * 65000.0;
-            else if (row == 7)  v = m_shot_conf * 65000.0;
-            else if (row == 8)  v = m_loss_mix * 65000.0;
-            else if (row == 9)  v = m_tone_conf * 65000.0;
+            // Rows 4-9 and 36-43 changed meaning in 5B (2026-09-30): the
+            // title-confidence / survivor / loss diagnostics were removed.
+            else if (row == 4)  v = m_evidence * 65000.0;
+            else if (row == 5)  v = m_ev_gate * 65000.0;
+            else if (row == 6)  v = m_auth_mean * 65000.0;
+            else if (row == 7)  v = m_acq_max * 4000.0;
+            else if (row == 8)  v = m_q_random * 65000.0;
+            else if (row == 9)  v = m_q_source * 65000.0;
             else if (row == 10) v = s_eff_render * 30000.0;
-            else if (row == 11) v = m_structure_ratio * 1000000.0;
+            else if (row == 11) v = 0.0; // retired in 5A (structure ratio)
             else if (row == 12) v = m_coverage * 65000.0;
             else if (row == 13) v = m_motion * 30000.0;
-            // Rows 14/15 decode the MEASURED size/hardness estimates —
-            // diagnostics only since the evidence freeze; the render uses
-            // PASS 2's FROZEN_SHOT_SHAPE and ignores these.
-            else if (row == 14) v = m_shot_size * 60000.0;
-            else if (row == 15) v = m_shot_hardness * 60000.0;
+            // Rows 14/15 (measured size/hardness) were retired with the
+            // estimates in 5A (2026-09-30) and read 0.
+            else if (row == 14) v = 0.0;
+            else if (row == 15) v = 0.0;
             else if (row == 16) v = m_cut_score * 30000.0;
             else if (row == 17) v = m_shot_age;
             else if (row == 18) v = m_measured;
@@ -3828,9 +3757,7 @@ void hook() {
                                       * 2000000.0;
             else if (row < 36)  v = sqrt(max(s_restore_p[row - 28], 0.0))
                                       * 2000000.0;
-            else if (row < 44)  v = sqrt(max(m_shot_obs_p[row - 36]
-                                      * m_shot_obs_w[row - 36], 0.0))
-                                      * 2000000.0;
+            else if (row < 44)  v = m_master_w[row - 36] * 65000.0;
             else if (row == 44) v = s_active_inset_x * 200000.0;
             else if (row == 45) v = s_active_inset_y * 200000.0;
             else if (row == 46) v = m_pending_inset_x * 200000.0;

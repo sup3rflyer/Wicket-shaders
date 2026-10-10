@@ -1,4 +1,4 @@
-// Debandit v3.4 — Detect-and-Reconstruct Deband, plane-fit estimator
+// Debandit v3.5 — Detect-and-Reconstruct Deband, plane-fit estimator
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Second-generation Debandit. The detect-and-reconstruct philosophy, the
@@ -108,20 +108,21 @@
 // reconstruction is the smoothness prior. Machinery: sigma-3 (1/4-res)
 // fitmask-NORMALIZED separable lowpass of M (two 17-tap passes,
 // mean-subtracted rows re-referenced in fp32 — the wide-moments
-// pattern; x8 encode headroom, see the LP V note); in the apply the
-// correction SOURCE blends fit -> lowpass per axis by db_curve x the
-// ENVELOPE gate x the LP's own confidence (trusted mass x support
-// symmetry, carried in DB2_LPC alpha). The fit-residual term is
+// pattern); in the apply the correction SOURCE blends fit -> lowpass
+// per axis by db_curve x the LP's own confidence (trusted mass x support
+// symmetry, carried in DB2_LPC alpha), and the envelope/residual gate
+// w_env is BYPASSED in proportion to that share (it certifies the fit,
+// not the lowpass — see the Apply note). The fit-residual term is
 // deliberately NOT in the blend weight — on curved shading the plane's
 // residual carries the very curvature+staircase the reconstructor
 // exists for, and a residual-shaped share measures NO better than the
 // fit alone (11% vs 38% ripple recovery on the 1312 rings). Bulk-edge
-// safety comes from the envelope (its +-8 seed reach equals the LP
-// window), the symmetry fade (a normalized convolution is biased on a
-// ramp under one-sided support — frame borders, mask collars; the fade
-// keeps the FIT there, which is exact), and the downstream gates + snap
-// machinery, which all read the BLENDED correction — the reconstructor
-// rides the entire v2 tower. Fallback: db_curve = 0 (DYNAMIC) is
+// safety on the LP share does NOT come from the envelope (bypassed, see
+// above) but from the LP alpha — trusted mass x the symmetry fade (a
+// normalized convolution is biased on a ramp under one-sided support —
+// frame borders, mask collars; the fade keeps the FIT there, which is
+// exact) — and from the amplitude, flatness and structure gates + snap
+// machinery, which all read the BLENDED correction. Fallback: db_curve = 0 (DYNAMIC) is
 // 1-ULP-equivalent to v2.2 (<= 1 px/frame — every algebraic blend form
 // perturbs Metal's luma-chain scheduling that much; fine for live A/B);
 // the BIT-exact escape is the deep define DB2_CURVE_PATH 0 in the Apply
@@ -205,6 +206,35 @@
 // — this newly covers the short fit's mask reads, which previously had
 // no storage dependence; in-envelope behavior is unchanged.
 //
+// v3.5 = v3.4 + an audit round: PASS FUSION round 3, exact skips and a
+// precision fix. 16 passes -> 15.
+// - Wide Residual fuses into Wide Fuse (it re-ran the identical 33-row V
+//   walk and solve). The residuals ride channels that were free: RANGE.y
+//   (luma) and ANISO.w (opponent). RANGE.x now holds the range itself,
+//   formed from the fp16-rounded extrema — the value the Apply used to
+//   subtract.
+// - (Recon LP H was also fused into Wide Moments and measured SLOWER:
+//   storage reads in LP V cost more than the pass it saved. Kept
+//   separate.)
+// - H Gathers computes the opponent block MAD from the full-res block it
+//   already reads (Chroma Range V re-read all 16 taps) and caches the row
+//   lumas for the tensor rows (18 MED fetches per texel). Noise Floor's
+//   stride grows with the frame (~32k samples; 1080p is the v3.4 grid).
+// - Uniform skips: db_aniso = 0 skips the structure tensor, db_block = 0
+//   the whole grid chain. Every consumer multiplies by the knob, so the
+//   output is identical.
+// - PRECISION: CORR, SCORR, LPC and the opponent range field are stored
+//   RAW (signed). The 0.5 + c offset encode quantized every correction to
+//   1/16-1/8 code at the fp16 ulp of 0.5 — a faint staircase locked to
+//   the ramps being rebuilt, which CelFlare's expansion then amplifies.
+//   The shader already needs signed float hook FBOs (WMOM_A, the LP sums),
+//   so the unorm insurance bought nothing. Output moves by <= 0.25 code;
+//   the regression tower is equal or better (border DC tilt 0.065 -> 0.041).
+// - TENS_H stores the tensor x4096: raw squared gradients sat in fp16
+//   SUBNORMALS on quiet sources, where the aniso flag read rounding noise.
+// Measured (D3D11, RTX 5090, defaults): 4K MAIN 0.665 -> 0.541 ms,
+// 1080p 0.218 -> 0.198 ms.
+//
 // Chain order: list BEFORE CelFlare in glsl-shaders (same-hook passes run
 // in load order; CelFlare's expansion multiplies any step not flattened
 // first). The previous v1.11 generation is archived outside the public
@@ -229,6 +259,17 @@
 // - EMA state: db2_floor lives in an SSBO and survives shader reload
 //   (2-3 frame convergence makes this harmless).
 // - mod-4 dimension tap-phase caveat unchanged from v1.x.
+// - REACH IS IN MAIN PIXELS. On 4K MAIN after a 2x upscale (an AI
+//   upscaler in the vf chain) every window covers half the source pixels
+//   it was calibrated on: the wide fit spans +-32 source px, not +-64.
+//   Wide-pitch staircases are the visible cost — measured on AI-upscaled
+//   1-code staircases, 96 / 192 / 384 px source pitch keep ~59 / 82 / 90%
+//   of their banding. (A frame-scale reconstructor was prototyped in the
+//   v3.5 round and parked: it fixed clean staircases but flattened soft
+//   painted mottle, which needs a positive staircase-evidence term first.)
+// - db_block's grid phase is hard-coded to a 16 px DCT grid on MAIN; after
+//   a 2x upscale the grid is 32 px and smeared, so the evidence is inert
+//   there (db_block = 0 then skips its cost).
 
 // ---- shampv shader API (plain comments to libplacebo) ----
 //@shampv input any
@@ -400,6 +441,11 @@
 //!FORMAT rgba16f
 //!STORAGE
 
+//!TEXTURE DB2_RES_S
+//!SIZE 1024 576
+//!FORMAT rgba16f
+//!STORAGE
+
 //!HOOK MAIN
 //!BIND HOOKED
 //!SAVE DB2_DS
@@ -547,7 +593,6 @@ void hook() {
 // identical window walk). A rides out_image (an ordinary hook texture —
 // the fuse passes sample it); B/C go to storage. Per-accumulator sum
 // order is unchanged, so the stored moments are bit-identical to v2.0.
-
 //!HOOK MAIN
 //!BIND DB2_MED
 //!BIND DB2_FITMASK
@@ -605,31 +650,46 @@ void hook() {
 //!BIND DB2_WMOM_A
 //!BIND DB2_WMOM_B
 //!BIND DB2_WMOM_C
+//!BIND DB2_RES_S
 //!SAVE DB2_CORR
 //!WIDTH DB2_MED.w
 //!HEIGHT DB2_MED.h
 //!COMPUTE 16 16
-//!DESC Debandit: Wide Fuse
+//!DESC Debandit: Wide Fuse + Residual
 
 // =============================================================================
 // PASS 5: WIDE FUSE — V accumulation, 2x2 weighted-LS solve, c = fit - M
 // =============================================================================
+// v3.5: the WIDE FIT RESIDUAL fuses in (it was its own pass re-running this
+// exact V walk and solve — ~10% of the shader at 4K). It needs only the B/C
+// alpha moments, which ride the same imageLoads. The residual is the fit's
+// RMS of M minus the fitted plane over the window, per gate axis: luma (x)
+// and the worse of the two opponent axes (y), linear [0,1] units —
+// resvar_X = S_XX - b_X*S_uX - c_X*S_vX per axis; axis moments are linear
+// combinations of the RGB ones. The apply gates each PATH on its own axis
+// (steep luma structure cannot veto a clean chroma fit — the v1.9 face
+// lesson carries into v2), pointwise, with no dilation. The SHORT scale
+// carries no residual on purpose: its +-8-texel envelope dilation already
+// covers the whole +-(db_rs+2) contamination reach (verified inert in the
+// prototype). Routing: stored to DB2_RES_S (storage), copied into the free
+// .y of DB2_RANGE (Flatness Range V) and .w of DB2_ANISO (Tensor V) — both
+// on this grid, so the Apply's bilinear reads land on identical values.
 // Combines the row moments over y' in [-db_rw, db_rw] (v = y'/db_rw),
 // re-referencing each row's mean-subtracted moments from the row center's
 // median value to this texel's in fp32 (linear moments shift linearly;
 // quadratics via (X-b)^2 = (X-a)^2 + 2(a-b)(X-a) + (a-b)^2). Solves the
 // centered normal equations per RGB channel (shared 2x2 geometry matrix),
-// evaluates the plane AT THIS TEXEL, and stores c = (fit - M) * conf
-// small-valued as 0.5 + c (both signs survive a unorm FBO fallback).
-// Alpha = max-channel |c| x fitmask^2, computed HERE at fp32 — the
-// envelope seed must never be re-derived from the 0.5 + c encode (v1.9
-// lesson: fp16 ulp at 0.5 is ~0.06 code, measured 0.3-code apply wobble).
+// evaluates the plane AT THIS TEXEL, and stores c = (fit - M) * conf RAW
+// (signed; v3.5 — the old 0.5 + c encode quantized every correction to
+// 1/16-1/8 code at the fp16 ulp of 0.5, a faint staircase locked to the
+// very ramps being rebuilt; the shader already requires signed float
+// hook FBOs for WMOM_A / LP sums, so the unorm insurance bought nothing).
+// Alpha = max-channel |c| x fitmask^2, computed HERE at fp32 (v1.9
+// lesson: never re-derive the envelope seed from a stored field).
 //
 // conf fades the fit out on low trusted mass (nothing to learn a ramp
 // from); g_det on an ill-conditioned normal matrix (trusted texels nearly
-// collinear — frame corners, heavy masking). CONSTANT SYNC: the knee
-// values and the solve here must match the Wide Residual pass EXACTLY
-// (no compile-time guard across translation units).
+// collinear — frame corners, heavy masking).
 #define DB2_CONF_LO   0.06
 #define DB2_CONF_HI   0.20
 #define DB2_DET_LO    0.02
@@ -649,21 +709,33 @@ void hook() {
 
     float W = 0.0, Wu = 0.0, Wv = 0.0, Wuu = 0.0, Wuv = 0.0, Wvv = 0.0;
     vec3 WM = vec3(0.0), WuM = vec3(0.0), WvM = vec3(0.0);
+    vec3 WQ = vec3(0.0);   // residual quadratics on (Y, o1, o2)
     for (int j = -db_rw; j <= db_rw; j++) {
         float yp = pos.y + float(j) * pt.y;
         float inb = step(0.0, yp) * step(yp, 1.0);
         float v = float(j) / float(db_rw);
         ivec2 tp = ivec2(min(gid.x, bnd.x), clamp(gid.y + j, 0, bnd.y));
         vec4 A = DB2_WMOM_A_tex(vec2(pos.x, yp)) * inb;
-        vec3 hM = imageLoad(DB2_WMOM_B, tp).rgb * inb;
-        vec3 hxM = imageLoad(DB2_WMOM_C, tp).rgb * inb;
+        vec4 B = imageLoad(DB2_WMOM_B, tp) * inb;
+        vec4 C = imageLoad(DB2_WMOM_C, tp) * inb;
         vec3 d = (DB2_MED_tex(vec2(pos.x, yp)).rgb - m0) * inb;
         W += A.x; Wu += A.y; Wv += v * A.x;
         Wuu += A.z; Wuv += v * A.y; Wvv += v * v * A.x;
-        vec3 rowM = hM + A.x * d;
+        vec3 rowM = B.rgb + A.x * d;
         WM += rowM;
-        WuM += hxM + A.y * d;
+        WuM += C.rgb + A.y * d;
         WvM += v * rowM;
+        // quadratic shift: per-axis d projections against per-axis row
+        // linear moments (B.rgb are RGB moments; project to axes)
+        float dy  = dot(d, W709);
+        float do1 = d.b - dy;
+        float do2 = d.r - dy;
+        float hy  = dot(B.rgb, W709);
+        float h1_ = B.rgb.b - hy;
+        float h2_ = B.rgb.r - hy;
+        WQ.x += A.w + 2.0 * dy  * hy  + dy  * dy  * A.x;
+        WQ.y += B.a + 2.0 * do1 * h1_ + do1 * do1 * A.x;
+        WQ.z += C.a + 2.0 * do2 * h2_ + do2 * do2 * A.x;
     }
 
     float Ws = max(W, 1e-6);
@@ -700,106 +772,17 @@ void hook() {
     // saturates long before the clamp engages.
     c = clamp(c, vec3(-0.2), vec3(0.2));
     float seed = max(max(abs(c.r), abs(c.g)), abs(c.b)) * fm0 * fm0;
-    imageStore(out_image, gid, vec4(vec3(0.5) + c, seed));
-}
+    imageStore(out_image, gid, vec4(c, seed));
 
-//!HOOK MAIN
-//!BIND DB2_MED
-//!BIND DB2_WMOM_A
-//!BIND DB2_WMOM_B
-//!BIND DB2_WMOM_C
-//!SAVE DB2_RES
-//!WIDTH DB2_MED.w
-//!HEIGHT DB2_MED.h
-//!COMPUTE 16 16
-//!DESC Debandit: Wide Residual
-
-// =============================================================================
-// PASS 6: WIDE FIT RESIDUAL — pointwise contamination, per gate axis
-// =============================================================================
-// Re-runs the wide V-accumulation and solve (constants and math must stay
-// IN SYNC with Wide Fuse — see its header) and emits what the fuse pass
-// has no channels left for: the fit's RMS residual on the luma axis (x)
-// and the worse of the two opponent axes (y), in linear [0,1] units.
-// resvar_X = S_XX - b_X*S_uX - c_X*S_vX per axis; axis moments are linear
-// combinations of the RGB ones. The apply gates each PATH on its own
-// axis (steep luma structure cannot veto a clean chroma fit — the v1.9
-// face lesson carries into v2), pointwise, with no dilation.
-// The SHORT scale carries no residual on purpose: its +-8-texel envelope
-// dilation already covers the whole +-(db_rs+2) contamination reach
-// (verified inert in the prototype).
-#define DB2_CONF_LO   0.06
-#define DB2_CONF_HI   0.20
-#define DB2_DET_LO    0.02
-#define DB2_DET_HI    0.08
-
-void hook() {
-    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = ivec2(DB2_MED_size);
-    if (gid.x >= sz.x || gid.y >= sz.y) return;
-    ivec2 bnd = min(sz, imageSize(DB2_WMOM_B)) - 1;
-    vec2 pt = DB2_MED_pt;
-    vec2 pos = (vec2(gid) + 0.5) * pt;
-    const vec3 W709 = vec3(0.2126, 0.7152, 0.0722);
-    vec3 m0 = DB2_MED_tex(pos).rgb;
-
-    float W = 0.0, Wu = 0.0, Wv = 0.0, Wuu = 0.0, Wuv = 0.0, Wvv = 0.0;
-    vec3 WM = vec3(0.0), WuM = vec3(0.0), WvM = vec3(0.0);
-    vec3 WQ = vec3(0.0);   // quadratics on (Y, o1, o2)
-    for (int j = -db_rw; j <= db_rw; j++) {
-        float yp = pos.y + float(j) * pt.y;
-        float inb = step(0.0, yp) * step(yp, 1.0);
-        float v = float(j) / float(db_rw);
-        ivec2 tp = ivec2(min(gid.x, bnd.x), clamp(gid.y + j, 0, bnd.y));
-        vec4 A = DB2_WMOM_A_tex(vec2(pos.x, yp)) * inb;
-        vec4 B = imageLoad(DB2_WMOM_B, tp) * inb;
-        vec4 C = imageLoad(DB2_WMOM_C, tp) * inb;
-        vec3 d = (DB2_MED_tex(vec2(pos.x, yp)).rgb - m0) * inb;
-        W += A.x; Wu += A.y; Wv += v * A.x;
-        Wuu += A.z; Wuv += v * A.y; Wvv += v * v * A.x;
-        vec3 rowM = B.rgb + A.x * d;
-        WM += rowM;
-        WuM += C.rgb + A.y * d;
-        WvM += v * rowM;
-        // quadratic shift: per-axis d projections against per-axis row
-        // linear moments (B.rgb are RGB moments; project to axes)
-        float dy  = dot(d, W709);
-        float do1 = d.b - dy;
-        float do2 = d.r - dy;
-        float hy  = dot(B.rgb, W709);
-        float h1_ = B.rgb.b - hy;
-        float h2_ = B.rgb.r - hy;
-        WQ.x += A.w + 2.0 * dy  * hy  + dy  * dy  * A.x;
-        WQ.y += B.a + 2.0 * do1 * h1_ + do1 * do1 * A.x;
-        WQ.z += C.a + 2.0 * do2 * h2_ + do2 * do2 * A.x;
-    }
-
-    float Ws = max(W, 1e-6);
-    float mu = Wu / Ws, mv = Wv / Ws;
-    float Suu = Wuu - mu * Wu;
-    float Suv = Wuv - mu * Wv;
-    float Svv = Wvv - mv * Wv;
-    vec3 SuM = WuM - mu * WM;
-    vec3 SvM = WvM - mv * WM;
-
-    float det = Suu * Svv - Suv * Suv;
-    float cond = det / max((Suu + Svv) * (Suu + Svv), 1e-9);
-    float g_det = smoothstep(DB2_DET_LO, DB2_DET_HI, cond);
-    float inv_det = 1.0 / max(det, 1e-9);
-    vec3 b  = (Svv * SuM - Suv * SvM) * inv_det * g_det;
-    vec3 cf = (Suu * SvM - Suv * SuM) * inv_det * g_det;
-
-    // Per-axis residuals, statically unrolled (no dynamic vector indexing
-    // — the one construct SPIRV-Cross->HLSL has historically fumbled).
-    // Axis vectors: Y, o1 = B - Y, o2 = R - Y.
-    #define DB2_RES_AXIS(axis, q) \
-        sqrt(max((q) - dot(WM, axis) * dot(WM, axis) / Ws \
-                 - dot(b, axis) * dot(SuM, axis) \
-                 - dot(cf, axis) * dot(SvM, axis), 0.0) / Ws)
+    // Per-axis fit residuals, statically unrolled (no dynamic vector
+    // indexing — the one construct SPIRV-Cross->HLSL has historically
+    // fumbled). Axis vectors: Y, o1 = B - Y, o2 = R - Y.
+    #define DB2_RES_AXIS(axis, q)         sqrt(max((q) - dot(WM, axis) * dot(WM, axis) / Ws                  - dot(b, axis) * dot(SuM, axis)                  - dot(cf, axis) * dot(SvM, axis), 0.0) / Ws)
     float res_y  = DB2_RES_AXIS(W709, WQ.x);
     float res_o1 = DB2_RES_AXIS(vec3(0.0, 0.0, 1.0) - W709, WQ.y);
     float res_o2 = DB2_RES_AXIS(vec3(1.0, 0.0, 0.0) - W709, WQ.z);
-    imageStore(out_image, gid, vec4(res_y, max(res_o1, res_o2), 0.0, 1.0));
+    if (all(lessThan(gid, imageSize(DB2_RES_S))))
+        imageStore(DB2_RES_S, gid, vec4(res_y, max(res_o1, res_o2), 0.0, 1.0));
 }
 
 //!HOOK MAIN
@@ -817,7 +800,7 @@ void hook() {
 // The bulk-edge rescue scale. At (2*db_rs+1)^2 = ~49 taps a direct 2D
 // accumulation is cheaper than a separable pair and keeps every moment in
 // fp32 registers end to end (no storage boundary at all). Same solve,
-// same knees as the wide fuse; c_s stored as 0.5 + c, alpha = fp32 seed.
+// same knees as the wide fuse; c_s stored raw (signed), alpha = fp32 seed.
 // v3.4: COMPUTE (FITMASK is storage now); positions and math verbatim.
 #define DB2_CONF_LO   0.06
 #define DB2_CONF_HI   0.20
@@ -878,7 +861,7 @@ void hook() {
     // Same encode-headroom clamp as the wide fuse (see its note).
     c = clamp(c, vec3(-0.2), vec3(0.2));
     float seed = max(max(abs(c.r), abs(c.g)), abs(c.b)) * fm0 * fm0;
-    imageStore(out_image, gid, vec4(vec3(0.5) + c, seed));
+    imageStore(out_image, gid, vec4(c, seed));
 }
 
 //!HOOK MAIN
@@ -967,10 +950,9 @@ void hook() {
 // (texel units; knees 0.5-1.5 — a clean interior measures ~0, a frame
 // border ~2.4; measured: kills ~2/3 of the worst-case one-sided ramp
 // bias at zero cost to banded-surface coverage).
-// ENCODE: 0.5 + 8*c — the reconstructor signal is 0.1-0.5 codes where
-// the fit's is 0.5-2, and the raw 0.5-encode ulp (~0.06 code, the v1.9
-// lesson) would eat it; x8 headroom still spans +-15 codes after the
-// clamp, beyond every gate knee (max cthr ~8.4).
+// ENCODE: raw signed c (v3.5; was 0.5 + 8*c — the x8 only existed to
+// dodge the fp16 ulp at the 0.5 offset). The +-0.06 clamp (+-15 codes)
+// stays, beyond every gate knee (max cthr ~8.4).
 #define DB2_LPC_CONF_LO  0.06
 #define DB2_LPC_CONF_HI  0.20
 #define DB2_LPW_MASS     56.05
@@ -1015,7 +997,7 @@ void hook() {
     float sym = 1.0 - smoothstep(DB2_LPC_SYM_LO, DB2_LPC_SYM_HI,
                                  max(abs(mux), abs(muy)) / dn);
     vec3 c = clamp(num / dn, vec3(-0.06), vec3(0.06));
-    imageStore(out_image, gid, vec4(vec3(0.5) + c * 8.0, conf * sym));
+    imageStore(out_image, gid, vec4(c, conf * sym));
 }
 
 //!HOOK MAIN
@@ -1043,12 +1025,15 @@ void hook() {
 // the FLOOR pass reads this pre-dilation; the V pass dilates +-2).
 // w: structure field (med5 mean-bias + signed-median coherence x2.5).
 // RANGEC_H (storage) — trust-masked min/max of the median field's
-// opponent axes over the same +-8 window, stored o * 0.5 + 0.5
-// (unorm-fallback-safe); the chroma V pass decodes to ranges.
+// opponent axes over the same +-8 window, stored raw (rgba16f storage;
+// the v3.4 o * 0.5 + 0.5 offset only cost fp16 precision, up to ~0.25
+// code of chroma range); the chroma V pass reduces them to ranges.
 // TENS_H (storage) — central-difference gradients of median-field luma,
 // structure-tensor components row-summed over +-4 (clamp-sampling,
 // order-stat-class, bias-free); column-summed and eigen-analyzed in the
-// Tensor V pass.
+// Tensor V pass. v3.5: .w = the OPPONENT block MAD (Y-plane dither cancels
+// in the projection) from the same 16 full-res taps as the luma MAD —
+// Chroma Range V used to re-fetch that whole block.
 // GRID_RAW (storage, v2.2) — full-res luma |dx|/|dy| sums over this
 // texel's own 4x4 block, split DCT-boundary-phase vs interior. The step
 // INTO column x = 16k lands in this block iff gid.x % 4 == 0 (then it is
@@ -1078,12 +1063,19 @@ void hook() {
     vec2 hic = o_c;
 
     // Shared +-8 row walk: luma range (RANGE_H.xy) + opponent range
-    // (RANGEC_H), one MED read per tap instead of two.
+    // (RANGEC_H), one MED read per tap instead of two. v3.5: the row lumas
+    // are cached (rowY[8 + i]) for the tensor rows' horizontal gradients,
+    // which used to re-fetch the same +-5 texels (bit-identical values:
+    // same sample positions, same dot).
+    float rowY[17];
+    rowY[8] = lum_c;
     for (int i = 1; i <= 8; i++) {
         vec4 tp = DB2_MED_tex(pos + vec2(float(i) * pt.x, 0.0));
         vec4 tn = DB2_MED_tex(pos - vec2(float(i) * pt.x, 0.0));
         float yp = dot(tp.rgb, DB2_W709);
         float yn = dot(tn.rgb, DB2_W709);
+        rowY[8 + i] = yp;
+        rowY[8 - i] = yn;
         float op = step(0.5, tp.a);
         float on = step(0.5, tn.a);
         lo = min(lo, min(mix(1e3, yp, op), mix(1e3, yn, on)));
@@ -1096,19 +1088,29 @@ void hook() {
 
     vec2 fpt = HOOKED_pt;
     float mad = 0.0;
+    float mad_c = 0.0;   // v3.5: opponent block MAD for Chroma Range V
     float blkY[16];
     for (int y = 0; y < 4; y++) {
         for (int x = 0; x < 4; x++) {
             vec2 off = vec2(float(x) - 1.5, float(y) - 1.5) * fpt;
             vec3 t = HOOKED_tex(pos + off).rgb;
-            vec3 d = abs(t - center.rgb);
+            vec3 ds = t - center.rgb;
+            vec3 d = abs(ds);
             mad += max(d.r, max(d.g, d.b));
+            vec3 d_op = ds - vec3(dot(ds, DB2_W709));
+            mad_c += max(max(abs(d_op.r), abs(d_op.g)), abs(d_op.b));
             blkY[y * 4 + x] = dot(t, DB2_W709);
         }
     }
     mad *= (1.0 / 16.0);
+    mad_c *= (1.0 / 16.0);
 
     // v2.2 grid raw stats (see header). All indices are unroll-constant.
+    // v3.5: db_block = 0 skips the whole grid chain (here, Grid Env H and
+    // the Tensor V evidence) on a UNIFORM branch — every consumer already
+    // multiplies the evidence by db_block, so the output is identical.
+    vec4 graw = vec4(0.0);
+    if (db_block > 0.0) {
     float lftY[4], topY[4];
     for (int k = 0; k < 4; k++) {
         lftY[k] = dot(HOOKED_tex(pos + vec2(-2.5, float(k) - 1.5) * fpt).rgb, DB2_W709);
@@ -1128,8 +1130,9 @@ void hook() {
     }
     bool gbx = (gid.x & 3) == 0;
     bool gby = (gid.y & 3) == 0;
-    vec4 graw = vec4(gbx ? gcol0 : 0.0, gbx ? gcolr : (gcol0 + gcolr),
-                     gby ? grow0 : 0.0, gby ? growr : (grow0 + growr));
+    graw = vec4(gbx ? gcol0 : 0.0, gbx ? gcolr : (gcol0 + gcolr),
+                gby ? grow0 : 0.0, gby ? growr : (grow0 + growr));
+    }
 
     float s0 = DB2_DS_tex(pos - vec2(2.0 * pt.x, 0.0)).a - lum_c;
     float s1 = DB2_DS_tex(pos - vec2(pt.x, 0.0)).a - lum_c;
@@ -1147,22 +1150,29 @@ void hook() {
     float gs = min(max(s0, s1), max(s3, s4));
     float coh = abs(max(min(s2, fs), min(max(s2, fs), gs)));
 
+    // v3.5: db_aniso = 0 skips the tensor rows (uniform branch; the Apply
+    // multiplies the flag by db_aniso, output identical). Stored x4096 —
+    // raw squared gradients sit in fp16 SUBNORMALS on quiet sources (the
+    // aniso knee there is ~1e-7), where the flag read rounding noise; the
+    // power-of-two scale is exact wherever the values were normal.
     vec3 J = vec3(0.0);   // (sum gx^2, sum gy^2, sum gx*gy)
+    if (db_aniso > 0.0) {
     for (int i = -4; i <= 4; i++) {
         vec2 tj = pos + vec2(float(i) * pt.x, 0.0);
-        float xr = dot(DB2_MED_tex(tj + vec2(pt.x, 0.0)).rgb, DB2_W709);
-        float xl = dot(DB2_MED_tex(tj - vec2(pt.x, 0.0)).rgb, DB2_W709);
+        float xr = rowY[9 + i];
+        float xl = rowY[7 + i];
         float yd = dot(DB2_MED_tex(tj + vec2(0.0, pt.y)).rgb, DB2_W709);
         float yu = dot(DB2_MED_tex(tj - vec2(0.0, pt.y)).rgb, DB2_W709);
         float gx = (xr - xl) * 0.5;
         float gy = (yd - yu) * 0.5;
         J += vec3(gx * gx, gy * gy, gx * gy);
     }
+    }
 
     imageStore(out_image, gid, vec4(lo, hi, mad, max(tex, 2.5 * coh)));
     if (all(lessThan(gid, imageSize(DB2_RANGEC_H)))) {
-        imageStore(DB2_RANGEC_H, gid, vec4(loc * 0.5 + 0.5, hic * 0.5 + 0.5).xzyw);
-        imageStore(DB2_TENS_H, gid, vec4(J, 1.0));
+        imageStore(DB2_RANGEC_H, gid, vec4(loc, hic).xzyw);
+        imageStore(DB2_TENS_H, gid, vec4(J * 4096.0, mad_c));
     }
     if (all(lessThan(gid, imageSize(DB2_GRID_RAW)))) {
         imageStore(DB2_GRID_RAW, gid, graw);
@@ -1235,11 +1245,16 @@ void hook() {
     if (lid == 0u) { db2_count = 0u; db2_count_f = 0u; db2_count_p = 0u; }
     barrier();
 
-    // 2x2-strided subsample: a global percentile is statistically
-    // indifferent to it and it quarters the reduce cost (measured 0.28 ms
-    // full-grid on M2-class hardware — the one pass that overshot the
-    // design budget).
-    ivec2 sz = ivec2(DB2_RANGE_H_size) / 2;
+    // Strided subsample: a global percentile is statistically indifferent
+    // to it and it divides the reduce cost (measured 0.28 ms full-grid on
+    // M2-class hardware — the one pass that overshot the design budget).
+    // v3.5: the stride grows with the frame so the sample count stays
+    // ~32k (1080p: 2, exactly the v3.4 grid; 4K: 4). One lone workgroup
+    // walks this grid serially, so on 4K MAIN the 2x2 stride made it
+    // ~8% of the shader for 4x the samples a p10/p50 needs.
+    ivec2 fsz = ivec2(DB2_RANGE_H_size);
+    int st = max(2, int(sqrt(float(fsz.x * fsz.y) / 32400.0) + 0.001));
+    ivec2 sz = fsz / st;
     int total = sz.x * sz.y;
     float log_lo = log2(DB2_FLOOR_LO);
     float log_hi = log2(DB2_FLOOR_HI);
@@ -1247,7 +1262,7 @@ void hook() {
     uint mine_f = 0u;
     uint mine_p = 0u;
     for (int t = int(lid); t < total; t += 1024) {
-        ivec2 p = ivec2((t % sz.x) * 2, (t / sz.x) * 2);
+        ivec2 p = ivec2((t % sz.x) * st, (t / sz.x) * st);
         vec4 rh = texelFetch(DB2_RANGE_H_raw, p, 0);
         float mad = rh.z;
         float lg = log2(max(mad, DB2_FLOOR_LO));
@@ -1353,6 +1368,7 @@ void hook() {
 //!BIND DB2_RANGE_H
 //!BIND DB2_GRID_RAW
 //!BIND DB2_GRIDH
+//!BIND DB2_RES_S
 //!SAVE DB2_RANGE
 //!WIDTH DB2_RANGE_H.w
 //!HEIGHT DB2_RANGE_H.h
@@ -1372,6 +1388,19 @@ void hook() {
 // per-axis sample counts from gid arithmetic, and a clamped tap would
 // double-count its edge texel. Sample counts are NOT stored — they are
 // implied by which texels t in the window satisfy t % 4 == 0.
+//
+// v3.5 OUTPUT LAYOUT: x = range (hi - lo), y = WIDE FIT RESIDUAL luma
+// (copied from the fused Wide Fuse's DB2_RES_S — the Wide Residual pass
+// retired), z = dilated MAD, w = structure. The Apply only ever used
+// hi - lo, so the range is formed here from the fp16-ROUNDED extrema
+// (db2_h16): an exact Sterbenz difference for any range the flatness gate
+// can see, i.e. the same value the Apply used to subtract. Beyond the
+// storage envelope (> 4096 wide) the residual reads as a huge value —
+// fail closed: the wide scale is condemned and the short fit carries it.
+
+float db2_h16(float x) {
+    return unpackHalf2x16(packHalf2x16(vec2(x, 0.0))).x;
+}
 
 void hook() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
@@ -1393,24 +1422,29 @@ void hook() {
         }
     }
     mm.w *= (1.0 / 5.0);
-    imageStore(out_image, gid, mm);
+    float res_y = all(lessThan(gid, imageSize(DB2_RES_S)))
+                ? imageLoad(DB2_RES_S, gid).x : 1.0;
+    imageStore(out_image, gid,
+               vec4(db2_h16(mm.y) - db2_h16(mm.x), res_y, mm.z, mm.w));
 
     ivec2 bnd = min(sz, ivec2(imageSize(DB2_GRID_RAW)));
     vec4 acc = vec4(0.0);
-    for (int i = -8; i <= 8; i++) {
-        int x = gid.x + i;
-        if (x < 0 || x >= bnd.x || gid.y >= bnd.y) continue;
-        acc += imageLoad(DB2_GRID_RAW, ivec2(x, gid.y));
+    if (db_block > 0.0) {   // v3.5 uniform skip (see H Gathers)
+        for (int i = -8; i <= 8; i++) {
+            int x = gid.x + i;
+            if (x < 0 || x >= bnd.x || gid.y >= bnd.y) continue;
+            acc += imageLoad(DB2_GRID_RAW, ivec2(x, gid.y));
+        }
     }
     if (all(lessThan(gid, imageSize(DB2_GRIDH))))
         imageStore(DB2_GRIDH, gid, acc);
 }
 
 //!HOOK MAIN
-//!BIND HOOKED
 //!BIND DB2_DS
 //!BIND DB2_MED
 //!BIND DB2_RANGEC_H
+//!BIND DB2_TENS_H
 //!BIND DB2_CORR
 //!BIND DB2_SCORR
 //!BIND DB2_ENV_H
@@ -1423,8 +1457,8 @@ void hook() {
 // =============================================================================
 // PASS 13: CHROMA FLATNESS RANGE + CHROMA NOISE, V half (identical to v1.11)
 // =============================================================================
-// Decodes the fused H pass's opponent min/max (stored o * 0.5 + 0.5,
-// unorm-fallback-safe) to ranges and adds the opponent block MAD (Y-plane
+// Reduces the fused H pass's opponent min/max (raw, v3.5) to ranges and
+// adds the opponent block MAD (Y-plane
 // dither cancels exactly in the projection) + the chroma structure/
 // coherence field. v2.1: RANGEC_H is a storage texture -> compute pass,
 // imageLoad; the sampler reads are v2.0 verbatim.
@@ -1452,8 +1486,8 @@ void hook() {
         vec2 tp = pos + vec2(float(i) * pt.x, 0.0);
         vec4 tL = DB2_CORR_tex(tp);
         vec4 tS = DB2_SCORR_tex(tp);
-        vec3 cL = tL.rgb - vec3(0.5);
-        vec3 cS = tS.rgb - vec3(0.5);
+        vec3 cL = tL.rgb;
+        vec3 cS = tS.rgb;
         vec3 oL = cL - vec3(dot(cL, DB2_RCV_W709));
         vec3 oS = cS - vec3(dot(cS, DB2_RCV_W709));
         float mcL = max(max(abs(cL.r), abs(cL.g)), abs(cL.b));
@@ -1468,7 +1502,7 @@ void hook() {
     if (all(lessThan(gid, imageSize(DB2_ENV_H))))
         imageStore(DB2_ENV_H, gid, envh);
 
-    vec4 mm = imageLoad(DB2_RANGEC_H, gid);
+    vec4 mm = imageLoad(DB2_RANGEC_H, min(gid, bnd));
     vec2 lo = mm.xz;
     vec2 hi = mm.yw;
 
@@ -1478,20 +1512,14 @@ void hook() {
         lo = min(lo, min(sp.xz, sn.xz));
         hi = max(hi, max(sp.yw, sn.yw));
     }
-    vec2 rng = (hi - lo) * 2.0;
+    vec2 rng = hi - lo;
 
     vec4 center = DB2_MED_tex(pos);
-    vec2 fpt = HOOKED_pt;
-    float mad_c = 0.0;
-    for (int y = 0; y < 4; y++) {
-        for (int x = 0; x < 4; x++) {
-            vec2 off = vec2(float(x) - 1.5, float(y) - 1.5) * fpt;
-            vec3 d = HOOKED_tex(pos + off).rgb - center.rgb;
-            vec3 d_op = d - vec3(dot(d, DB2_RCV_W709));
-            mad_c += max(max(abs(d_op.r), abs(d_op.g)), abs(d_op.b));
-        }
-    }
-    mad_c *= (1.0 / 16.0);
+    // v3.5: opponent block MAD computed in H Gathers (TENS_H .w, same taps,
+    // same order — bit-identical). Beyond the storage envelope it reads as
+    // huge: chroma snap closes there (fail closed, documented envelope).
+    float mad_c = all(lessThan(gid, imageSize(DB2_TENS_H)))
+                ? imageLoad(DB2_TENS_H, gid).w : 1.0;
 
     float y_c = dot(center.rgb, DB2_RCV_W709);
     vec2 o_c = vec2(center.b - y_c, center.r - y_c);
@@ -1557,6 +1585,7 @@ void hook() {
 //!BIND DB2_GRID_RAW
 //!BIND DB2_GRIDH
 //!BIND DB2_STATE
+//!BIND DB2_RES_S
 //!SAVE DB2_ANISO
 //!WIDTH DB2_MED.w
 //!HEIGHT DB2_MED.h
@@ -1607,18 +1636,22 @@ void hook() {
     ivec2 sz = ivec2(DB2_MED_size);
     if (gid.x >= sz.x || gid.y >= sz.y) return;
     ivec2 bnd = min(sz, imageSize(DB2_TENS_H)) - 1;
+    float fl = max(db2_floor, DB2_AN_FLOOR_MIN);
+    // v3.5: db_aniso = 0 / db_block = 0 skip their halves on uniform
+    // branches (the Apply multiplies both by their knob — identical out).
+    float flag = 0.0;
+    if (db_aniso > 0.0) {
     vec3 J = vec3(0.0);
     for (int j = -4; j <= 4; j++) {
         J += imageLoad(DB2_TENS_H, ivec2(min(gid.x, bnd.x), clamp(gid.y + j, 0, bnd.y))).xyz;
     }
-    J *= (1.0 / 81.0);
+    J *= (1.0 / (81.0 * 4096.0));   // H Gathers stores x4096 (see there)
 
     float tr = J.x + J.y;
     float dq = sqrt(0.25 * (J.x - J.y) * (J.x - J.y) + J.z * J.z);
     float amp_iso = sqrt(max(0.5 * tr - dq, 0.0));
     float kappa = 2.0 * dq / max(tr, 1e-12);
 
-    float fl = max(db2_floor, DB2_AN_FLOOR_MIN);
     // v3.1: the ANISO significance reference lifts to the flat-field
     // dither level wherever the snap knees shifted (same statistic,
     // same hinge, same knob). The p10 floor under-reads mixed
@@ -1634,10 +1667,13 @@ void hook() {
     // The GRID branch keeps the raw p10 fl: its contrast term already
     // self-normalizes against dither.
     float fl_an = max(fl, db2_dfl * min(db_fsnap * db2_dshift, 1.0));
-    float flag = smoothstep(DB2_AN_AMP_LO * fl_an, DB2_AN_AMP_HI * fl_an, amp_iso)
-               * (1.0 - smoothstep(DB2_AN_KAP_LO, DB2_AN_KAP_HI, kappa));
+    flag = smoothstep(DB2_AN_AMP_LO * fl_an, DB2_AN_AMP_HI * fl_an, amp_iso)
+         * (1.0 - smoothstep(DB2_AN_KAP_LO, DB2_AN_KAP_HI, kappa));
+    }
 
     // ---- v2.2 grid evidence ----
+    float g_conf = 0.0, g_exc = 0.0;
+    if (db_block > 0.0) {
     ivec2 gbnd = min(sz, ivec2(imageSize(DB2_GRID_RAW)));
     vec4 acc = vec4(0.0);
     for (int j = -8; j <= 8; j++) {
@@ -1667,14 +1703,19 @@ void hook() {
              * smoothstep(amp_lo, amp_hi, exc_x);
     float cy = smoothstep(DB2_GRID_CON_LO, DB2_GRID_CON_HI, con_y)
              * smoothstep(amp_lo, amp_hi, exc_y);
-    float g_conf = db_block * max(cx, cy);
+    g_conf = db_block * max(cx, cy);
     // Excess clamps to db_thr HERE (audit F1) — blocking never measures
     // past ~db_thr codes of step; beyond that is phase-aligned real
     // structure. Apply must not re-clamp (bit-exactness note there).
-    float g_exc  = db_block * min(max(cx * exc_x, cy * exc_y),
-                                  db_thr * (1.0 / 255.0));
+    g_exc  = db_block * min(max(cx * exc_x, cy * exc_y),
+                            db_thr * (1.0 / 255.0));
+    }
 
-    imageStore(out_image, gid, vec4(flag, g_conf, g_exc, 1.0));
+    // v3.5: .w carries the wide fit's OPPONENT residual (see Wide Fuse);
+    // out-of-envelope fails closed like the luma one in Flatness Range V.
+    float res_o = all(lessThan(gid, imageSize(DB2_RES_S)))
+                ? imageLoad(DB2_RES_S, gid).y : 1.0;
+    imageStore(out_image, gid, vec4(flag, g_conf, g_exc, res_o));
 }
 
 //!HOOK MAIN
@@ -1682,7 +1723,6 @@ void hook() {
 //!BIND DB2_MED
 //!BIND DB2_CORR
 //!BIND DB2_SCORR
-//!BIND DB2_RES
 //!BIND DB2_ENV
 //!BIND DB2_RANGE
 //!BIND DB2_RANGEC
@@ -1699,8 +1739,9 @@ void hook() {
 //         gate per axis (no dilation on the residual);
 //  (v2-b) validity-normalized convex scale blend + blended-validity gate;
 //  (v2-c) the anisotropy flag closes the snap regime (LF correction stays).
-//  (v3)   correction-SOURCE blend fit -> bounded lowpass on uncondemned
-//         surfaces (db_curve x v_L) — see the blend note below;
+//  (v3)   correction-SOURCE blend fit -> bounded lowpass, weight
+//         db_curve x LP alpha, envelope bypassed in proportion — see the
+//         blend note below;
 //  (v3.1) luma snap knees shift by the flat-field dither level
 //         (db_fsnap — see the knee-shift note at the snap regime).
 // Everything else — knees, snap regimes, dark bias, SNR knee, authority,
@@ -1770,9 +1811,7 @@ vec4 hook() {
     vec4 mmR = DB2_RANGE_tex(DB2_RANGE_pos + vec2(2.0 * rpt.x, 0.0));
     vec4 mmU = DB2_RANGE_tex(DB2_RANGE_pos - vec2(0.0, 2.0 * rpt.y));
     vec4 mmD = DB2_RANGE_tex(DB2_RANGE_pos + vec2(0.0, 2.0 * rpt.y));
-    float range_soft = (mm.y - mm.x) * 0.4
-                     + ((mmL.y - mmL.x) + (mmR.y - mmR.x)
-                     +  (mmU.y - mmU.x) + (mmD.y - mmD.x)) * 0.15;
+    float range_soft = mm.x * 0.4 + (mmL.x + mmR.x + mmU.x + mmD.x) * 0.15;
     float mad1 = max(max(DB2_RANGE_tex(DB2_RANGE_pos - vec2(rpt.x, 0.0)).z,
                          DB2_RANGE_tex(DB2_RANGE_pos + vec2(rpt.x, 0.0)).z),
                      max(DB2_RANGE_tex(DB2_RANGE_pos - vec2(0.0, rpt.y)).z,
@@ -1803,8 +1842,8 @@ vec4 hook() {
     float texc_codes = (cc.w + ccL.w + ccR.w + ccU.w + ccD.w) * 0.2 / DB2_CODE;
 
     // The two plane-fit corrections, precomputed at 1/4 res.
-    vec3 c  = DB2_CORR_tex(DB2_CORR_pos).rgb - vec3(0.5);
-    vec3 cs = DB2_SCORR_tex(DB2_SCORR_pos).rgb - vec3(0.5);
+    vec3 c  = DB2_CORR_tex(DB2_CORR_pos).rgb;
+    vec3 cs = DB2_SCORR_tex(DB2_SCORR_pos).rgb;
 
     // (v2-a) Per-scale validities: envelope gate x pointwise residual gate
     // (wide scale only — the short scale's envelope covers its whole
@@ -1812,7 +1851,8 @@ vec4 hook() {
     // half a step is legitimate staircase residual, a full step is not.
     float cthr = db_thr * DB2_CTHR_GAIN;
     vec4 env_codes = DB2_ENV_tex(DB2_ENV_pos) / DB2_CODE;
-    vec2 res_codes = DB2_RES_tex(DB2_RES_pos).xy / DB2_CODE;
+    vec4 an_t = DB2_ANISO_tex(DB2_ANISO_pos);
+    vec2 res_codes = vec2(mm.y, an_t.w) / DB2_CODE;
     // v2.2 grid evidence (bilinear — smooth fields). y = confidence,
     // z = confidence-weighted boundary excess; both already db_block-
     // weighted upstream, so db_block = 0 reduces every discount below to
@@ -1827,7 +1867,7 @@ vec4 hook() {
     // The clamp lives UPSTREAM on purpose — a min() in this expression
     // re-fuses the division and costs the db_block = 0 bit-exactness
     // (measured, same class as the knee-shift note above).
-    vec3 an_g = DB2_ANISO_tex(DB2_ANISO_pos).xyz;
+    vec3 an_g = an_t.xyz;
     float g_exc_c = an_g.z / DB2_CODE;
     float d_res = DB2_GRID_DRES * g_exc_c;
     float v_Ly = (1.0 - smoothstep(0.5 * db_thr, db_thr, env_codes.x))
@@ -1893,7 +1933,7 @@ vec4 hook() {
     // the BIT-exact fallback is DB2_CURVE_PATH 0 above.
 #if DB2_CURVE_PATH == 1
     vec4 lpc = DB2_LPC_tex(DB2_LPC_pos);
-    vec3 c_rc = (lpc.rgb - vec3(0.5)) * 0.125;
+    vec3 c_rc = lpc.rgb;
     float cy_R = dot(c_rc, W709);
     vec3 cop_R = c_rc - vec3(cy_R);
     float b_rc = db_curve * lpc.a;

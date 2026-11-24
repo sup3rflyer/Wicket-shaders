@@ -130,9 +130,17 @@ Uses the same mpv profile as CelFlare, but keeps the classic in-file setup: set 
 
 ### TextureClarity
 
-**Subtle texture sharpening** that enhances fine detail without edge sharpening or grain amplification.
+**Subtle texture sharpening** that lifts fine detail an encode has softened, without steepening edges or outlines.
 
-Operates on the luma channel only. Uses a 5x5 neighborhood with variance-based texture/grain discrimination and Sobel edge detection to selectively sharpen real texture while leaving edges, grain, and flat areas untouched. Works best when it's barely noticeable. This is meant to restore subtle texture detail affected by encoding.
+Operates on the luma channel only, from a 5x5 neighborhood:
+
+- A texture test picks pixels with real local contrast. Flat areas and faint, near-invisible grain or noise fall below it and are left alone.
+- Grain bypass: two small passes measure the picture's grain level per brightness band, from its flattest parts, and the sharpening acts only where local detail rises clearly above that level. Grain on flat areas is left as it is. Texture fainter than the grain cannot be told apart from it and is left alone too; grain riding on stronger texture is sharpened with it.
+- Edges are kept out twice: a Sobel test on the pixel itself, and a line guard that looks for oriented gradient anywhere in the 5x5, so the foot of an outline is not steepened and the faint ripple beside it is not lifted.
+- The change is capped at `tc_max_delta` (about 3 code values at the default) and eases into the cap.
+- Active between luma 0.05 and 0.95; near-black and near-white are left alone.
+
+Works best when it's barely noticeable. It strengthens detail that survived encoding, most on high-bitrate sources; it cannot bring back detail an encode removed entirely, and it has little to do on clean, flat-shaded animation.
 
 Runtime controls (live via `glsl-shader-opts`, no recompile):
 
@@ -141,7 +149,9 @@ Runtime controls (live via `glsl-shader-opts`, no recompile):
 | `tc_strength` | Sharpening strength (12 = shipped tune, 0 = off). |
 | `tc_coring` | High-pass deltas below this are ignored (keeps noise from being sharpened). |
 | `tc_texture_thresh` | Minimum local variance that counts as real texture rather than noise. |
-| `tc_max_delta` | Hard cap on how much sharpening may move any pixel. |
+| `tc_max_delta` | Cap on how much sharpening may move any pixel; large changes ease into it. |
+| `tc_line_guard` | Line guard: the sharpening fades where the 5x5 neighbourhood holds an edge or a line (1 = on, shipped; 0 = only the pixel's own edge test applies). |
+| `tc_grain_bypass` | Grain bypass: sharpen only detail that rises above the measured grain level (1 = on, shipped; 0 = grain is sharpened like texture). |
 
 **Usage:**
 

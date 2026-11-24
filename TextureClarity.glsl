@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Ágúst Ari
 // Licensed under GPL-3.0 — see LICENSE
 
-// User tuning: the four tc_* params below (DYNAMIC — glsl-shader-opts
+// User tuning: the five tc_* params below (DYNAMIC — glsl-shader-opts
 // changes apply on the next frame, no recompile). Defaults = the shipped
 // tune. Everything below the param block is internal.
 // shampv shader API (plain comments to libplacebo):
@@ -35,9 +35,132 @@
 //!MAXIMUM 0.05
 0.012
 
-//!DESC Texture Clarity
+//!PARAM tc_line_guard
+//!DESC Line guard. The sharpening fades where the 5x5 neighbourhood holds an edge or a line (oriented gradient), so the foot of an outline is not steepened and the faint ripple beside it is not lifted. Grain and texture, which point every way, pass. 1 = on (shipped) · 0 = off, only the centre pixel's own edge test applies.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
+
+//!PARAM tc_grain_bypass
+//!DESC Grain bypass. The grain level is measured over the whole picture, per brightness band, from its flattest parts; the sharpening acts only where the local detail rises above it, so grain on flat areas is left as it is while texture, cloth and painted detail are still lifted (with the grain riding on them). 1 = on (shipped) · 0 = off, grain is sharpened like texture.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
+
 //!HOOK LUMA
 //!BIND HOOKED
+//!SAVE TC_GRAIN_E
+//!WIDTH HOOKED.w 4 /
+//!HEIGHT HOOKED.h 4 /
+//!COMPONENTS 2
+//!DESC Texture Clarity: local energy 1/4
+
+// x: mean high-pass energy of the central 2x2 pixels of this 4x4 cell (the 4x4 read covers their 3x3
+// neighbourhoods), times GE_SCALE (keeps grain-level energies far from the half-float floor).
+// y: mean luma of the 16 pixels.
+#define GE_SCALE 10000.0
+
+vec4 hook() {
+    if (tc_grain_bypass <= 0.0)
+        return vec4(0.0);
+    // Cell origin on the pixel grid: with a size that is not a multiple of 4
+    // the cell pitch is not 4 px, and taps around this texel's own centre
+    // drifted off pixel centres (bilinear-blurred in bands across the frame).
+    vec2 cell = (floor(HOOKED_pos * HOOKED_size * 0.25) * 4.0 + 2.0) * HOOKED_pt;
+    float g[16];
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++)
+            g[j * 4 + i] = HOOKED_tex(cell + vec2(float(i) - 1.5, float(j) - 1.5) * HOOKED_pt).x;
+#define GE_T(I) (g[I] - (4.0 * g[I] + 2.0 * (g[I - 1] + g[I + 1] + g[I - 4] + g[I + 4]) + g[I - 5] + g[I - 3] + g[I + 3] + g[I + 5]) * (1.0 / 16.0))
+    float t0 = GE_T(5);
+    float t1 = GE_T(6);
+    float t2 = GE_T(9);
+    float t3 = GE_T(10);
+    float l = 0.0;
+    for (int k = 0; k < 16; k++)
+        l += g[k];
+    return vec4((t0 * t0 + t1 * t1 + t2 * t2 + t3 * t3) * (0.25 * GE_SCALE), l * (1.0 / 16.0), 0.0, 1.0);
+}
+
+//!HOOK LUMA
+//!BIND HOOKED
+//!BIND TC_GRAIN_E
+//!SAVE TC_GRAIN_FLOOR
+//!WIDTH 8
+//!HEIGHT 1
+//!COMPONENTS 1
+//!COMPUTE 32 32
+//!DESC Texture Clarity: grain floor
+
+// One workgroup. Block k of a GF_GX x GF_GY grid = one 2x2 group of TC_GRAIN_E cells, read with a single
+// bilinear fetch at the group's centre (equal weights: the mean of the four). Blocks outside luma
+// GF_Y_LO-GF_Y_HI are left out (crushed blacks, letterbox and clipped whites hold no grain). Per luma band
+// (GF_BINS), a histogram of log2(energy); the band's floor is its GF_PCT percentile, stored as RMS. A band
+// with fewer than GF_MIN_COUNT blocks gets 0 (no bypass at that brightness).
+// Every barrier sits at top level: FXC X3663 needs barriers in uniform control flow.
+#define GF_GX 96
+#define GF_GY 54
+#define GF_BINS 8
+#define GF_HB 64
+#define GF_LOG_MIN (-27.0)
+#define GF_LOG_SPAN 21.0
+#define GF_PCT 15.0000
+#define GF_MIN_COUNT 12u
+#define GF_Y_LO 0.05
+#define GF_Y_HI 0.95
+
+shared uint gf_hist[GF_BINS * GF_HB];
+
+void hook() {
+    uint lid = gl_LocalInvocationIndex;
+    if (lid < uint(GF_BINS * GF_HB))
+        gf_hist[lid] = 0u;
+    barrier();
+    vec2 cells = TC_GRAIN_E_size;
+    vec2 pairs = floor(cells * 0.5);
+    for (uint k = lid; k < uint(GF_GX * GF_GY); k += 1024u) {
+        vec2 ab = floor((vec2(float(k % uint(GF_GX)), float(k / uint(GF_GX))) + 0.5) * pairs / vec2(GF_GX, GF_GY));
+        vec2 v = TC_GRAIN_E_tex((2.0 * ab + 1.0) / cells).xy;
+        float e = v.x * (1.0 / 10000.0);
+        float l = v.y;
+        if (l >= GF_Y_LO && l <= GF_Y_HI) {
+            int bin = clamp(int(l * float(GF_BINS)), 0, GF_BINS - 1);
+            int hb = clamp(int((log2(max(e, 1e-30)) - GF_LOG_MIN) * (float(GF_HB) / GF_LOG_SPAN)), 0, GF_HB - 1);
+            atomicAdd(gf_hist[bin * GF_HB + hb], 1u);
+        }
+    }
+    barrier();
+    if (lid < uint(GF_BINS)) {
+        uint n = 0u;
+        for (int h = 0; h < GF_HB; h++)
+            n += gf_hist[int(lid) * GF_HB + h];
+        float rms = 0.0;
+        if (n >= GF_MIN_COUNT) {
+            // rank inside the cumulative histogram, interpolated inside the bin (log domain)
+            float target = GF_PCT * 0.01 * float(n);
+            float cum = 0.0;
+            float lg = GF_LOG_MIN;
+            for (int h = 0; h < GF_HB; h++) {
+                float c = float(gf_hist[int(lid) * GF_HB + h]);
+                if (c > 0.0 && cum + c >= target) {
+                    lg = GF_LOG_MIN + (float(h) + clamp((target - cum) / c, 0.0, 1.0)) * (GF_LOG_SPAN / float(GF_HB));
+                    break;
+                }
+                cum += c;
+            }
+            rms = exp2(0.5 * lg);
+        }
+        imageStore(out_image, ivec2(int(lid), 0), vec4(rms, 0.0, 0.0, 1.0));
+    }
+}
+
+//!HOOK LUMA
+//!BIND HOOKED
+//!BIND TC_GRAIN_FLOOR
+//!BIND TC_GRAIN_E
+//!DESC Texture Clarity
 
 // Grain suppression parameters
 const float grain_threshold = 0.045;
@@ -46,15 +169,37 @@ const float grain_transition_width = 0.50;
 // Texture discrimination
 const float texture_transition_width = 0.018;
 
-// Black/white area safeguards
-const float black_threshold = 0.15;
-const float black_falloff = 0.10;
-const float white_threshold = 0.55;
-const float white_falloff = 0.20;
+// Black/white area safeguards: the sharpening fades in over luma 0.05-0.12 and
+// out over 0.85-0.95. (Was 0.15-0.25 and 0.35-0.55: that window held 21-65 % of
+// the texture in a set of 34 masters, and nothing outside it was ever touched.
+// Scored band by band against the masters, what the shader adds agrees with
+// the master's detail equally from near-black to near-white.) Below 0.05 sit
+// crushed blacks and letterbox; above 0.95 there is nothing left to lift, and a
+// highlight expansion that runs later multiplies small luma differences there.
+const float black_threshold = 0.05;
+const float black_falloff = 0.07;
+const float white_threshold = 0.95;
+const float white_falloff = 0.10;
 
 // Enhanced control parameters
 const float EDGE_MULTIPLIER = 6.0;
+// Line guard (tc_line_guard): fade by the oriented gradient energy of the 5x5.
+// The centre's own Sobel is small at the FOOT of an edge, where the curvature
+// the high-pass reads is largest, so the edge gate alone let the shader steepen
+// the shoulders of lines. The structure tensor keeps an edge's or a line's
+// energy (all gradients along one axis, either polarity) and cancels grain,
+// which is isotropic. Units: luma per pixel.
+const float LINE_GUARD_LO = 0.010;
+const float LINE_GUARD_HI = 0.018;
+#define TC_TENSOR(GX, GY) { float gx = GX; float gy = GY; jxx += gx * gx; jyy += gy * gy; jxy += gx * gy; }
 const float DETAIL_LOW = 0.003;
+// Grain bypass (tc_grain_bypass): the sharpening fades in as the local high-pass energy (TC_GRAIN_E) rises
+// from GB_LO to GB_HI times the grain floor at the pixel's brightness (TC_GRAIN_FLOOR). On a field of grain
+// the ratio sits around 2 (the floor is a low percentile of 16-sample blocks).
+const float GB_LO = 1.500;
+const float GB_HI = 6.000;
+#define GB_PASS(R) smoothstep(GB_LO, GB_HI, R)
+const float GE_SCALE_INV = 1.0 / 10000.0;
 const float DETAIL_HIGH = 0.013;
 
 // Cinematic boost parameters
@@ -169,11 +314,61 @@ vec4 hook() {
     float edge = abs(sobel_h) + abs(sobel_v);
     float edge_factor = clamp(1.0 - edge * EDGE_MULTIPLIER, 0.0, 1.0);
 
+    // Line guard: structure tensor of plain differences at all 25 positions
+    // (central inside the window, one-sided on its rim). CONSTANT indices on
+    // purpose: a loop over get_grid() made the D3D11 compiler index the array
+    // dynamically and copy it per call (measured 20 ms against 0.14 ms at 4K).
+    float jxx = 0.0;
+    float jyy = 0.0;
+    float jxy = 0.0;
+    TC_TENSOR(grid[1] - grid[0], grid[5] - grid[0])
+    TC_TENSOR(0.5 * (grid[2] - grid[0]), grid[6] - grid[1])
+    TC_TENSOR(0.5 * (grid[3] - grid[1]), grid[7] - grid[2])
+    TC_TENSOR(0.5 * (grid[4] - grid[2]), grid[8] - grid[3])
+    TC_TENSOR(grid[4] - grid[3], grid[9] - grid[4])
+    TC_TENSOR(grid[6] - grid[5], 0.5 * (grid[10] - grid[0]))
+    TC_TENSOR(0.5 * (grid[7] - grid[5]), 0.5 * (grid[11] - grid[1]))
+    TC_TENSOR(0.5 * (grid[8] - grid[6]), 0.5 * (grid[12] - grid[2]))
+    TC_TENSOR(0.5 * (grid[9] - grid[7]), 0.5 * (grid[13] - grid[3]))
+    TC_TENSOR(grid[9] - grid[8], 0.5 * (grid[14] - grid[4]))
+    TC_TENSOR(grid[11] - grid[10], 0.5 * (grid[15] - grid[5]))
+    TC_TENSOR(0.5 * (grid[12] - grid[10]), 0.5 * (grid[16] - grid[6]))
+    TC_TENSOR(0.5 * (grid[13] - grid[11]), 0.5 * (grid[17] - grid[7]))
+    TC_TENSOR(0.5 * (grid[14] - grid[12]), 0.5 * (grid[18] - grid[8]))
+    TC_TENSOR(grid[14] - grid[13], 0.5 * (grid[19] - grid[9]))
+    TC_TENSOR(grid[16] - grid[15], 0.5 * (grid[20] - grid[10]))
+    TC_TENSOR(0.5 * (grid[17] - grid[15]), 0.5 * (grid[21] - grid[11]))
+    TC_TENSOR(0.5 * (grid[18] - grid[16]), 0.5 * (grid[22] - grid[12]))
+    TC_TENSOR(0.5 * (grid[19] - grid[17]), 0.5 * (grid[23] - grid[13]))
+    TC_TENSOR(grid[19] - grid[18], 0.5 * (grid[24] - grid[14]))
+    TC_TENSOR(grid[21] - grid[20], grid[20] - grid[15])
+    TC_TENSOR(0.5 * (grid[22] - grid[20]), grid[21] - grid[16])
+    TC_TENSOR(0.5 * (grid[23] - grid[21]), grid[22] - grid[17])
+    TC_TENSOR(0.5 * (grid[24] - grid[22]), grid[23] - grid[18])
+    TC_TENSOR(grid[24] - grid[23], grid[24] - grid[19])
+    float j_d = (jxx - jyy) * (1.0 / 25.0);
+    float j_o = jxy * (2.0 / 25.0);
+    float edge_oriented = sqrt(sqrt(j_d * j_d + j_o * j_o));
+    float line_guard = 1.0 - tc_line_guard * smoothstep(LINE_GUARD_LO, LINE_GUARD_HI, edge_oriented);
+
     // Suppress sharpening in high-detail areas
     float detail_saturation = 1.0 - smoothstep(DETAIL_LOW, DETAIL_HIGH, window_variance);
 
     // Combine influences
-    float combined = edge_factor * final_grain * final_texture * detail_saturation;
+    float combined = edge_factor * line_guard * final_grain * final_texture * detail_saturation;
+
+    // Grain bypass: local energy against the grain floor at this brightness (bands centred at (k + 0.5) / 8,
+    // linear between them, flat beyond the end ones). A band without enough blocks has floor 0: no bypass.
+    if (tc_grain_bypass > 0.0) {
+        float fb = clamp(window_mean * 8.0 - 0.5, 0.0, 7.0);
+        float f0i = floor(fb);
+        float f0 = TC_GRAIN_FLOOR_tex(vec2((f0i + 0.5) / 8.0, 0.5)).x;
+        float f1 = TC_GRAIN_FLOOR_tex(vec2((min(f0i + 1.0, 7.0) + 0.5) / 8.0, 0.5)).x;
+        float floor_e = mix(f0 * f0, f1 * f1, fb - f0i);
+        float e_loc = TC_GRAIN_E_tex(HOOKED_pos).x * GE_SCALE_INV;
+        float grain_pass = floor_e > 0.0 ? GB_PASS(e_loc / floor_e) : 1.0;
+        combined *= 1.0 - tc_grain_bypass * (1.0 - grain_pass);
+    }
     float sharpen_amount = t_sharp * tc_strength * combined;
 
     // -----------------------
@@ -203,8 +398,10 @@ vec4 hook() {
 
     sharpen_amount *= mask;
 
-    // Clamp final brightness changes
-    float result = clamp(p.x + sharpen_amount, p.x - tc_max_delta, p.x + tc_max_delta);
+    // Cap on the brightness change, eased: small changes pass unchanged, large
+    // ones approach tc_max_delta smoothly (the hard clip left a third of the
+    // touched pixels of a grainy picture sitting exactly on the cap).
+    float result = p.x + tc_max_delta * tanh(clamp(sharpen_amount / tc_max_delta, -10.0, 10.0));
 
     return vec4(result, 0.0, 0.0, 1.0);
 }

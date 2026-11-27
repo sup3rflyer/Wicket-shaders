@@ -21,22 +21,20 @@ The keybindings above use a Lua script for mpv. Ask an AI assistant to write you
 
 **Scene-adaptive SDR-to-HDR highlight expansion** with PQ BT.2020 output.
 
-The goal is a professional HDR grade of the source, not an "HDR filter" look: midtones stay close to the SDR grade, highlights expand with natural gradation, and speculars get a believable amount of extra pop. The shader does no tone mapping of its own; your display does the final mapping.
+The goal is an authentic HDR grade of the source, not a brightening filter: shadows and midtones stay at the SDR grade (nothing changes below signal 0.5), highlights expand with natural gradation, and compact speculars get a believable amount of extra pop. The shader does no tone mapping of its own; your display does the final mapping.
 
-Every pixel gets a smooth, monotone expansion curve of its own brightness. The curve's shape is set by an illumination field (a wide Gaussian blur of the regional brightness), so all pixels in one region share one curve: tonal order is kept and no gradient can invert, while local contrast is scaled by the curve's slope. Frame-level statistics (bright fraction, contrast, brightness key) adapt the result continuously; there is no scene-type classifier. At `cf_strength` 1 the curve peaks at about 2.4x (bright regions) to 2.7x (dark regions) of reference white; the default 0.7 scales that down, before scene adaptation, specular pop and the light pump. Works with anime and live action.
+Every pixel gets a smooth, monotone expansion curve of a smooth luma base (a 1/4-resolution guided filter with surface-aware coring, so texture, grain, and compression mottle ride on the expansion 1:1 instead of being magnified). The curve's shape is set by an illumination field (a wide Gaussian blur of the regional brightness), so all pixels in one region share one curve: tonal order is kept and no gradient can invert. Frame-level statistics (bright fraction, contrast, brightness key) adapt the result continuously; there is no scene-type classifier. Works with anime and live action.
 
 Features:
-- Spatially modulated per-pixel expansion curve, shaped by a regional illumination field
+- Spatially modulated per-pixel expansion curve on a smooth luma base, shaped by a regional illumination field
 - Picture-size-aware geometry: the illumination field scales with the picture (80 px sigma at 1080p, 160 px on a 4K or 2x-upscaled picture), so an upscaler chain looks like 1080p playback of the same title; letterboxed and 4:3 encodes keep the 1080p scale
-- Continuous scene adaptation (brightness key, contrast, bright fraction), with letterbox/pillarbox bars excluded from the statistics
+- Continuous scene adaptation (brightness key, contrast, bright fraction) with scene-key hold (`cf_key_hold`) and content-locked skin steadiness (`cf_skin_steady`) for shot-to-shot consistency; letterbox/pillarbox bars are excluded from the statistics
 - Velocity-adaptive temporal smoothing with cut detection: still scenes are stable, lighting changes adapt faster, cuts lock on quickly; a brightening explosion or tunnel exit is not mistaken for a cut, and strobing content does not keep the state in "cut" mode
 - Growing-object detection: explosions, fire and backlit reveals keep their HDR pop instead of being dampened as they grow
-- Specular bonus on near-clip highlights, with bright-scene recovery (chrome, sun glints, headlights in daylight) and saturation gating (bright colored surfaces do not get specular pop)
-- Specular stabilization (`cf_spec_stab`): grain and mottle near the specular onset are no longer amplified by the steep specular ramp, lone outliers and pepper pits are locked or filled, and tiny isolated glints can be de-emphasized (`cf_spec_floor`). Edges, glints and smooth falloffs are left alone
+- Compact highlight lift (`cf_highlight`): extra lift above the scene's own diffuse white for compact highlights (glints, lamps, small reflections), while painted whites and broad near-white areas (clouds, walls, glare) stay smooth; slope cap and bright-field shoulder are handled internally as functions of the picture
 - Light pump: a temporary, exposure-like surge on sustained brightening (explosions, tunnel exits, spells). It works per region of the picture, uses a motion search so camera pans and moving lamps do not trigger it, needs several frames of proof before it opens, and releases slowly with the source instead of snapping off
 - Warm-hue correction (Bezold-Brücke): fire, sunsets and skin do not drift green as they brighten
 - Pale-skin protection (saturation restore plus a small lift in bright, cooled scenes)
-- Grain stabilization: a compute-shader bilateral filter on luma makes the expansion decision grain-stable, so film grain stays filmic after expansion
 - Expansion in Oklab at constant chromaticity, with a fast path for near-neutral pixels
 - Exact PQ encoding where the fast approximation is inaccurate (near black, and above 1800 nits per channel), plus a PQ-aware dither against 8-bit banding in expanded highlights
 - Debug views with on-screen legends (`cf_debug`)
@@ -44,7 +42,7 @@ Features:
 **Controls.** All controls live in the **USER TUNING block at the top of the shader**. Edit the values there, or set them from `mpv.conf` without touching the file:
 
 ```ini
-glsl-shader-opts=cf_ref_white=110,cf_strength=0.8,cf_spec=1.2
+glsl-shader-opts=cf_ref_white=110,cf_strength=1.0,cf_highlight=1.5
 ```
 
 Sliders respond live during playback (no recompile; bind `glsl-shader-opts` changes to keys for real-time A/B). Toggles and `cf_debug` trigger a quick recompile.
@@ -52,31 +50,19 @@ Sliders respond live during playback (no recompile; bind `glsl-shader-opts` chan
 | Control | Range | Default | Effect |
 |---------|-------|---------|--------|
 | `cf_ref_white` | 80–480 | 116 | SDR white level in nits. **Must match `hdr-reference-white`.** |
-| `cf_strength` | 0–2 | 0.7 | Overall strength. 0 = plain SDR, 1 = the full internal tune. Scales base expansion, specular pop and the light pump together. |
-| `cf_curve` | 0.6–2 | 1.2 | Ramp shape. Below 1 = gentle, broad lift; above 1 = lift concentrated on the brightest pixels, midtones closer to the SDR grade. Peak unchanged. |
-| `cf_shoulder` | 0–1 | 1.0 | How softly expansion arrives at the peak. 1 = smoothest (no steepening near clip), 0 = steepest near-clip pop. |
-| `cf_spec` | 0–2 | 1.1 | Specular pop on glints, light sources and clipped highlights. 0 = off. |
-| `cf_spec_stab` | 0–2 | 1.0 | Specular stabilization. 0 = raw specular ramp; 1 = default; above 1 = overdrive (texture evened harder, stronger corrections). |
-| `cf_spec_floor` | 0–1 | 0.45 | Share of specular pop kept by tiny isolated points (2x2 stars, lone sparkles). Coherent highlights always get full pop. 1 = uniform, 0 = isolated points get base expansion only. Needs `cf_spec_stab` > 0. |
+| `cf_strength` | 0–2 | 1.0 | Overall strength. 0 = plain SDR, 1 = the full internal tune. Scales base expansion, the highlight lift and the light pump together. |
+| `cf_curve` | 0.6–2 | 1.6 | Ramp shape. Below 1 = gentle, broad lift; above 1 = lift concentrated on the brightest pixels, midtones closer to the SDR grade. Peak unchanged. |
+| `cf_highlight` | 1–2 | 1.5 | Extra lift factor at clipped white for compact highlights (glints, lamps, small reflections) above the scene's diffuse white. Painted whites and broad near-white areas are excluded, and the lift shrinks automatically as the scene's own white approaches clip. 1 = no extra lift. |
 | `cf_pump` | 0–2 | 1.0 | Light pump strength. 0 = off. |
-| `cf_key_hold` | 0–64 | 0 | Scene-key hold in seconds. After a brighter shot, a darker shot keeps the brighter shot's scene adaptation and eases to its own over about this long, so faces and outfits stop stepping at every cut inside one scene. A cut to a brighter shot still adapts at once. Cost: dark shots inside a brighter scene get less dark-scene boost. 0 = off. |
-| `cf_skin_steady` | 0–1 | 0 | Exempts pale warm tones (skin, and cream or sand of the same hue) from the bright-scene cooling, so a close-up face is not cooled while the same face in a wider shot is not. 0 = off. |
-| `cf_spec_anchor` | 0–1 | 0 | Prototype. Which pixels get the specular bonus. 0 = every pixel above luma 0.90 whenever near-white is scarce in the frame. 1 = it starts just above the scene's diffuse white, so painted whites (shirts, white hair, eye whites) stay put in every framing while glints and emitter cores lift; where no such anchor exists only compact bright things and near-white cores inside saturated glow lift. Much less specular light overall. |
-| `cf_spec_gain` | 0.5–4 | 1.0 | Peak of the qualified specular; only acts with `cf_spec_anchor`. Multiplies `cf_spec`. The bonus is broad and tapered: other whites above the scene's diffuse white keep a quarter of it, so 1 to 1.6 is the useful range (frame peaks about 1.2x the plain setting's); 2 and above starts lighting cloud tops and hair sheens. |
-| `cf_spec_top` | 0.93–1 | 1.0 | Where the qualified specular reaches its level; only acts with `cf_spec_anchor`. The source luma at which the bonus is complete; above it the bonus is flat, so the gentle top of a soft highlight comes out even instead of peaked. Lower values shorten the climb, so lower `cf_spec_gain` with it (0.96 with gain 0.8 keeps the climb as steep as 1.0 with gain 1.4). 1 = unchanged. |
-| `cf_spec_soft` | 0–1 | 0 | Softness of the specular ramp. At 0 the bonus follows each pixel's own luma, so on a soft highlight (a cloud, a lamp's glow) its whole climb lands on a thin band of the slope and reads as a contour around a flat hot core. At 1 the climb is spread along the slope, among neighbours of similar luma, and the bonus rises gradually from the foot of the highlight like a blur. It acts only where the picture itself is soft: near a hard edge between two bright colours (a cel highlight on its fill, an eye white on skin) the pixel keeps its own ramp, and flat areas are unchanged. Soft highlights give up some peak, small ones most. Scales with the picture (measured at 2160 and 1080 lines). Heavy grain reduces it and finally switches it off by itself. Costs about 0.07 ms at 4K when on, 0.02 ms when off. |
-| `cf_hl` | 0–1 | 0 | Highlight model. 0 = the per-pixel specular bonus (`cf_spec` and the `cf_spec_*` sliders). 1 = gradient-preserving highlights: the curve reads a smooth base of the picture (a fast guided filter at 1/4 resolution), so texture, grain and compression noise ride on the expansion unchanged instead of being magnified, and the specular is replaced by a gentle lift above the scene's diffuse white whose steepness is capped (`cf_hl_top`, `cf_hl_cap`). A soft glare or cloud keeps its gradient; a glint or a lit window comes out even, without a hot core or a rim. Peaks sit lower than with the specular bonus (in the measured scenes 25-35 %). The `cf_spec_*` sliders do nothing in this mode. Costs about 0.04 ms at 4K. |
-| `cf_hl_top` | 1–2 | 1.5 | Highest extra lift above the scene's diffuse white with `cf_hl`, as a factor at clip. The slope cap usually decides first: about x1.13 with the diffuse white at 0.90, nothing when it is at clip. 1 = no lift. |
-| `cf_hl_cap` | 1.5–3 | 2.0 | Steepest the highlights may climb with `cf_hl`: the log-log slope of the output against the smooth base, base curve included (a professional HDR grade measures about 1.6 at the top). Higher = more lift above diffuse white, gradients climb faster. 1.5 = no lift. |
-| `cf_grain_stab` | 0/1 | 1 | Grain stabilization toggle. |
+| `cf_key_hold` | 0–64 | 10.0 | Scene-key hold in seconds. After a brighter shot, a darker shot keeps the brighter shot's calmer scene adaptation and eases to its own over about this long, so faces and outfits stop stepping at every cut inside one scene. A cut to a brighter shot still adapts at once. 0 = off. |
+| `cf_skin_steady` | 0–1 | 1.0 | Exempts skin-hued tones from bright-scene cooling via a content-locked local fit, so a close-up face keeps the same curve as in a wider shot. 0 = off. |
+| `cf_grain_stab` | 0/1 | 1 | Grain stabilization toggle. Feeds the light pump's per-pixel weight (the expansion curve reads the smooth base directly). |
 | `cf_additive_pump` | 0/1 | 1 | 1 = each region pumps at its own strength (motion-checked opening). 0 = the older subtractive mode, where the regional mask can only suppress a frame-wide pump. |
 | `cf_warm_shift` | 0/1 | 1 | Warm-hue correction toggle. |
 | `cf_pale_skin` | 0/1 | 1 | Pale-skin protection toggle. |
-| `cf_debug` | 0–12 | 0 | Debug view: 1 bypass, 2 illumination field, 3 expansion, 4 base expansion, 5 specular, 6 light pump, 7 warm shift / pale skin, 8 scene stats, 9 motion offset, 10 motion evidence (11 = same as 10), 12 light-pump opening proof. |
+| `cf_debug` | 0–12 | 0 | Debug view: 1 bypass, 2 illumination field, 3 expansion, 4 base expansion, 5 top lift, 6 light pump, 7 warm shift / pale skin, 8 scene stats, 9 motion offset, 10 motion evidence (11 = same as 10), 12 light-pump opening proof. |
 
-`cf_spec_stab` in detail: from 0 to 1 it fades in both parts of the stabilization (the texture-evened drive and the range lock / pit fill). From 1 to 2 those stay at full, and the texture evening gets stronger: less of the grain is passed to the specular ramp (never zero) and the largest allowed correction doubles.
-
-**Removed in v6.0** (these keys no longer exist; drop them from `glsl-shader-opts` and saved profiles): `cf_spec_bonus` (use `cf_spec=0`), `cf_light_pump` (use `cf_pump=0`), `cf_spatial_pump` (the regional pump is always on; the frame-wide-only mode pumped on camera pans), `cf_spec_scene_reject` (always on), `cf_spec_radius` (fixed at 6 px), `cf_spec_texture` (merged into `cf_spec_stab`: `cf_spec_texture=2` with `cf_spec_stab=1` is now `cf_spec_stab=2`).
+**Removed in v7.0** (drop these keys from `glsl-shader-opts` and saved profiles): the legacy per-pixel specular controls (`cf_spec`, `cf_spec_stab`, `cf_spec_floor`, `cf_spec_anchor`, `cf_spec_gain`, `cf_spec_top`, `cf_spec_soft`), the transition switches (`cf_hl`, `cf_hl_top`, `cf_hl_cap`), and `cf_shoulder` — replaced by the single `cf_highlight` slider and internal picture-driven cap/shoulder functions. *(Earlier v6.0 removals: `cf_spec_bonus`, `cf_light_pump`, `cf_spatial_pump`, `cf_spec_scene_reject`, `cf_spec_radius`, `cf_spec_texture`.)*
 
 Load **one** CelFlare shader at a time. Never combine `CelFlare.glsl` with `CelFlare-transport.glsl`: the picture would be processed twice.
 
@@ -138,7 +124,8 @@ Operates on the luma channel only, from a 5x5 neighborhood:
 - Grain bypass: two small passes measure the picture's grain level per brightness band, from its flattest parts, and the sharpening acts only where local detail rises clearly above that level. Grain on flat areas is left as it is. Texture fainter than the grain cannot be told apart from it and is left alone too; grain riding on stronger texture is sharpened with it.
 - Edges are kept out twice: a Sobel test on the pixel itself, and a line guard that looks for oriented gradient anywhere in the 5x5, so the foot of an outline is not steepened and the faint ripple beside it is not lifted.
 - The change is capped at `tc_max_delta` (about 3 code values at the default) and eases into the cap.
-- Active between luma 0.05 and 0.95; near-black and near-white are left alone.
+- Active between signal 0.05 and 0.95; near-black and near-white are left alone (accounts for limited-range video by default via `tc_range=1`).
+- Native PQ HDR mode (`tc_pq=1`): maps PQ luma to SDR-equivalent light (BT.1886 against `tc_ref_white`) so HDR10/DV sources sharpen with the same strength as SDR and bright highlights above diffuse white are left untouched.
 
 Works best when it's barely noticeable. It strengthens detail that survived encoding, most on high-bitrate sources; it cannot bring back detail an encode removed entirely, and it has little to do on clean, flat-shaded animation.
 
@@ -152,12 +139,21 @@ Runtime controls (live via `glsl-shader-opts`, no recompile):
 | `tc_max_delta` | Cap on how much sharpening may move any pixel; large changes ease into it. |
 | `tc_line_guard` | Line guard: the sharpening fades where the 5x5 neighbourhood holds an edge or a line (1 = on, shipped; 0 = only the pixel's own edge test applies). |
 | `tc_grain_bypass` | Grain bypass: sharpen only detail that rises above the measured grain level (1 = on, shipped; 0 = grain is sharpened like texture). |
+| `tc_range` | Video luma range: `1` = limited 16–235 (default; discs, broadcast, streaming), `0` = full 0–255. Ensures the near-black/near-white guards and grain bands sit at true signal levels. |
+| `tc_pq` | Native PQ HDR mode (HDR10, Dolby Vision base layer): `1` = sharpen in SDR-equivalent light relative to `tc_ref_white` (leaves highlights above ~0.88× reference white untouched); `0` = plain gamma plane (default; keep `0` for SDR, HLG, and SDR-to-HDR chains like CelFlare). |
+| `tc_ref_white` | Diffuse white in nits when `tc_pq=1` (default `203`, BT.2408). |
 
 **Usage:**
 
 ```ini
 # mpv.conf
 glsl-shaders-append=~~/shaders/TextureClarity.glsl
+
+# Optional: enable PQ mode only on native PQ HDR sources (not SDR-to-HDR)
+[hdr-tc]
+profile-cond=p["video-params/trc"] == "smpte2084"
+profile-restore=copy
+glsl-shader-opts-append=tc_pq=1
 ```
 
 ---
@@ -266,7 +262,7 @@ Shape and amount are separate controls. `grain_size`, `grain_contrast` and `grai
 
 The density compositor retains the generator's unequal, correlated RGB grain character, but normalizes its luma energy downward when a saturated carrier would otherwise make the same measured grain look stronger than it does on an equal-luma neutral. This is covariance-aware rather than a generic saturation reduction: quiet chromatic directions are left alone, neutral pixels are unchanged, and additive mode is untouched.
 
-Visible arrangement cadence is source-locked and display-refresh independent. `grain_rate` controls the boil cadence; every visible tick regenerates the vocabulary and rehashes its block windows and jitter. Paused redraws freeze the observer, vocabulary, and arrangement when the companion shampv script supplies the machine-owned pause signal; paused seeks/frame-steps participate in normal source cadence for their new frame, then refreeze (so “on twos” still intentionally shares an arrangement). Editing a generator-baked look control while paused rebuilds the standing vocabulary once under the same seed, so tuning remains live without starting the temporal observer. A shader first enabled while paused initializes once from the held source frame. `state_epoch` must change once per file so title state cannot bleed across a playlist (shampv does this; standalone integrations must too). It has two parts. Its value mod 4096 names the title or series: any change there wipes the learned state. `floor(state_epoch / 4096)` counts the file within that series: a change of that part alone carries the title's learned grain into the next episode at a quarter of its authority. An integration that adds 1 per file gets a cold start on every file.
+Visible arrangement cadence is source-locked and display-refresh independent. `grain_rate` controls the boil cadence; every visible tick regenerates the vocabulary and rehashes its block windows and jitter. Paused redraws freeze the observer, vocabulary, and arrangement when the companion shampv script supplies the machine-owned pause signal; paused seeks/frame-steps participate in normal source cadence for their new frame, then refreeze (so “on twos” still intentionally shares an arrangement). Editing a generator-baked look control while paused rebuilds the standing vocabulary once under the same seed, so tuning remains live without starting the temporal observer. A shader first enabled while paused initializes once from the held source frame. `state_epoch` must change once per file so title state cannot bleed across a playlist (shampv does this; standalone integrations must too). It has two parts. Its value mod 4096 names the title or series: any change there wipes the learned state. `floor(state_epoch / 4096)` counts the file within that series: a change of that part alone carries the title's learned grain into the next episode at a quarter of its authority. An integration that adds 1 per file gets a cold start on every file. Plain mpv never changes it, so within one mpv instance (a playlist) the learned grain carries from file to file — usually what you want for a series. A grainy title followed by a clean one in the same playlist (or an opening much grainier than its show) can hold extra grain for several minutes before it relaxes; opening files one at a time starts each fresh.
 
 Runtime controls (live-toggleable via `glsl-shader-opts`):
 
@@ -288,10 +284,10 @@ Runtime controls (live-toggleable via `glsl-shader-opts`):
 | `grain_hdr` | 1 = PQ BT.2020 output chain (e.g. CelFlare): grain is keyed and applied in the measured SDR domain via a per-pixel PQ bridge, fading out shortly above reference white. 0 = plain SDR (exact prior behavior). |
 | `grain_headroom` | Only with `grain_hdr=1`: 1 = an upstream SDR→HDR stage (e.g. CelFlare) expands highlights above reference white, so grain fades just above it; 0 = plain SDR carried in a PQ container, where reference white is the clip ceiling. |
 | `grain_ref_white` | SDR reference white in nits for the HDR bridge — match `hdr-reference-white`. With `grain_source_trc=1` it is also the anchor native PQ is measured against. |
-| `grain_source_trc` | Source transfer the observer reads: 0 = gamma (all SDR, including SDR retagged for an SDR→HDR shader); 1 = PQ native HDR (HDR10/HDR10+, Dolby Vision P7/P8 base layer), measured through a bridge to SDR-equivalent codes at `grain_ref_white` so native HDR is read in the domain the model is calibrated in. HLG and Dolby Vision P5 stay 0. mpv cannot tell the shader the source transfer — set it per profile for HDR sources. |
+| `grain_source_trc` | Source transfer the observer reads: 0 = gamma (all SDR, including SDR retagged for an SDR→HDR shader); 1 = PQ native HDR (HDR10/HDR10+, Dolby Vision P7/P8 base layer), measured through a bridge to SDR-equivalent codes at `grain_ref_white` so native HDR is read in the domain the model is calibrated in. HLG and Dolby Vision P5 stay 0. 2 = auto: read from the source's tagged transfer (PQ sources are bridged; SDR and HLG are read as gamma). Auto sees only the tag, so a chain that retags SDR sources as PQ at the source (the usual CelFlare setup) must pin 0. |
 | `debug_match` | Machine-readable state overlay for tuning. |
 
-**Requirements:** mpv with `vo=gpu-next`; compute shaders (GLSL 4.30+) — Vulkan/D3D11, or OpenGL 4.3+. SDR content, or native PQ HDR with `grain_source_trc=1`; for SDR→HDR chains (e.g. CelFlare, PQ BT.2020 out) set `grain_hdr=1` + `grain_ref_white=<your hdr-reference-white>` in `glsl-shader-opts`. Grain is measured in picture-relative terms, so 1080p, 4K and upscaled (e.g. an AI upscaler filter ahead of the shader) sources of the same picture read the same grain. The observer assumes limited-range video (disc, broadcast, streaming); full-range sources mis-key the darkest tones slightly.
+**Requirements:** mpv with `vo=gpu-next`; compute shaders (GLSL 4.30+) — Vulkan/D3D11, or OpenGL 4.3+. SDR content, or native PQ HDR with `grain_source_trc=1` (or `2` = auto); for SDR→HDR chains (e.g. CelFlare, PQ BT.2020 out) set `grain_hdr=1` + `grain_ref_white=<your hdr-reference-white>` in `glsl-shader-opts`. Grain is measured in picture-relative terms, so 1080p, 4K and upscaled (e.g. an AI upscaler filter ahead of the shader) sources of the same picture read the same grain. The observer assumes limited-range video (disc, broadcast, streaming); full-range sources mis-key the darkest tones slightly.
 
 **Usage:**
 

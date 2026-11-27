@@ -1,11 +1,14 @@
-// CelFlare v6.0 — SDR-to-HDR highlight expansion for mpv (libplacebo)
+// CelFlare v7.0 — SDR-to-HDR highlight expansion for mpv (libplacebo)
 // Copyright (C) 2026 Agust Ari · GPL-3.0
 //
 // Turns an SDR picture into PQ BT.2020 HDR by expanding its highlights.
-// Mission: emulate a professional HDR grade of the source. Midtones hold the
-// SDR grade, highlights expand with natural gradation, speculars get
-// grade-realistic pop; gentle over flashy. The shader does no tone mapping:
-// the display owns the final mapping.
+// Mission: an authentic HDR grade of the source, not a brightening filter.
+// Shadows and mid-tones keep the SDR grade: nothing changes below signal 0.5.
+// Above it the expansion grows smoothly with brightness: a few percent at
+// 0.5-0.6, about x1.15 at 0.7-0.8 and x1.3-1.4 on bright diffuse tones
+// (0.85-0.95) in a bright scene, more in a dark one, and most on highlights
+// above the scene's own white. Gentle over flashy. The shader does no tone
+// mapping: the display owns the final mapping.
 //
 // Rules (cited in comments as rule 1-3):
 //  1. Never attenuate source clipping; gradation first. The expansion is a
@@ -19,24 +22,33 @@
 //  3. The display owns the ceiling; PUMP_GAIN_CEIL is a safety roof, not a
 //     tone curve.
 //
-// Signal path (pass 9, per pixel): grain-stabilized luma -> base curve whose
-// shape follows the illumination field (the regional brightness) -> x
-// dynamic intensity (scene contrast) -> x APL modulation (scene key) ->
-// + specular bonus (near-clip ramp) -> x (1 + light-pump gain) -> applied in
-// Oklab at constant chromaticity (+ warm-hue and pale-skin corrections) ->
-// PQ BT.2020 -> dither.
+// Signal path (pass 9, per pixel): smooth base of the luma (a guided filter
+// at 1/4 resolution, so texture and grain ride on the expansion 1:1) -> base
+// curve whose shape follows the illumination field (the regional brightness)
+// -> x dynamic intensity (scene contrast) -> x APL modulation (scene key) ->
+// x top lift above the scene's diffuse white on compact highlights
+// (cf_highlight) -> x (1 +
+// light-pump gain) -> applied in Oklab at constant chromaticity (+ warm-hue
+// and pale-skin corrections) -> PQ BT.2020 -> dither.
 //
-// Passes (all hook MAIN, in this order):
+// Passes (all hook MAIN, in this order; the numbers are the names used in
+// the comments, not the pass count):
 //   1 Grain pre-filter      COMPUTE 16x16; decision luma into alpha as Y*0.5
-//   2 Downsample 1/4        -> CELFLARE_DS
+//                           (read by the pump's pixel weight)
+//   2 Downsample 1/4        -> CELFLARE_DS (alpha: near-white membership)
+//     Highlight base        3 passes at 1/4: luma, statistics -> CELFLARE_GA
 //   3 Illumination blur H   -> CELFLARE_BLUR_H
 //   4 Illumination blur V   -> CELFLARE_ILLUM (sigma 80 px at 1080p, scales
 //                              with the picture)
+//     Skin weight           4b-4c and the surface spreads, the smoothing,
+//                           the fit (CELFLARE_SKSM, CELFLARE_SKF)
+//     Highlight base        coefficients and the coring reference -> CELFLARE_GF
+//     Highlight size        seed + 6 spread passes on a 68-row grid (after pass 8): object coverage -> CELFLARE_OBJ
 //   5 Motion downsample     -> MOTION_CUR 128x72
 //   6 Motion block-match    COMPUTE 16x9 -> MOTION_FLOW, one vector per cell
 //   7 Motion history store  -> CELFLARE_ADD_MOTION_PREV for the next frame
 //   8 Frame stats           COMPUTE 16x9: scene statistics, cut detection,
-//                           light-pump state; parallel per-cell update
+//                           diffuse-white anchor, light-pump state
 //   9 Expansion apply       COMPUTE 16x16, full resolution, the output
 // Frame state lives in the CELFLARE_ADD_STATE buffer. A "cell" is one of the
 // 16x9 = 144 grid regions used by pass 8 and the pump.
@@ -44,14 +56,13 @@
 // Controls (USER TUNING below; all settable via glsl-shader-opts):
 //   cf_ref_white   SDR white in nits; MUST equal mpv's hdr-reference-white
 //   cf_strength    overall strength (0 = plain SDR)   cf_curve   ramp shape
-//   cf_shoulder    arrival at peak                    cf_spec    specular pop
-//   cf_spec_stab   spec stabilization 0..2            cf_pump    light pump
-//   cf_spec_floor  pop kept by tiny isolated glints
+//   cf_highlight   extra lift of clipped white        cf_pump    light pump
+//   cf_key_hold    scene-key hold, s                  cf_skin_steady  skin exemption
 //   toggles (recompile): cf_grain_stab, cf_additive_pump, cf_warm_shift,
 //   cf_pale_skin, cf_debug. Sliders act on the next frame.
 //   Deep anchors: search "MAIN TUNING" (the knobs scale them).
 // cf_debug views: 1 bypass, 2 illumination field, 3 expansion, 4 detail (base
-// expansion before the scene terms), 5 specular, 6 light pump, 7 warm/skin,
+// expansion before the scene terms), 5 top lift, 6 light pump, 7 warm/skin,
 // 8 scene stats, 9 motion offset, 10 motion evidence (11 = alias of 10),
 // 12 additive opening proof.
 //
@@ -66,7 +77,7 @@
 //@shampv input sdr
 //@shampv output trc=pq primaries=bt.2020
 //@shampv ref-white-param cf_ref_white
-//@shampv choice cf_debug off bypass illum expand detail spec pump warm-skin stats mv-offset mv-evidence mv-evidence-alias additive-proof
+//@shampv choice cf_debug off bypass illum expand detail toplift pump warm-skin stats mv-offset mv-evidence mv-evidence-alias additive-proof
 
 // =============================================================================
 //  USER TUNING
@@ -88,46 +99,18 @@
 116.0
 
 //!PARAM cf_strength
-//!DESC Overall HDR strength. 0 = plain SDR, no expansion · 0.7 = shipped · 1 = the full internal tune · ↑ 2 = double. Scales base expansion, specular pop and light pump together.
+//!DESC Overall HDR strength. 0 = plain SDR, no expansion · 1 = the full internal tune (default) · ↑ 2 = double. Scales base expansion, the top lift and the light pump together.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 2.0
-0.7
+1.0
 
 //!PARAM cf_curve
-//!DESC Expansion ramp shape. ↓ <1 = gentle broad lift · ↑ >1 = lift concentrated on the brightest pixels, midtones closer to the SDR grade. Peak unchanged. 1.2 shipped.
+//!DESC Expansion ramp shape. ↓ <1 = gentle broad lift · ↑ >1 = lift concentrated on the brightest pixels, midtones closer to the SDR grade. Peak unchanged. 1.6 default.
 //!TYPE DYNAMIC float
-//!MINIMUM 0.6
+//!MINIMUM 0.599
 //!MAXIMUM 2.0
-1.2
-
-//!PARAM cf_shoulder
-//!DESC Highlight shoulder — eases how hard expansion hits the brightest pixels. 1 = smoothest, no steepening (shipped) · ↓ 0 = steepest near-clip pop.
-//!TYPE DYNAMIC float
-//!MINIMUM 0.0
-//!MAXIMUM 1.0
-1.0
-
-//!PARAM cf_spec
-//!DESC Specular pop — extra punch on glints, light sources, clipped highlights. ↑ = punchier · 0 = off. 1.1 shipped.
-//!TYPE DYNAMIC float
-//!MINIMUM 0.0
-//!MAXIMUM 2.0
-1.1
-
-//!PARAM cf_spec_stab
-//!DESC Specular stabilization. Grain/mottle straddling the spec onset stops being ramp-amplified (texture-evened drive) and lone outliers / pepper pits are range-locked or filled — the area keeps its pop, per-pixel crunch shrinks; glints, edges and smooth falloffs are untouched. 0 = raw ramp · 1 = shipped · ↑ 2 = overdrive (texture evened harder, deeper corrections).
-//!TYPE DYNAMIC float
-//!MINIMUM 0.0
-//!MAXIMUM 2.0
-1.0
-
-//!PARAM cf_spec_floor
-//!DESC Isolated-glint spec floor (impact weighting, needs cf_spec_stab). Coherent highlight bodies always get full specular pop; tiny isolated points (2x2 stars, lone sparkles) keep this fraction of it. 1 = off (uniform spec) · 0 = isolated points get base expansion only. 0.45 shipped.
-//!TYPE DYNAMIC float
-//!MINIMUM 0.0
-//!MAXIMUM 1.0
-0.45
+1.6
 
 //!PARAM cf_pump
 //!DESC Light pump — temporary surge on sustained brightening (explosions, tunnel exits, spells). ↑ = stronger surge · 1 = shipped · 0 = off.
@@ -141,66 +124,24 @@
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 64.0
-0.0
+10.0
 
 //!PARAM cf_skin_steady
-//!DESC Skin steadiness. Bright-scene cooling is meant for broad bright fields, but a large, brightly painted face is one, so a close-up was cooled and the same face in a wider shot was not. ↑ 1 = skin-hued pixels are exempt from the cooling and keep one curve in every framing · 0 = off.
+//!DESC Skin steadiness. Bright-scene cooling is meant for broad bright fields, but a large, brightly painted face is one, so a close-up was cooled and the same face in a wider shot was not. ↑ 1 = skin-hued pixels are exempt from the cooling and keep one curve in every framing (default) · 0 = off.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
-//!MAXIMUM 1.0
-0.0
-
-//!PARAM cf_spec_anchor
-//!DESC Highlight qualification for the specular bonus (prototype). 0 = the bonus lifts every pixel above luma 0.90 whenever near-white is scarce in the frame (shipped) · ↑ 1 = it starts just above the scene's diffuse white, so shirts, white hair and eye whites stay put in every framing while glints and emitter cores lift; where no such anchor exists it lifts only compact bright things and near-white cores inside saturated glow. The frame-wide on/off no longer applies.
-//!TYPE DYNAMIC float
-//!MINIMUM 0.0
-//!MAXIMUM 1.0
-0.0
-
-//!PARAM cf_spec_gain
-//!DESC Peak of the qualified specular (needs cf_spec_anchor). With cf_spec_anchor the bonus only reaches glints and emitter cores, so it can sit well above diffuse white without lifting painted whites. 1 = the same peak as the shipped specular · ↑ = higher peak (1 to 1.6 is the useful range now that other whites keep a quarter of the bonus; 2 starts lighting cloud tops and hair sheens) · multiplies cf_spec.
-//!TYPE DYNAMIC float
-//!MINIMUM 0.5
-//!MAXIMUM 4.0
-1.0
-
-//!PARAM cf_spec_top
-//!DESC Where the qualified specular reaches its level (needs cf_spec_anchor): the source luma at which the bonus is complete; above it the bonus is flat. 1 = it keeps climbing right up to clip, so the gentle top of a soft highlight comes out as a peak · ↓ 0.96 = complete at luma 0.96: highlight tops come out even and the climb sits on the highlight's own edge. The climb gets shorter and steeper as this goes down, so lower cf_spec_gain with it.
-//!TYPE DYNAMIC float
-//!MINIMUM 0.93
 //!MAXIMUM 1.0
 1.0
 
-//!PARAM cf_spec_soft
-//!DESC Softness of the specular ramp. 0 = the bonus follows each pixel's own luma: on a soft highlight (a cloud, a glow) its whole climb lands on a thin band of the slope and reads as a contour around a flat hot core · ↑ 1 = the climb is spread along the slope, among neighbours of similar luma: the bonus rises gradually from the foot of the highlight like a blur. Only where the picture itself is soft: near a hard edge between two bright colours (a cel highlight on its fill, an eye white on skin) nothing changes. Soft highlights give up some peak, small ones most.
-//!TYPE DYNAMIC float
-//!MINIMUM 0.0
-//!MAXIMUM 1.0
-0.0
-
-//!PARAM cf_hl
-//!DESC Highlight model. 0 = per-pixel specular bonus (cf_spec and the cf_spec_* sliders) · 1 = gradient-preserving highlights: the curve reads a smooth base of the picture (texture, grain and compression noise ride on it unchanged), and the specular is replaced by a gentle top lift above the scene's diffuse white whose steepness is capped (cf_hl_top, cf_hl_cap). The cf_spec_* sliders do nothing in this mode.
-//!TYPE DYNAMIC float
-//!MINIMUM 0.0
-//!MAXIMUM 1.0
-0.0
-
-//!PARAM cf_hl_top
-//!DESC Highest extra lift above the scene's diffuse white (needs cf_hl), as a factor at clip. The slope cap usually decides first: about x1.13 with the diffuse white at 0.90, nothing when it is at clip. 1 = no lift.
+//!PARAM cf_highlight
+//!DESC Highlight pop: the extra factor a compact highlight (a glint, a lamp, a small reflection) gets at clipped white, on top of the curve, in a scene whose whites are not near clip. 1 = none · 1.5 = default. Painted whites, shirts and eye whites (the scene's own diffuse white) stay put, broad near-white areas (clouds, bands, garments, glare) get none of it, and it shrinks by itself as the scene's white nears clip. The factor is raised to the power cf_strength.
 //!TYPE DYNAMIC float
 //!MINIMUM 1.0
 //!MAXIMUM 2.0
 1.5
 
-//!PARAM cf_hl_cap
-//!DESC Steepest the highlights may climb (needs cf_hl): the log-log slope of output against the smooth base, base curve included. 2 = a little above a professional grade (about 1.6 at the top) · ↑ = more lift above diffuse white, gradients climb faster · 1.5 = no lift.
-//!TYPE DYNAMIC float
-//!MINIMUM 1.5
-//!MAXIMUM 3.0
-2.0
-
 //!PARAM cf_grain_stab
-//!DESC Grain stabilization (toggle). 1 = keep film grain filmic after expansion instead of shimmering · 0 = off.
+//!DESC Grain stabilization (toggle). Feeds only the light pump's per-pixel weight (the expansion reads the smooth base and does not need it). 1 = on · 0 = off.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 1
@@ -228,7 +169,7 @@
 1
 
 //!PARAM cf_debug
-//!DESC Debug view selector (recompiles). Cycles: off, bypass, illum, expand, detail (base expansion), spec, pump, warm/skin, stats, mv-offset, mv-evidence, 11 = mv-evidence, additive-proof.
+//!DESC Debug view selector (recompiles). Cycles: off, bypass, illum, expand, detail (base expansion), top lift, pump, warm/skin, stats, mv-offset, mv-evidence, 11 = mv-evidence, additive-proof.
 //!TYPE DEFINE
 //!MINIMUM 0
 //!MAXIMUM 12
@@ -236,7 +177,6 @@
 
 //!BUFFER CELFLARE_ADD_STATE
 //!VAR float smoothed_bright_frac
-//!VAR float smoothed_spec_signal
 //!VAR float smoothed_contrast
 //!VAR float smoothed_log_avg
 //!VAR float smoothed_growth_mode
@@ -514,9 +454,9 @@ void hook() {
     float edge = sqrt(gx * gx + gy * gy);
     float edge_mask = smoothstep(GRAIN_EDGE_LOW, GRAIN_EDGE_HIGH, edge);
 
-    // The decision feeds the base curve, not the steep spec ramp (which
-    // reads raw Y_gamma: this field drew cloud rings there). It fades to raw
-    // from 0.95 to clip, so a hot core is never decision-squashed.
+    // The decision feeds the light pump's pixel weight in pass 9 (the base
+    // curve reads the highlight base instead). It fades to raw from 0.95 to
+    // clip, so a hot core is never decision-squashed.
     float stab = (1.0 - edge_mask) * range_mask;
     float Y_decision = Y_gamma + (blurred - Y_gamma) * stab;
 
@@ -550,9 +490,10 @@ vec4 hook() {
     rgb      += c2;
     rgb      += c3;
     rgb *= 0.25;
-    // Alpha carries a soft near-white membership (cf_spec_anchor). The two
-    // blur passes below carry it along, so CELFLARE_ILLUM.a is the share of
-    // the sigma-80 neighbourhood that is near-white: the "bright coverage".
+    // Alpha carries a soft near-white membership (the diffuse-white anchor,
+    // pass 8). The two blur passes below carry it along, so CELFLARE_ILLUM.a
+    // is the share of the sigma-80 neighbourhood that is near-white: the
+    // "bright coverage".
     const vec3 lw = vec3(0.2126, 0.7152, 0.0722);
     float m = smoothstep(0.86, 0.92, dot(c0, lw)) + smoothstep(0.86, 0.92, dot(c1, lw))
             + smoothstep(0.86, 0.92, dot(c2, lw)) + smoothstep(0.86, 0.92, dot(c3, lw));
@@ -560,7 +501,7 @@ vec4 hook() {
 }
 
 // =============================================================================
-// HIGHLIGHT BASE (cf_hl): fast guided filter at 1/4 resolution
+// HIGHLIGHT BASE: fast guided filter at 1/4 resolution
 // =============================================================================
 // The curve reads a smooth base of the picture instead of each pixel's own
 // luma, so texture, grain and compression noise ride on the expansion 1:1
@@ -1070,17 +1011,6 @@ vec4 hook() {
     return vec4(c.rgb, acc / wsum);
 }
 
-// =============================================================================
-// PASSES 4d-4f: EMITTER FIELD (cf_spec_anchor)
-// =============================================================================
-// Share of the neighbourhood that is saturated, full-value colour (glow), as
-// a Gaussian field: 1/8 resolution, sigma 3.5 texels at the reference
-// geometry (28 px at 1080p), scaled with the picture like the illumination
-// field. The highlight qualification reads it to tell a near-white emitter
-// core from a painted white. It was 12 ring taps counted through steep
-// thresholds; the count steps as taps cross colour boundaries and drew a
-// hard-edged mosaic over smooth clipped areas.
-
 //!HOOK MAIN
 //!BIND CELFLARE_SKS
 //!SAVE CELFLARE_SKSM
@@ -1323,273 +1253,6 @@ vec4 hook() {
             acc += w * CELFLARE_SKFA_tex(CELFLARE_SKFA_pos + vec2(float(i), float(j)) * CELFLARE_SKFA_pt);
         }
     return acc * (1.0 / 81.0);
-}
-
-//!HOOK MAIN
-//!BIND CELFLARE_DS
-//!BIND CELFLARE_ILLUM
-//!SAVE CELFLARE_EMM
-//!WIDTH CELFLARE_DS.w 2 /
-//!HEIGHT CELFLARE_DS.h 2 /
-//!DESC CelFlare: Emitter field 1/8
-
-float emit_tap(vec2 pos) {
-    vec3 gc = CELFLARE_DS_tex(pos).rgb;
-    float gv = max(max(gc.r, gc.g), gc.b);
-    float gs = (gv - min(min(gc.r, gc.g), gc.b)) / max(gv, 1e-3);
-    return smoothstep(0.45, 0.70, gs) * smoothstep(0.90, 0.98, gv);
-}
-
-vec4 hook() {
-    if (cf_hl > 0.5) return vec4(0.0);   // read only by the specular, which cf_hl skips
-    vec2 h = 0.5 * CELFLARE_DS_pt;
-    float m = emit_tap(CELFLARE_DS_pos + vec2(-h.x, -h.y)) + emit_tap(CELFLARE_DS_pos + vec2( h.x, -h.y))
-            + emit_tap(CELFLARE_DS_pos + vec2(-h.x,  h.y)) + emit_tap(CELFLARE_DS_pos + vec2( h.x,  h.y));
-    // g, b: sources of the object field (passes 4g-4h): the near-white
-    // membership, and the membership times the bright coverage to the 4th.
-    float wm = 0.25 * (CELFLARE_DS_tex(CELFLARE_DS_pos + vec2(-h.x, -h.y)).a + CELFLARE_DS_tex(CELFLARE_DS_pos + vec2( h.x, -h.y)).a
-                     + CELFLARE_DS_tex(CELFLARE_DS_pos + vec2(-h.x,  h.y)).a + CELFLARE_DS_tex(CELFLARE_DS_pos + vec2( h.x,  h.y)).a);
-    float cv = CELFLARE_ILLUM_tex(CELFLARE_ILLUM_pos).a;
-    cv *= cv;
-    return vec4(m * 0.25, wm, wm * cv * cv, 1.0);
-}
-
-//!HOOK MAIN
-//!BIND CELFLARE_EMM
-//!SAVE CELFLARE_EMH
-//!WIDTH CELFLARE_EMM.w
-//!HEIGHT CELFLARE_EMM.h
-//!DESC CelFlare: Emitter field blur H
-
-#define EMIT_SIGMA  3.5     // texels at the reference geometry (240x135)
-#define EMIT_REF_W  240.0
-#define EMIT_REF_H  135.0
-
-vec4 hook() {
-    if (cf_hl > 0.5) return vec4(0.0);   // read only by the specular, which cf_hl skips
-    vec2 cs = CELFLARE_EMM_size;
-    vec2 dir = vec2(CELFLARE_EMM_pt.x, 0.0);
-    float sigma = EMIT_SIGMA * max(cs.x / EMIT_REF_W, cs.y / EMIT_REF_H);
-    int pairs = int(ceil(sigma));
-    float k = -0.5 / (sigma * sigma);
-    float sum = CELFLARE_EMM_tex(CELFLARE_EMM_pos).r;
-    float wsum = 1.0;
-    for (int i = 0; i < pairs; i++) {
-        float x1 = float(2 * i + 1);
-        float x2 = x1 + 1.0;
-        float w1 = exp(k * x1 * x1);
-        float w2 = exp(k * x2 * x2);
-        float w = w1 + w2;
-        float o = (w1 * x1 + w2 * x2) / w;
-        sum += (CELFLARE_EMM_tex(CELFLARE_EMM_pos + o * dir).r + CELFLARE_EMM_tex(CELFLARE_EMM_pos - o * dir).r) * w;
-        wsum += 2.0 * w;
-    }
-    return vec4(sum / wsum, 0.0, 0.0, 1.0);
-}
-
-//!HOOK MAIN
-//!BIND CELFLARE_EMH
-//!SAVE CELFLARE_EMIT
-//!WIDTH CELFLARE_EMH.w
-//!HEIGHT CELFLARE_EMH.h
-//!DESC CelFlare: Emitter field blur V
-
-#define EMIT_SIGMA  3.5     // keep identical to the H pass
-#define EMIT_REF_W  240.0
-#define EMIT_REF_H  135.0
-
-vec4 hook() {
-    if (cf_hl > 0.5) return vec4(0.0);   // read only by the specular, which cf_hl skips
-    vec2 cs = CELFLARE_EMH_size;
-    vec2 dir = vec2(0.0, CELFLARE_EMH_pt.y);
-    float sigma = EMIT_SIGMA * max(cs.x / EMIT_REF_W, cs.y / EMIT_REF_H);
-    int pairs = int(ceil(sigma));
-    float k = -0.5 / (sigma * sigma);
-    float sum = CELFLARE_EMH_tex(CELFLARE_EMH_pos).r;
-    float wsum = 1.0;
-    for (int i = 0; i < pairs; i++) {
-        float x1 = float(2 * i + 1);
-        float x2 = x1 + 1.0;
-        float w1 = exp(k * x1 * x1);
-        float w2 = exp(k * x2 * x2);
-        float w = w1 + w2;
-        float o = (w1 * x1 + w2 * x2) / w;
-        sum += (CELFLARE_EMH_tex(CELFLARE_EMH_pos + o * dir).r + CELFLARE_EMH_tex(CELFLARE_EMH_pos - o * dir).r) * w;
-        wsum += 2.0 * w;
-    }
-    return vec4(sum / wsum, 0.0, 0.0, 1.0);
-}
-
-// =============================================================================
-// PASSES 4g-4h: OBJECT FIELD,  4i-4k: WIDE EMITTER FIELD (cf_spec_anchor)
-// =============================================================================
-// The highlight qualification asks two things of a near-white pixel: is it
-// part of something small (compact), and does it sit in a glow (emitter
-// core). Both were read at the pixel, and both drew a bright rim just inside
-// the edge of a large white object (a cloud: 207 nits at the rim, 187 inside,
-// on white that is flat in the source):
-//  - the bright coverage is 0.5 or less on the BORDER of any white object,
-//    however large, so a convex stretch of a big object's edge read as small;
-//  - beside a saturated full-value sky the border read as an emitter core.
-// Object field (4g-4h, 1/8 resolution, sigma 80 px at 1080p): Gaussian sums
-// of the near-white membership m and of m x coverage^4. Their ratio, to the
-// power 1/4, is the coverage the object's own white pixels see (a power mean
-// that leans to the largest): border and interior of one object read nearly
-// alike, a glint or a thin tube still reads small.
-// Wide emitter field (4i-4k, 1/32 resolution, sigma 240 px at 1080p): share
-// of saturated full-value colour in the wide neighbourhood. A glow is local;
-// where that colour fills the wide neighbourhood it is a field (a daytime
-// sky), and the emitter cue fades out.
-
-//!HOOK MAIN
-//!BIND CELFLARE_EMM
-//!SAVE CELFLARE_OBH
-//!WIDTH CELFLARE_EMM.w
-//!HEIGHT CELFLARE_EMM.h
-//!DESC CelFlare: Object field blur H
-
-#define OBJ_SIGMA  10.0     // texels at the reference geometry (240x135) = 80 px at 1080p, the coverage field's own scale
-#define OBJ_SIGMA_REF_W  240.0
-#define OBJ_SIGMA_REF_H  135.0
-
-vec4 hook() {
-    if (cf_hl > 0.5) return vec4(0.0);   // read only by the specular, which cf_hl skips
-    vec2 cs = CELFLARE_EMM_size;
-    vec2 dir = vec2(CELFLARE_EMM_pt.x, 0.0);
-    float sigma = OBJ_SIGMA * max(cs.x / OBJ_SIGMA_REF_W, cs.y / OBJ_SIGMA_REF_H);
-    int pairs = int(ceil(sigma));
-    float k = -0.5 / (sigma * sigma);
-    vec2 sum = CELFLARE_EMM_tex(CELFLARE_EMM_pos).gb;
-    float wsum = 1.0;
-    for (int i = 0; i < pairs; i++) {
-        float x1 = float(2 * i + 1);
-        float x2 = x1 + 1.0;
-        float w1 = exp(k * x1 * x1);
-        float w2 = exp(k * x2 * x2);
-        float w = w1 + w2;
-        float o = (w1 * x1 + w2 * x2) / w;
-        sum += (CELFLARE_EMM_tex(CELFLARE_EMM_pos + o * dir).gb + CELFLARE_EMM_tex(CELFLARE_EMM_pos - o * dir).gb) * w;
-        wsum += 2.0 * w;
-    }
-    return vec4(sum / wsum, 0.0, 1.0);
-}
-
-//!HOOK MAIN
-//!BIND CELFLARE_OBH
-//!BIND CELFLARE_EMIT
-//!SAVE CELFLARE_OBJ
-//!WIDTH CELFLARE_OBH.w
-//!HEIGHT CELFLARE_OBH.h
-//!DESC CelFlare: Object field blur V
-
-#define OBJ_SIGMA  10.0     // keep identical to the H pass
-#define OBJ_SIGMA_REF_W  240.0
-#define OBJ_SIGMA_REF_H  135.0
-
-vec4 hook() {
-    if (cf_hl > 0.5) return vec4(0.0);   // read only by the specular, which cf_hl skips
-    vec2 cs = CELFLARE_OBH_size;
-    vec2 dir = vec2(0.0, CELFLARE_OBH_pt.y);
-    float sigma = OBJ_SIGMA * max(cs.x / OBJ_SIGMA_REF_W, cs.y / OBJ_SIGMA_REF_H);
-    int pairs = int(ceil(sigma));
-    float k = -0.5 / (sigma * sigma);
-    vec2 sum = CELFLARE_OBH_tex(CELFLARE_OBH_pos).rg;
-    float wsum = 1.0;
-    for (int i = 0; i < pairs; i++) {
-        float x1 = float(2 * i + 1);
-        float x2 = x1 + 1.0;
-        float w1 = exp(k * x1 * x1);
-        float w2 = exp(k * x2 * x2);
-        float w = w1 + w2;
-        float o = (w1 * x1 + w2 * x2) / w;
-        sum += (CELFLARE_OBH_tex(CELFLARE_OBH_pos + o * dir).rg + CELFLARE_OBH_tex(CELFLARE_OBH_pos - o * dir).rg) * w;
-        wsum += 2.0 * w;
-    }
-    // .b carries the emitter field (same 1/8 size) so pass 9 needs one bind
-    // less (d3d11 constant-buffer slots).
-    return vec4(sum / wsum, CELFLARE_EMIT_tex(CELFLARE_OBH_pos).r, 1.0);
-}
-
-//!HOOK MAIN
-//!BIND CELFLARE_EMM
-//!SAVE CELFLARE_EMW0
-//!WIDTH CELFLARE_EMM.w 4 /
-//!HEIGHT CELFLARE_EMM.h 4 /
-//!DESC CelFlare: Wide emitter field 1/32
-
-vec4 hook() {
-    if (cf_hl > 0.5) return vec4(0.0);   // read only by the specular, which cf_hl skips
-    // 4 bilinear taps on texel corners = a 4x4 box of the 1/8 membership.
-    vec2 o = CELFLARE_EMM_pt;
-    float m = CELFLARE_EMM_tex(CELFLARE_EMM_pos + vec2(-o.x, -o.y)).r + CELFLARE_EMM_tex(CELFLARE_EMM_pos + vec2( o.x, -o.y)).r
-            + CELFLARE_EMM_tex(CELFLARE_EMM_pos + vec2(-o.x,  o.y)).r + CELFLARE_EMM_tex(CELFLARE_EMM_pos + vec2( o.x,  o.y)).r;
-    return vec4(m * 0.25, 0.0, 0.0, 1.0);
-}
-
-//!HOOK MAIN
-//!BIND CELFLARE_EMW0
-//!SAVE CELFLARE_EMWH
-//!WIDTH CELFLARE_EMW0.w
-//!HEIGHT CELFLARE_EMW0.h
-//!DESC CelFlare: Wide emitter field blur H
-
-#define EMW_SIGMA  7.5     // texels at the reference geometry (60x34) = 240 px at 1080p
-#define EMW_SIGMA_REF_W  60.0
-#define EMW_SIGMA_REF_H  33.75
-
-vec4 hook() {
-    if (cf_hl > 0.5) return vec4(0.0);   // read only by the specular, which cf_hl skips
-    vec2 cs = CELFLARE_EMW0_size;
-    vec2 dir = vec2(CELFLARE_EMW0_pt.x, 0.0);
-    float sigma = EMW_SIGMA * max(cs.x / EMW_SIGMA_REF_W, cs.y / EMW_SIGMA_REF_H);
-    int pairs = int(ceil(sigma));
-    float k = -0.5 / (sigma * sigma);
-    float sum = CELFLARE_EMW0_tex(CELFLARE_EMW0_pos).r;
-    float wsum = 1.0;
-    for (int i = 0; i < pairs; i++) {
-        float x1 = float(2 * i + 1);
-        float x2 = x1 + 1.0;
-        float w1 = exp(k * x1 * x1);
-        float w2 = exp(k * x2 * x2);
-        float w = w1 + w2;
-        float o = (w1 * x1 + w2 * x2) / w;
-        sum += (CELFLARE_EMW0_tex(CELFLARE_EMW0_pos + o * dir).r + CELFLARE_EMW0_tex(CELFLARE_EMW0_pos - o * dir).r) * w;
-        wsum += 2.0 * w;
-    }
-    return vec4(sum / wsum, 0.0, 0.0, 1.0);
-}
-
-//!HOOK MAIN
-//!BIND CELFLARE_EMWH
-//!SAVE CELFLARE_EMWIDE
-//!WIDTH CELFLARE_EMWH.w
-//!HEIGHT CELFLARE_EMWH.h
-//!DESC CelFlare: Wide emitter field blur V
-
-#define EMW_SIGMA  7.5     // keep identical to the H pass
-#define EMW_SIGMA_REF_W  60.0
-#define EMW_SIGMA_REF_H  33.75
-
-vec4 hook() {
-    if (cf_hl > 0.5) return vec4(0.0);   // read only by the specular, which cf_hl skips
-    vec2 cs = CELFLARE_EMWH_size;
-    vec2 dir = vec2(0.0, CELFLARE_EMWH_pt.y);
-    float sigma = EMW_SIGMA * max(cs.x / EMW_SIGMA_REF_W, cs.y / EMW_SIGMA_REF_H);
-    int pairs = int(ceil(sigma));
-    float k = -0.5 / (sigma * sigma);
-    float sum = CELFLARE_EMWH_tex(CELFLARE_EMWH_pos).r;
-    float wsum = 1.0;
-    for (int i = 0; i < pairs; i++) {
-        float x1 = float(2 * i + 1);
-        float x2 = x1 + 1.0;
-        float w1 = exp(k * x1 * x1);
-        float w2 = exp(k * x2 * x2);
-        float w = w1 + w2;
-        float o = (w1 * x1 + w2 * x2) / w;
-        sum += (CELFLARE_EMWH_tex(CELFLARE_EMWH_pos + o * dir).r + CELFLARE_EMWH_tex(CELFLARE_EMWH_pos - o * dir).r) * w;
-        wsum += 2.0 * w;
-    }
-    return vec4(sum / wsum, 0.0, 0.0, 1.0);
 }
 
 // =============================================================================
@@ -1905,9 +1568,6 @@ void hook() {
 // Specular detection (source brightness tiers, no illum field)
 #define HIGHLIGHT_THRESH    0.75    // Source highlight tier
 #define SPECULAR_THRESH     0.92    // Source specular tier
-// Top-band tier (soft, on V). Feeds only the broad achromatic top-field
-// rejection below; between HIGHLIGHT and SPECULAR so soft near-clip skies count.
-#define TOP_BAND_THRESH     0.85
 // Soft tier membership: 144 single-texel samples with hard compares make the
 // fractions jump in 1/144 steps on a pan, right through the shutoff bands
 // (scene-wide specular flicker). Each compare is a smoothstep over +-this.
@@ -1932,41 +1592,28 @@ void hook() {
 #define BRIGHT_SPEC_FRAC_MAX  0.10  // Recovery starts fading at 10% of cells > 0.97
 #define BRIGHT_SPEC_FRAC_CEIL 0.28  // Recovery fully off at 28% of cells > 0.97
 // It counts NEAR-WHITE cells only: with V counting, a large saturated surface
-// (a pink carpet, sat 0.40-0.88) would pose as "sparse chrome" and re-arm
-// the spec ramp on 4:2:0 chroma noise. Saturated emissives in the dark still
-// fire through the normal path.
+// (a pink carpet, sat 0.40-0.88) would pose as "sparse chrome" and arm
+// growth mode on 4:2:0 chroma noise. Saturated emissives in the dark still
+// count through the normal tier.
 #define BRIGHT_SPEC_SAT_MAX   0.30  // bright-spec tier counts only cells with sat below this
 
-// Broad achromatic top field: a grainy near-white shoulder can have a sparse
-// > 0.92 tail and no specular object, which the tier ratio reads as good
-// separation. When the top band is broad, nearly achromatic, the frame is
-// high-key and the shoulder spills densely into the spec tier, both the 0.92
-// route and the 0.97 recovery are rejected. Base expansion is untouched.
-#define SPEC_BROAD_TOP_LO          0.08  // spec routes start yielding at 8% top-band cover
-#define SPEC_BROAD_TOP_HI          0.12  // spec routes fully yield at 12% top-band cover
-#define SPEC_TOP_CHROMA_SAT_LO     0.05  // top-cell chroma membership begins here
-#define SPEC_TOP_CHROMA_SAT_HI     0.20  // top-cell chroma membership is full here
-#define SPEC_TOP_CHROMA_FRAC_LO    0.05  // below: top band is fully achromatic
-#define SPEC_TOP_CHROMA_FRAC_HI    0.20  // above: top band is chromatic enough to keep normal route
-#define SPEC_SHOULDER_FILL_LO       0.20  // spec/top density below: sparse glints, no rejection
-#define SPEC_SHOULDER_FILL_HI       0.40  // spec/top density above: grainy shoulder-tail evidence
-
 // Spec tiers count V = max(R,G,B), so a saturated primary (red LED: Y 0.21,
-// V 1.0) qualifies; neutrals are unchanged (V >= Y). Pass 8 only: pass 9 has
-// no per-pixel V spec driver. The scene gates are tuned against V counting.
+// V 1.0) qualifies; neutrals are unchanged (V >= Y). The tiers now feed only
+// growth mode (spec_vel), not a picture term of their own.
 #define ENABLE_SATURATED_SPEC 1
 
-// Scene diffuse-white anchor (cf_spec_anchor). The spec ramp qualifies by luma
-// alone, so painted whites (shirts, white hair, eye whites at 0.93-0.97 in
-// most productions) rode along whenever the frame gate opened, and stepped
-// with the framing. The anchor is the level of the BROAD near-white fields: a
+// Scene diffuse-white anchor, read by pass 9's top lift (the lift starts at
+// it). Painted whites (shirts, white hair, eye whites at 0.93-0.97 in most
+// productions) must not be lifted, in any framing. The anchor is the level of
+// the BROAD near-white fields: a
 // power mean (p 32, close to their maximum: a shaded white such as a cloud
 // must anchor at its lit top, or the top quarter of every cloud qualifies as
 // a highlight) of the source luma over sample cells that sit inside one
 // (bright coverage, see pass 2), valid from about two cells. It rises quickly (at once on a cut) and releases slowly,
 // so a close-up without white in frame keeps the scene's anchor; a black
 // frame releases it. SPEC_ANCHOR_NONE (below the ramp onset) means "no
-// diffuse white known": pass 9 then falls back to its spatial tests.
+// diffuse white known": pass 9 then measures the lift from its floor
+// (HL_W_MIN 0.90).
 #define SPEC_ANCHOR_NONE    0.88
 #define SPEC_ANCHOR_COV_LO  0.35
 #define SPEC_ANCHOR_COV_HI  0.60
@@ -2032,7 +1679,6 @@ void hook() {
 #define GROWTH_C_GATE_HIGH     0.25   // smoothstep saturation on contrast_vel
 #define GROWTH_FRAC_FLOOR_LOW  0.04   // smoothed_bright_frac required to activate
 #define GROWTH_FRAC_FLOOR_HIGH 0.10
-#define GROWTH_SHUTOFF_LIFT    0.6    // 0 = no spec_shutoff bypass during growth, 1 = full lift
 #define GROWTH_SPEC_CELLS_LO   1.0    // corroboration: growth needs multi-cell spec evidence
 #define GROWTH_SPEC_CELLS_HI   2.5    // (one glint on one sample point held spec_vel high
                                       // ~90 frames; a real fireball crosses 2-3 cells fast)
@@ -2596,8 +2242,6 @@ void hook() {
         uint  change_count      = 0u;
         uint  change_pos_count  = 0u;
         float bright_spec_sum   = 0.0;
-        float top_sum           = 0.0;
-        float top_chroma_sum    = 0.0;
         float illum_min         = 1.0;
         float illum_max         = 0.0;
         float illum_v_psum      = 0.0;
@@ -2688,12 +2332,6 @@ void hook() {
                                  ? smoothstep(BRIGHT_SPEC_THRESH - TIER_SOFT_HALFBAND,
                                               BRIGHT_SPEC_THRESH + TIER_SOFT_HALFBAND, ii)
                                  : 0.0;
-            float top_member    = smoothstep(TOP_BAND_THRESH - TIER_SOFT_HALFBAND,
-                                             TOP_BAND_THRESH + TIER_SOFT_HALFBAND, ii);
-            top_sum           += top_member;
-            top_chroma_sum    += top_member
-                               * smoothstep(SPEC_TOP_CHROMA_SAT_LO,
-                                            SPEC_TOP_CHROMA_SAT_HI, s_sat[i]);
         }
 
         const float N_SAMPLES = 144.0;
@@ -2702,7 +2340,6 @@ void hook() {
         float n_eff       = N_SAMPLES - float(n_bar);
         float avg_illum   = illum_sum / N_SAMPLES;
         float bright_frac = bright_sum / n_eff;
-        float top_frac    = top_sum / n_eff;
 
         // Contrast: dynamic range of the illumination field in stops. Floored
         // like contrast_v: a zero fallback read any frame with one near-black
@@ -2754,28 +2391,7 @@ void hook() {
         float bright_scene = smoothstep(BRIGHT_SCENE_LOW, BRIGHT_SCENE_HIGH,
                                         state_init ? log_avg : smoothed_log_avg);
 
-        // Broad achromatic top-field reject (see SPEC_BROAD_TOP): chroma is
-        // measured inside the top band only, and the reject needs a high-key
-        // frame AND a dense shoulder spill, so a white wall in a dark scene or
-        // snow with sparse glints does not veto other highlights. The current
-        // log_avg keys it, so a cut does not inherit the old key.
-        float top_chroma_frac = top_chroma_sum / max(top_sum, 1e-5);
-        float broad_top = smoothstep(SPEC_BROAD_TOP_LO, SPEC_BROAD_TOP_HI,
-                                     top_frac);
-        float achromatic_top = 1.0 - smoothstep(SPEC_TOP_CHROMA_FRAC_LO,
-                                                SPEC_TOP_CHROMA_FRAC_HI,
-                                                top_chroma_frac);
-        float high_key = smoothstep(BRIGHT_SCENE_LOW, BRIGHT_SCENE_HIGH, log_avg);
-        float shoulder_fill = spec_frac / max(top_frac, 1e-5);
-        float dense_shoulder = smoothstep(SPEC_SHOULDER_FILL_LO,
-                                          SPEC_SHOULDER_FILL_HI, shoulder_fill);
-        float broad_achro_reject = broad_top * achromatic_top
-                                 * high_key * dense_shoulder;
-        float scene_spec_keep = 1.0 - broad_achro_reject;
-
-        // Natural (pre-bypass) spec_raw feeds the velocity calc, so growth
-        // mode sees the unboosted signal. It EXCLUDES scene_spec_keep: the
-        // reject opening as a neutral field recedes is not specular growth.
+        // The spec signal feeds the velocity calc only (growth mode).
         float spec_normal_natural = spec_onset * spec_shutoff * tier_mode;
         float spec_raw_natural = mix(spec_normal_natural,
                                      max(spec_normal_natural, bs_raw), bright_scene);
@@ -2826,8 +2442,8 @@ void hook() {
 
         // ---- Velocity-driven adaptation ----
         // Signed velocities (value minus smoothed value). spec_vel uses the
-        // un-lifted smoothed_spec_natural; the growth-lifted smoothed_spec_signal
-        // would quench growth mode before long events finish.
+        // smoothed natural spec signal (a growth-lifted one would quench growth
+        // mode before long events finish).
         float bright_vel   = bright_frac - smoothed_bright_frac;
         float spec_vel     = spec_raw_natural - smoothed_spec_natural;
         float contrast_vel = contrast - smoothed_contrast;
@@ -2861,7 +2477,6 @@ void hook() {
         float growth_mode_instant = smoothstep(GROWTH_SIG_LOW, GROWTH_SIG_HIGH, growth_sig)
                                   * c_gate * frac_floor * growth_corrob;
 
-        // Growth mode updates first, so shutoff_eff reads the smoothed value.
         // Transient reset window: state init, the cut lockout (cut frame
         // included), a motion-history prime, a motion-cost reset, or an
         // additive/subtractive switch. ONE flag serves growth mode, the scalar
@@ -2877,14 +2492,6 @@ void hook() {
             ? (state_init ? 0.0 : smoothed_growth_mode * PUMP_RESET_DECAY)
             : mix(smoothed_growth_mode, growth_mode_instant, alpha);
 
-        float shutoff_eff = mix(spec_shutoff, 1.0,
-                                 GROWTH_SHUTOFF_LIFT * smoothed_growth_mode);
-        float spec_normal_flagship = spec_onset * shutoff_eff * tier_mode;
-        float spec_raw_flagship = mix(spec_normal_flagship,
-                                      max(spec_normal_flagship, bs_raw), bright_scene);
-        // The broad-achromatic reject applies after the growth lift, so
-        // neither recovery nor growth can resurrect a rejected field.
-        float spec_raw = spec_raw_flagship * scene_spec_keep;
 
         // ---- Light-pump band-pass (sudden sustained brightening) ----
         // Two EMAs of pnorm_illum_v; their difference is the drive. A transient
@@ -2983,16 +2590,11 @@ void hook() {
         s_bc_lb[0] = lb_left;  s_bc_lb[1] = lb_right;
         s_bc_lb[2] = lb_top;   s_bc_lb[3] = lb_bot;
 
-        // Scene EMAs; on init they snap (select form, FXC-safe). The applied
-        // spec gate uses its own SLOW alpha: during a pan vel_mag holds the
-        // base alpha at MID and the gate tracked zero-mean tier jitter
-        // (~+-20 % vs ~+-1 %). smoothed_spec_natural KEEPS the shared alpha:
-        // spec_vel is calibrated against it.
-        float alpha_spec = (scene_cut_lockout > 0.0) ? alpha : TEMPORAL_ALPHA_SLOW;
+        // Scene EMAs; on init they snap (select form, FXC-safe).
+        // smoothed_spec_natural keeps the shared alpha: spec_vel is calibrated
+        // against it.
         smoothed_bright_frac   = state_init ? bright_frac
                                : mix(smoothed_bright_frac, bright_frac, alpha);
-        smoothed_spec_signal   = state_init ? spec_raw
-                               : mix(smoothed_spec_signal, spec_raw, alpha_spec);
         smoothed_spec_natural  = state_init ? spec_raw_natural
                                : mix(smoothed_spec_natural, spec_raw_natural, alpha);
         smoothed_contrast      = state_init ? contrast
@@ -3009,7 +2611,7 @@ void hook() {
         // than with the hold off) and releases toward a darker key in the log
         // domain with time constant cf_key_hold seconds (24 fps assumed, like
         // every temporal constant here). Only pass 9's APL axis reads it; the
-        // spec detector and the velocities keep smoothed_log_avg. A black frame
+        // velocities keep smoothed_log_avg. A black frame
         // (fade through black, title card) releases it outright: that is a
         // scene boundary, and nothing is expanded on it. Select form
         // throughout (FXC-safe); own range test, since the state magic does
@@ -3529,292 +3131,10 @@ void hook() {
 }
 
 // =============================================================================
-// PASSES 8b-8e: SOFT RAMP FIELD (cf_spec_soft)
-// =============================================================================
-// The specular bonus was a function of the pixel's own luma alone, complete
-// between luma 0.90 and cf_spec_top, so on a soft highlight the whole climb
-// sat on a few pixels of the slope: a contour around a flat hot core (one
-// small cloud: source 0.88 -> 0.98 over 12 px, expansion x1.28 -> x2.06 over
-// the same 12 px).
-//   8b seed      per quarter-resolution texel: its ramp in the two forms
-//                pass 9 mixes (free with level top, anchored), with the
-//                scene's gamma and anchor (after pass 8, from the state
-//                buffer) and the texel's own saturation gate applied; a
-//                hard-edge flag (blue); its luma (alpha, the guide).
-//   8c-8e        three 5x5 passes, spacing 1, 2, 2 texels (at 2160 lines;
-//                scaled with the picture). The ramps are averaged, each tap
-//                weighted by a Gaussian in distance and by its luma's
-//                closeness to the centre's (0 at SSOFT_RANGE): one step
-//                cannot cross a luma edge, but three steps walk down a soft
-//                slope, where every step finds neighbours a little brighter
-//                and a little darker. The hard-edge flag is spread with
-//                the same fall-off: a maximum in 8c, a mean in 8d-8e.
-// The saturation gate is applied at the source and travels with the ramp:
-// applied at the receiving pixel it cut the bonus along the very slope this
-// is meant to soften (a cloud's foot turns blue as it darkens).
-// Hard-edge flag: luma cannot keep a white highlight's bonus off a flat
-// coloured fill of similar luma beside it (blonde hair fill at luma 0.95),
-// and a colour guide that can also blocks a cloud's own colour gradient
-// (saturation 0.05 -> 0.23 over 12 px, as much as fill against highlight).
-// What separates them is how fast the colour changes at full resolution: the
-// flag is the largest step (any channel) between picture samples 2 px apart
-// inside the texel, as a share of the colour range over 12 px there; only
-// bright samples count (line art is a luma edge, which the averaging does
-// not cross anyway). A straight slope 12 px long or longer gives 0.17 or
-// less whatever its height, a cel edge 0.6 or more. The first form used the
-// step's absolute size (0.05-0.08): a white cloud on a deep blue sky swings
-// 0.7 in red, so its soft edge sat right on that threshold and the softening
-// switched on and off along it in 4 px blocks (owner: "Pixellation in
-// clouds"). The flag is thickened by pass 8c (maximum) and smoothed by 8d-8e
-// (mean), so pass 9's switch has no block structure left. Pass 9 leaves the
-// pixel's own ramp alone wherever the spread flag is set.
-// CELFLARE_STATS is bound as the data dependency on pass 8, as in pass 9.
-// The ramp math must stay identical to pass 9's (separate translation units).
-
-//!HOOK MAIN
-//!BIND HOOKED
-//!BIND CELFLARE_DS
-//!BIND CELFLARE_ADD_STATE
-//!BIND CELFLARE_STATS
-//!SAVE CELFLARE_SS0
-//!WIDTH CELFLARE_DS.w
-//!HEIGHT CELFLARE_DS.h
-//!COMPUTE 16 16
-//!DESC CelFlare: Soft ramp seed
-
-#define APL_KEY_DARK        0.03    // keep equal to pass 9
-#define APL_KEY_BRIGHT      0.30    // keep equal to pass 9
-#define SPEC_Y_LOW          0.90    // keep equal to pass 9
-#define SPEC_GAMMA_DARK     1.3     // keep equal to pass 9
-#define SPEC_GAMMA_BRIGHT   1.1     // keep equal to pass 9
-#define SPEC_RAMP_CEIL      1.10    // keep equal to pass 9
-#define SPEC_ANCHOR_MARGIN   0.005   // keep equal to pass 9
-#define SPEC_ANCHOR_MIN_SPAN 1.0     // keep equal to pass 9
-#define SPEC_TOP_STEEP_MAX   1.5     // keep equal to pass 9
-#define SPEC_SAT_LOW          0.05  // keep equal to pass 9
-#define SPEC_SAT_HIGH         0.25  // keep equal to pass 9
-#define SPEC_SAT_ATTEN_DARK   0.20  // keep equal to pass 9
-#define SPEC_SAT_ATTEN_BRIGHT 0.80  // keep equal to pass 9
-#define SSOFT_HARD_STEP     2.0     // sample spacing for the hard-edge flag, px at 2160 lines
-#define SSOFT_HARD_FAR      6.0     // distance of the four outer samples, px at 2160 lines (the range is taken over 12 px)
-#define SSOFT_HARD_LO       0.40    // share of the local colour range that one 2 px step covers where an edge starts to count as hard
-#define SSOFT_HARD_HI       0.60    // ... and fully counts (a straight 12 px slope gives 0.17, a 3 px cel edge 0.6 or more)
-#define SSOFT_HARD_FLOOR    0.14    // least range the share is taken of: below it a step must reach 0.05-0.08 by itself (grain on a flat does not count)
-#define SSOFT_HARD_Y_LO     0.70    // the darker side must be this bright to count (fades in)
-#define SSOFT_HARD_Y_HI     0.78
-
-float ssoft_step(vec3 a, vec3 b) {
-    const vec3 lw = vec3(0.2126, 0.7152, 0.0722);
-    vec3 d = abs(a - b);
-    return max(max(d.r, d.g), d.b)
-         * smoothstep(SSOFT_HARD_Y_LO, SSOFT_HARD_Y_HI, min(dot(a, lw), dot(b, lw)));
-}
-
-// A sample for the range: itself where bright, the centre where dark.
-vec3 ssoft_bright(vec3 a, vec3 c) {
-    return mix(c, a, smoothstep(SSOFT_HARD_Y_LO, SSOFT_HARD_Y_HI, dot(a, vec3(0.2126, 0.7152, 0.0722))));
-}
-
-void hook() {
-    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = ivec2(CELFLARE_DS_size);
-    if (p.x >= sz.x || p.y >= sz.y) return;
-    // Slider off: pass 9 never reads the field.
-    if (cf_spec_soft <= 0.0 || cf_hl > 0.5) { imageStore(out_image, p, vec4(0.0)); return; }
-    vec2 uv = (vec2(p) + 0.5) * CELFLARE_DS_pt;
-    vec3 c = CELFLARE_DS_tex(uv).rgb;
-    float y = dot(c, vec3(0.2126, 0.7152, 0.0722));
-    float sat = max(max(c.r, c.g), c.b) - min(min(c.r, c.g), c.b);
-    float key = (cf_key_hold > 0.0) ? held_log_avg : smoothed_log_avg;
-    float apl_t = smoothstep(APL_KEY_DARK, APL_KEY_BRIGHT, key);
-    float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, apl_t);
-    float r = pow(smoothstep(SPEC_Y_LOW, 1.0, y), spec_gamma);
-    float r0 = pow(smoothstep(SPEC_Y_LOW, 1.0, spec_anchor_held + SPEC_ANCHOR_MARGIN), spec_gamma);
-    float ramp_anc = clamp((r - r0) / max(1.0 - r0, SPEC_ANCHOR_MIN_SPAN), 0.0, SPEC_RAMP_CEIL);
-    float ramp_free = r;
-    if (cf_spec_top < 1.0) {
-        float top_r = max(pow(smoothstep(SPEC_Y_LOW, 1.0, cf_spec_top), spec_gamma), 0.05);
-        float top_k = 1.0 - smoothstep(0.985, 1.0, cf_spec_top);
-        float uf = min(r / top_r, 1.0);
-        ramp_free = uf + top_k * uf * (1.0 - uf);
-        float a_span = max(1.0 - r0, SPEC_ANCHOR_MIN_SPAN);
-        float a_peak = (1.0 - r0) / a_span;
-        float a_lvl  = clamp((top_r - r0) / a_span, a_peak / SPEC_TOP_STEEP_MAX, a_peak);
-        float ua = clamp(ramp_anc / max(a_lvl, 1e-4), 0.0, 1.0);
-        float a_lev = a_peak * ua * ua * (3.0 - 2.0 * ua) + max(ramp_anc - a_peak, 0.0);
-        ramp_anc = mix(ramp_anc, a_lev, top_k);
-    }
-    // Without the anchor mode pass 9 uses the raw ramp.
-    if (cf_spec_anchor < 0.5) ramp_free = r;
-    // The texel's own saturation gate rides along.
-    float gate = 1.0 - smoothstep(SPEC_SAT_LOW, SPEC_SAT_HIGH, sat)
-                     * mix(SPEC_SAT_ATTEN_DARK, SPEC_SAT_ATTEN_BRIGHT, apl_t);
-    // Hard-edge flag: 3x3 picture samples around the texel centre (each the
-    // mean of 2x2 px there), the largest step between neighbours ...
-    vec2 hs = SSOFT_HARD_STEP * max(HOOKED_size.x * (1.0 / 3840.0), HOOKED_size.y * (1.0 / 2160.0))
-            * HOOKED_pt;
-    vec3 g00 = HOOKED_tex(uv + vec2(-hs.x, -hs.y)).rgb;
-    vec3 g10 = HOOKED_tex(uv + vec2(  0.0, -hs.y)).rgb;
-    vec3 g20 = HOOKED_tex(uv + vec2( hs.x, -hs.y)).rgb;
-    vec3 g01 = HOOKED_tex(uv + vec2(-hs.x,   0.0)).rgb;
-    vec3 g11 = HOOKED_tex(uv).rgb;
-    vec3 g21 = HOOKED_tex(uv + vec2( hs.x,   0.0)).rgb;
-    vec3 g02 = HOOKED_tex(uv + vec2(-hs.x,  hs.y)).rgb;
-    vec3 g12 = HOOKED_tex(uv + vec2(  0.0,  hs.y)).rgb;
-    vec3 g22 = HOOKED_tex(uv + vec2( hs.x,  hs.y)).rgb;
-    float hd = max(max(max(ssoft_step(g00, g10), ssoft_step(g10, g20)),
-                       max(ssoft_step(g01, g11), ssoft_step(g11, g21))),
-                   max(max(ssoft_step(g02, g12), ssoft_step(g12, g22)),
-                       max(ssoft_step(g00, g01), ssoft_step(g01, g02))));
-    hd = max(hd, max(max(ssoft_step(g10, g11), ssoft_step(g11, g12)),
-                     max(ssoft_step(g20, g21), ssoft_step(g21, g22))));
-    // ... against the colour range of the bright samples over 12 px (the 3x3
-    // and four outer ones; a dark sample counts as the centre, so line art
-    // beside the texel does not widen the range).
-    vec2 hf = SSOFT_HARD_FAR * max(HOOKED_size.x * (1.0 / 3840.0), HOOKED_size.y * (1.0 / 2160.0))
-            * HOOKED_pt;
-    vec3 f0 = ssoft_bright(HOOKED_tex(uv + vec2(-hf.x, 0.0)).rgb, g11);
-    vec3 f1 = ssoft_bright(HOOKED_tex(uv + vec2( hf.x, 0.0)).rgb, g11);
-    vec3 f2 = ssoft_bright(HOOKED_tex(uv + vec2(0.0, -hf.y)).rgb, g11);
-    vec3 f3 = ssoft_bright(HOOKED_tex(uv + vec2(0.0,  hf.y)).rgb, g11);
-    vec3 b00 = ssoft_bright(g00, g11), b10 = ssoft_bright(g10, g11), b20 = ssoft_bright(g20, g11);
-    vec3 b01 = ssoft_bright(g01, g11), b21 = ssoft_bright(g21, g11);
-    vec3 b02 = ssoft_bright(g02, g11), b12 = ssoft_bright(g12, g11), b22 = ssoft_bright(g22, g11);
-    vec3 lo3 = min(min(min(b00, b10), min(b20, b01)), min(min(g11, b21), min(b02, b12)));
-    vec3 hi3 = max(max(max(b00, b10), max(b20, b01)), max(max(g11, b21), max(b02, b12)));
-    lo3 = min(min(lo3, b22), min(min(f0, f1), min(f2, f3)));
-    hi3 = max(max(hi3, b22), max(max(f0, f1), max(f2, f3)));
-    vec3 rg3 = hi3 - lo3;
-    float rng = max(max(rg3.r, rg3.g), rg3.b);
-    float hard = smoothstep(SSOFT_HARD_LO, SSOFT_HARD_HI, hd / max(rng, SSOFT_HARD_FLOOR));
-    imageStore(out_image, p, vec4(ramp_free * gate, ramp_anc * gate, hard, y));
-}
-
-//!HOOK MAIN
-//!BIND CELFLARE_SS0
-//!SAVE CELFLARE_SS1
-//!WIDTH CELFLARE_SS0.w
-//!HEIGHT CELFLARE_SS0.h
-//!DESC CelFlare: Soft ramp field 1
-
-#define SSOFT_RANGE   0.12     // luma distance at which a neighbour stops counting (keep equal in 8c-8e)
-#define SSOFT_STRIDE  1.0      // tap spacing, texels at the reference geometry (960x540)
-#define SSOFT_REF_W   960.0
-#define SSOFT_REF_H   540.0
-#define SSOFT_FLAG_MAX 1.0      // hard-edge flag: 1 = spread as a maximum (thickens a thin edge), 0 = averaged (smooths it)
-
-vec4 hook() {
-    if (cf_spec_soft <= 0.0 || cf_hl > 0.5) return vec4(0.0);      // slider off: nothing reads this
-    vec2 cs = CELFLARE_SS0_size;
-    vec2 st = SSOFT_STRIDE * max(cs.x / SSOFT_REF_W, cs.y / SSOFT_REF_H) * CELFLARE_SS0_pt;
-    float yc = CELFLARE_SS0_tex(CELFLARE_SS0_pos).a;
-    vec2 acc = vec2(0.0);
-    float ws = 0.0;
-    float hard = 0.0;
-    float hsum = 0.0;
-    float gsum = 0.0;
-    for (int j = -2; j <= 2; j++) {
-        for (int i = -2; i <= 2; i++) {
-            vec4 t = CELFLARE_SS0_tex(CELFLARE_SS0_pos + vec2(float(i), float(j)) * st);
-            float g = exp(-float(i * i + j * j) * (1.0 / 4.5));
-            float d = (t.a - yc) * (1.0 / SSOFT_RANGE);
-            float w = max(1.0 - d * d, 0.0);
-            w *= w * g;
-            acc += t.rg * w;
-            ws += w;
-            hard = max(hard, t.b * g);
-            hsum += t.b * g;
-            gsum += g;
-        }
-    }
-    return vec4(acc / ws, mix(hsum / gsum, hard, SSOFT_FLAG_MAX), yc);
-}
-
-//!HOOK MAIN
-//!BIND CELFLARE_SS1
-//!SAVE CELFLARE_SS2
-//!WIDTH CELFLARE_SS1.w
-//!HEIGHT CELFLARE_SS1.h
-//!DESC CelFlare: Soft ramp field 2
-
-#define SSOFT_RANGE   0.12     // luma distance at which a neighbour stops counting (keep equal in 8c-8e)
-#define SSOFT_STRIDE  2.0      // tap spacing, texels at the reference geometry (960x540)
-#define SSOFT_REF_W   960.0
-#define SSOFT_REF_H   540.0
-#define SSOFT_FLAG_MAX 0.0      // hard-edge flag: 1 = spread as a maximum (thickens a thin edge), 0 = averaged (smooths it)
-
-vec4 hook() {
-    if (cf_spec_soft <= 0.0 || cf_hl > 0.5) return vec4(0.0);      // slider off: nothing reads this
-    vec2 cs = CELFLARE_SS1_size;
-    vec2 st = SSOFT_STRIDE * max(cs.x / SSOFT_REF_W, cs.y / SSOFT_REF_H) * CELFLARE_SS1_pt;
-    float yc = CELFLARE_SS1_tex(CELFLARE_SS1_pos).a;
-    vec2 acc = vec2(0.0);
-    float ws = 0.0;
-    float hard = 0.0;
-    float hsum = 0.0;
-    float gsum = 0.0;
-    for (int j = -2; j <= 2; j++) {
-        for (int i = -2; i <= 2; i++) {
-            vec4 t = CELFLARE_SS1_tex(CELFLARE_SS1_pos + vec2(float(i), float(j)) * st);
-            float g = exp(-float(i * i + j * j) * (1.0 / 4.5));
-            float d = (t.a - yc) * (1.0 / SSOFT_RANGE);
-            float w = max(1.0 - d * d, 0.0);
-            w *= w * g;
-            acc += t.rg * w;
-            ws += w;
-            hard = max(hard, t.b * g);
-            hsum += t.b * g;
-            gsum += g;
-        }
-    }
-    return vec4(acc / ws, mix(hsum / gsum, hard, SSOFT_FLAG_MAX), yc);
-}
-
-//!HOOK MAIN
-//!BIND CELFLARE_SS2
-//!SAVE CELFLARE_SOFT
-//!WIDTH CELFLARE_SS2.w
-//!HEIGHT CELFLARE_SS2.h
-//!DESC CelFlare: Soft ramp field 3
-
-#define SSOFT_RANGE   0.12     // luma distance at which a neighbour stops counting (keep equal in 8c-8e)
-#define SSOFT_STRIDE  2.0      // tap spacing, texels at the reference geometry (960x540)
-#define SSOFT_REF_W   960.0
-#define SSOFT_REF_H   540.0
-#define SSOFT_FLAG_MAX 0.0      // hard-edge flag: 1 = spread as a maximum (thickens a thin edge), 0 = averaged (smooths it)
-
-vec4 hook() {
-    if (cf_spec_soft <= 0.0 || cf_hl > 0.5) return vec4(0.0);      // slider off: nothing reads this
-    vec2 cs = CELFLARE_SS2_size;
-    vec2 st = SSOFT_STRIDE * max(cs.x / SSOFT_REF_W, cs.y / SSOFT_REF_H) * CELFLARE_SS2_pt;
-    float yc = CELFLARE_SS2_tex(CELFLARE_SS2_pos).a;
-    vec2 acc = vec2(0.0);
-    float ws = 0.0;
-    float hard = 0.0;
-    float hsum = 0.0;
-    float gsum = 0.0;
-    for (int j = -2; j <= 2; j++) {
-        for (int i = -2; i <= 2; i++) {
-            vec4 t = CELFLARE_SS2_tex(CELFLARE_SS2_pos + vec2(float(i), float(j)) * st);
-            float g = exp(-float(i * i + j * j) * (1.0 / 4.5));
-            float d = (t.a - yc) * (1.0 / SSOFT_RANGE);
-            float w = max(1.0 - d * d, 0.0);
-            w *= w * g;
-            acc += t.rg * w;
-            ws += w;
-            hard = max(hard, t.b * g);
-            hsum += t.b * g;
-            gsum += g;
-        }
-    }
-    return vec4(acc / ws, mix(hsum / gsum, hard, SSOFT_FLAG_MAX), yc);
-}
-
-// =============================================================================
 // PASS 9: EXPANSION APPLY (full resolution)
 // =============================================================================
-// The expansion is a monotone curve of the pixel's own grain-stabilized
-// luma; the illumination field (the sigma-80 regional brightness, a
+// The expansion is a monotone curve of the smooth highlight base of the
+// pixel's luma; the illumination field (the sigma-80 regional brightness, a
 // symmetric Gaussian) sets the curve's SHAPE, so a region shares one curve.
 // Tonal order is kept; local contrast is scaled by the curve's slope. Scene
 // adaptation is continuous (bright fraction, contrast, log-average key).
@@ -3823,27 +3143,190 @@ vec4 hook() {
 // pass ordering on every backend.
 
 //!HOOK MAIN
+//!BIND CELFLARE_DS
+//!BIND CELFLARE_ILLUM
+//!SAVE CELFLARE_OB0
+//!WIDTH CELFLARE_DS.w CELFLARE_DS.h / 68 *
+//!HEIGHT 68
+//!DESC CelFlare: Highlight size seed
+
+// HIGHLIGHT SIZE (these passes run after pass 8, on a grid of 68 rows whatever
+// the picture size: cells of 16 px at 1080p). The top lift is meant for compact
+// highlights: glints, lamps, small reflections. A broad near-white field (a
+// cloud bank, a painted band, a white garment, a soft glare over a screen)
+// given the same steep lift magnified its texture and compression mottle and
+// drew a cliff in its soft gradients. The bright coverage around a pixel
+// (CELFLARE_ILLUM.a) is 0.5 or less on the border of any white object however
+// large, so one object would get more lift along its border than inside.
+// These passes give every cell of one white object the largest coverage found
+// in that object: each pass takes the maximum over the cell and its 8
+// neighbours, and a cell passes its value on only in proportion to how much
+// near-white it holds (OBJ_M_LO to OBJ_M_HI of its area). A cell with almost
+// no near-white passes nothing on, so a glint beside a cloud keeps its own
+// small reading once the gap between them holds such a cell (16 to 32 px at
+// 1080p, depending on where the grid falls); a glint touching the cloud is
+// part of it. 6 passes reach about 96 px at 1080p along the axes, more
+// diagonally: enough to carry an object's centre to its border while the
+// border itself still reads below HL_SIZE_HI (larger objects read above it
+// everywhere). Pass 9 fades the lift out between HL_SIZE_LO and HL_SIZE_HI of
+// the result. The seed's 16 taps cover a cell fully up to 4K pictures.
+#define OBJ_ROWS  68.0
+#define OBJ_M_LO  0.02
+#define OBJ_M_HI  0.10
+
+vec4 hook() {
+    // near-white share of the cell: 4x4 bilinear taps spread over its area
+    vec2 cell = (CELFLARE_DS_size.y / OBJ_ROWS) * CELFLARE_DS_pt;
+    float m = 0.0;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2(-0.375, -0.375)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2(-0.125, -0.375)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2( 0.125, -0.375)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2( 0.375, -0.375)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2(-0.375, -0.125)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2(-0.125, -0.125)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2( 0.125, -0.125)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2( 0.375, -0.125)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2(-0.375,  0.125)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2(-0.125,  0.125)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2( 0.125,  0.125)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2( 0.375,  0.125)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2(-0.375,  0.375)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2(-0.125,  0.375)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2( 0.125,  0.375)).a;
+    m += CELFLARE_DS_tex(CELFLARE_DS_pos + cell * vec2( 0.375,  0.375)).a;
+    m *= 0.0625;
+    float cov = CELFLARE_ILLUM_tex(CELFLARE_ILLUM_pos).a;
+    // r: the cell's value so far, g: how much of it the cell passes on, b: its own coverage
+    return vec4(cov, smoothstep(OBJ_M_LO, OBJ_M_HI, m), cov, 1.0);
+}
+
+//!HOOK MAIN
+//!BIND CELFLARE_OB0
+//!SAVE CELFLARE_OB1
+//!WIDTH CELFLARE_OB0.w
+//!HEIGHT CELFLARE_OB0.h
+//!DESC CelFlare: Highlight size spread 1
+
+#define OBJ_NB(dx, dy) { vec4 n = CELFLARE_OB0_tex(CELFLARE_OB0_pos + vec2(dx, dy) * CELFLARE_OB0_pt); u = max(u, n.g * n.r); }
+
+vec4 hook() {
+    vec4 s = CELFLARE_OB0_tex(CELFLARE_OB0_pos);
+    float u = s.b;
+    OBJ_NB(-1.0, -1.0) OBJ_NB(0.0, -1.0) OBJ_NB(1.0, -1.0)
+    OBJ_NB(-1.0,  0.0) OBJ_NB(0.0,  0.0) OBJ_NB(1.0,  0.0)
+    OBJ_NB(-1.0,  1.0) OBJ_NB(0.0,  1.0) OBJ_NB(1.0,  1.0)
+    return vec4(u, s.g, s.b, 1.0);
+}
+
+//!HOOK MAIN
+//!BIND CELFLARE_OB1
+//!SAVE CELFLARE_OB2
+//!WIDTH CELFLARE_OB1.w
+//!HEIGHT CELFLARE_OB1.h
+//!DESC CelFlare: Highlight size spread 2
+
+#define OBJ_NB(dx, dy) { vec4 n = CELFLARE_OB1_tex(CELFLARE_OB1_pos + vec2(dx, dy) * CELFLARE_OB1_pt); u = max(u, n.g * n.r); }
+
+vec4 hook() {
+    vec4 s = CELFLARE_OB1_tex(CELFLARE_OB1_pos);
+    float u = s.b;
+    OBJ_NB(-1.0, -1.0) OBJ_NB(0.0, -1.0) OBJ_NB(1.0, -1.0)
+    OBJ_NB(-1.0,  0.0) OBJ_NB(0.0,  0.0) OBJ_NB(1.0,  0.0)
+    OBJ_NB(-1.0,  1.0) OBJ_NB(0.0,  1.0) OBJ_NB(1.0,  1.0)
+    return vec4(u, s.g, s.b, 1.0);
+}
+
+//!HOOK MAIN
+//!BIND CELFLARE_OB2
+//!SAVE CELFLARE_OB3
+//!WIDTH CELFLARE_OB2.w
+//!HEIGHT CELFLARE_OB2.h
+//!DESC CelFlare: Highlight size spread 3
+
+#define OBJ_NB(dx, dy) { vec4 n = CELFLARE_OB2_tex(CELFLARE_OB2_pos + vec2(dx, dy) * CELFLARE_OB2_pt); u = max(u, n.g * n.r); }
+
+vec4 hook() {
+    vec4 s = CELFLARE_OB2_tex(CELFLARE_OB2_pos);
+    float u = s.b;
+    OBJ_NB(-1.0, -1.0) OBJ_NB(0.0, -1.0) OBJ_NB(1.0, -1.0)
+    OBJ_NB(-1.0,  0.0) OBJ_NB(0.0,  0.0) OBJ_NB(1.0,  0.0)
+    OBJ_NB(-1.0,  1.0) OBJ_NB(0.0,  1.0) OBJ_NB(1.0,  1.0)
+    return vec4(u, s.g, s.b, 1.0);
+}
+
+//!HOOK MAIN
+//!BIND CELFLARE_OB3
+//!SAVE CELFLARE_OB4
+//!WIDTH CELFLARE_OB3.w
+//!HEIGHT CELFLARE_OB3.h
+//!DESC CelFlare: Highlight size spread 4
+
+#define OBJ_NB(dx, dy) { vec4 n = CELFLARE_OB3_tex(CELFLARE_OB3_pos + vec2(dx, dy) * CELFLARE_OB3_pt); u = max(u, n.g * n.r); }
+
+vec4 hook() {
+    vec4 s = CELFLARE_OB3_tex(CELFLARE_OB3_pos);
+    float u = s.b;
+    OBJ_NB(-1.0, -1.0) OBJ_NB(0.0, -1.0) OBJ_NB(1.0, -1.0)
+    OBJ_NB(-1.0,  0.0) OBJ_NB(0.0,  0.0) OBJ_NB(1.0,  0.0)
+    OBJ_NB(-1.0,  1.0) OBJ_NB(0.0,  1.0) OBJ_NB(1.0,  1.0)
+    return vec4(u, s.g, s.b, 1.0);
+}
+
+//!HOOK MAIN
+//!BIND CELFLARE_OB4
+//!SAVE CELFLARE_OB5
+//!WIDTH CELFLARE_OB4.w
+//!HEIGHT CELFLARE_OB4.h
+//!DESC CelFlare: Highlight size spread 5
+
+#define OBJ_NB(dx, dy) { vec4 n = CELFLARE_OB4_tex(CELFLARE_OB4_pos + vec2(dx, dy) * CELFLARE_OB4_pt); u = max(u, n.g * n.r); }
+
+vec4 hook() {
+    vec4 s = CELFLARE_OB4_tex(CELFLARE_OB4_pos);
+    float u = s.b;
+    OBJ_NB(-1.0, -1.0) OBJ_NB(0.0, -1.0) OBJ_NB(1.0, -1.0)
+    OBJ_NB(-1.0,  0.0) OBJ_NB(0.0,  0.0) OBJ_NB(1.0,  0.0)
+    OBJ_NB(-1.0,  1.0) OBJ_NB(0.0,  1.0) OBJ_NB(1.0,  1.0)
+    return vec4(u, s.g, s.b, 1.0);
+}
+
+//!HOOK MAIN
+//!BIND CELFLARE_OB5
+//!SAVE CELFLARE_OBJ
+//!WIDTH CELFLARE_OB5.w
+//!HEIGHT CELFLARE_OB5.h
+//!DESC CelFlare: Highlight size spread 6
+
+#define OBJ_NB(dx, dy) { vec4 n = CELFLARE_OB5_tex(CELFLARE_OB5_pos + vec2(dx, dy) * CELFLARE_OB5_pt); u = max(u, n.g * n.r); }
+
+vec4 hook() {
+    vec4 s = CELFLARE_OB5_tex(CELFLARE_OB5_pos);
+    float u = s.b;
+    OBJ_NB(-1.0, -1.0) OBJ_NB(0.0, -1.0) OBJ_NB(1.0, -1.0)
+    OBJ_NB(-1.0,  0.0) OBJ_NB(0.0,  0.0) OBJ_NB(1.0,  0.0)
+    OBJ_NB(-1.0,  1.0) OBJ_NB(0.0,  1.0) OBJ_NB(1.0,  1.0)
+    return vec4(s.g * u, s.g, s.b, 1.0);
+}
+
+//!HOOK MAIN
 //!BIND HOOKED
 //!BIND CELFLARE_ADD_STATE
 //!BIND CELFLARE_STATS
 //!BIND CELFLARE_ILLUM
 //!BIND MOTION_FLOW
-//!BIND CELFLARE_DS
 //!BIND CELFLARE_SKSM
-//!BIND CELFLARE_OBJ
 //!BIND CELFLARE_SKF
-//!BIND CELFLARE_EMWIDE
-//!BIND CELFLARE_SOFT
 //!BIND CELFLARE_GF
+//!BIND CELFLARE_OBJ
 //!COMPUTE 16 16
-//!DESC CelFlare v6.0 (motion-aware additive A2 + texture-evened spec)
+//!DESC CelFlare v7.0 (motion-aware additive A2 + gradient-preserving highlights)
 
 // =============================================
 //  MAIN TUNING — deep anchors. The supported user surface is the cf_* block
 //  at the top of the file; those knobs scale the values below (neutral at 1).
 // =============================================
 #define INTENSITY       cf_strength  // Global scaling knob (top of file). Also scales
-                                     // spec + pump at their apply sites, so 0 = SDR.
+                                     // the top lift + pump at their apply sites, so 0 = SDR.
 #define KNEE            0.30    // Expansion onset — midtones below this stay near SDR
 
 
@@ -3855,7 +3338,7 @@ vec4 hook() {
 // gradients kept), dark regions steep ones (pop). With gamma >= 1 the
 // derivative only increases: no inflection in the face range. The APL and
 // dynamic-intensity terms are gentle (~10 %) scene adjustments on top.
-// Nits at cf_ref_white 116, cf_strength 1, cf_curve 1, cf_shoulder 0, curve
+// Nits at cf_ref_white 116, cf_strength 1, cf_curve 1, curve
 // only: peak (Y 1.00) ~278-313, highlights (Y 0.90-0.95) 180-250, reference
 // white (Y 0.85) 145-155, midtones (Y <= 0.50) near SDR.
 #define PEAK_BRIGHT     2.4     // Expansion peak for bright regions (~278 nits pre-APL)
@@ -3948,7 +3431,7 @@ vec4 hook() {
 // =============================================
 // Pass 8 publishes the per-cell mask pump_mask_cell (16x9, bilinear-sampled
 // here), the cover gate and the scalar pump_env (see its SPATIAL MODEL). The
-// pump multiplies the finished expansion (base, APL, spec) by a
+// pump multiplies the finished expansion (base, APL, top lift) by a
 // brightness-weighted gain on the rising EDGE of an event; the growth bypass
 // instead REMOVES dampening on a sustained object. A fireball triggers
 // both, so the pump is down-gated by growth mode.
@@ -3973,236 +3456,10 @@ vec4 hook() {
 // at PUMP_CELL_DRIVE_HIGH (0.15) per cell vs the scalar's 0.20, so moderate
 // events run a little hotter (that pass-8 knob is the amplitude lever).
 #define SPATIAL_PUMP_ADDITIVE cf_additive_pump
-// =============================================
-//  SPECULAR BONUS — scene-detected, per-pixel bloom
-// =============================================
-// Pass 8 counts cells in the highlight (> 0.75) and specular (> 0.92) tiers;
-// the signal fires when specular is present but rarer than highlight. Here a
-// per-pixel ramp picks the pixels; the scene key sets peak and gamma (a
-// per-pixel Y_illum term drew edge halos). Added after APL and dynamic
-// intensity, so those dampeners do not touch it.
-// NO V DRIVER ON THIS RAMP: in a saturated region the peak channel clips
-// before luma, so a V driver feeds a flat ~1.0 across a core that still has
-// luma gradient and the spec add compresses it (rule 1). It was rejected
-// twice in the field.
+
 // Cross-pass rules: each HOOK block is a SEPARATE compilation unit (a define
 // used in two passes must exist in both), and an undefined identifier in an
 // #if silently evaluates to 0.
-#define SPEC_Y_LOW          0.90    // ramp onset: only genuinely near-clip pixels (cel-flat faces
-                                    // and signs below 0.90 never enter); the spec still builds
-                                    // as a gradient into the clipped core.
-#define SPEC_PEAK_DARK      1.2     // Specular boost in dark scenes (highlight pop)
-#define SPEC_PEAK_BRIGHT    0.7     // Specular boost in bright scenes (modest: eye whites
-                                    // and hair highlights kept perceptually cool)
-#define SPEC_GAMMA_DARK     1.3     // Gentler concentration in dark scenes (broader ramp)
-#define SPEC_GAMMA_BRIGHT   1.1     // Near-linear phase-in in bright scenes
-// Saturation gate: genuine specular is near-white. Dark scenes keep
-// saturated emissives (red LEDs, lasers); bright scenes suppress hard ("bright
-// + colored" in daylight is almost always a surface).
-#define SPEC_SAT_LOW          0.05  // Below: near-white → no attenuation
-#define SPEC_SAT_HIGH         0.25  // Above: colored surface → full attenuation
-#define SPEC_SAT_ATTEN_DARK   0.20  // Dark scenes: gentle (red LEDs lose only 20%)
-#define SPEC_SAT_ATTEN_BRIGHT 0.80  // Bright scenes: strong (colored objects suppressed)
-// No emissive carve-out: even a 0.98-1.00 V gate put the steepest derivative
-// across the codec ceiling (WEB blocking modulated rejection by tens of
-// nits). Y alone owns spec amplitude.
-// Super-white bonus: upscaler Y > 1.0 is taken as clip evidence (~+2 % peak
-// at Y 1.2), capped by SPEC_RAMP_CEIL.
-#define SPEC_OVERSHOOT_GAIN 0.3
-#define SPEC_RAMP_CEIL      1.10    // Hard cap on ramp; safety against extreme overshoot
-// Highlight qualification (cf_spec_anchor; pass 8 holds the anchor). With an
-// anchor the ramp is re-based just above the scene's diffuse white, so painted
-// whites get nothing in any framing and only what is brighter lifts; things
-// above it that are broad (a soft sheen over a whole head) keep
-// SPEC_ANCHOR_BROAD of it. Without one (none known, or it sits at clip, where
-// level cannot tell a glint from paint) the spatial tests decide: COMPACT =
-// the white object the pixel belongs to is small (a glint, a thin tube, a
-// lamp), or an EMITTER core = near-white with saturated full-value colour
-// around it (the glow of a tube, beam or flame), unless the object is broad
-// or that colour is a field, not a glow. Size tests depend on framing (the
-// same tube drops out in a close-up), which is why the anchor leads when it
-// exists.
-// Both tests judge the OBJECT (see passes 4g-4k). Read at the pixel, the
-// coverage is 0.5 or less on the border of any white object and the glow only
-// reaches a little way in, so a large cloud beside a saturated sky got a
-// bright rim just inside its edge (x1.16 on white that is flat in the source).
-#define SPEC_ANCHOR_NONE     0.88    // keep equal to pass 8
-#define SPEC_ANCHOR_MARGIN   0.005
-#define SPEC_ANCHOR_CLIP_LO  0.975
-#define SPEC_ANCHOR_CLIP_HI  0.990
-// Broader and tapered (owner: the qualified specular "draws too much attention
-// to itself" and "swings wildly" in a busy moving shot). With an all-or-
-// nothing qualification, a narrow coverage ramp and the whole bonus squeezed
-// between a near-clip anchor and clip, the same source white landed anywhere
-// from 1.38x to 2.33x SDR inside one lightning shot (5 % of frames stepping
-// over 10 %) and drew hard-edged hot blobs. Three changes, measured there:
-// frame-to-frame RMS 5.3 % -> 1.7 %, steps over 10 % 4.0 % -> 0.4 %, spread
-// inside a frame 1.24 -> 1.14 (plain profile: 2.9 %, 1.3 %, 1.03).
-//  - non-qualified whites keep a quarter of the bonus (0 made the bonus a
-//    switch; 0.35-0.40 with the old peak lit cloud tops and hair sheens, so
-//    this goes with cf_spec_gain near 1.3, not 2);
-//  - the ramp above the diffuse white is NOT stretched to full height
-//    (SPEC_ANCHOR_MIN_SPAN 1.0): it is the raw ramp minus its value at the
-//    diffuse white, so its slope never exceeds the raw ramp's and its peak
-//    shrinks smoothly to nothing as the diffuse white nears clip (0.05
-//    squeezed the whole bonus into the last code values; 0.5 still left
-//    cloud tops just above the diffuse white with a visible step);
-//  - coverage fades the compact test over 0.08-0.50 instead of 0.10-0.25.
-#define SPEC_ANCHOR_BROAD    0.25    // share kept by things above the anchor that are NOT compact
-#define SPEC_ANCHOR_MIN_SPAN 1.0     // least ramp span the re-based ramp is squeezed into (1.0 = never stretched)
-#define SPEC_NOANCHOR_BROAD  0.25    // share kept by non-qualified whites where no anchor exists
-#define SPEC_TOP_STEEP_MAX   1.5     // cf_spec_top may shorten the anchored rise by at most this factor
-#define SPEC_OBJ_COV          1.0     // 1 = size from the object field (0 = the pixel's own coverage, the old test)
-#define SPEC_OBJ_M_LO        0.0001  // below this membership sum the object field holds nothing: pixel coverage
-#define SPEC_OBJ_M_HI        0.001
-#define EMIT_FIELD_LO        0.30    // wide share of saturated full-value colour where the emitter cue starts to fade
-#define EMIT_FIELD_HI        0.42    // ... and is gone: that colour is a field (a sky), not a glow
-#define SPEC_COV_LO          0.08
-#define SPEC_COV_HI          0.50
-// Soft ramp (cf_spec_soft; passes 8b-8e hold the field). The main pass reads
-// the field at nine points around the pixel, each weighted by its luma's
-// closeness to the pixel's own (full-resolution) luma, and mixes them with
-// the pixel's own ramp at SPEC_SOFT_CENTER_W: a pixel no texel resembles (a
-// small hard glint on a dark ground) keeps its own ramp; a flat field is an
-// identity. The qualification shares, the anchor mix and cf_spec_gain are
-// the pixel's own and apply to the field's ramps as they do to its own; the
-// saturation gate is the source texel's. cf_spec_anchor acts as a switch
-// here (the field holds the raw ramp below 0.5, the free and anchored ramps
-// from 0.5).
-// Where the field's hard-edge flag is set (a hard edge between two bright
-// colours within its reach) the pixel keeps its own ramp exactly.
-// Pixels down to SPEC_SOFT_REACH under the onset take part (the foot of a
-// soft slope into near-white); flat lit skin there has no near-white texel
-// that resembles it and gets nothing.
-#define SPEC_SOFT_RANGE      0.12    // luma distance at which a field texel stops counting
-#define SPEC_SOFT_REACH      0.14    // how far under the onset a pixel may take part
-#define SPEC_SOFT_TAP        1.25    // read spacing, field texels at 2160 lines
-#define SPEC_SOFT_CENTER_W   0.15    // the pixel's own share (the nine taps sum to 5.8)
-#define SPEC_SOFT_HARD_LO    0.03    // spread hard-edge flag where the softening starts to fade
-#define SPEC_SOFT_HARD_HI    0.20    // ... and is off (a hard edge reads about 0.45 on itself, 0.2 at 20 px, 0.03 at 40 px)
-// Spec range lock (cf_spec_stab): the raw center ramp owns the result within
-// +-SPEC_LOCK_BAND of a same-surface reference; only larger outliers move.
-// The reference is formed in LUMA from antipodal pairs, so an affine
-// gradient is an exact identity despite the ramp's curvature. Inner 3x3
-// evidence plus four outer pairs at SPEC_LOCK_RADIUS (6 px). The LIFT is
-// separate: pairs donate only when both taps agree and enough pairs carry
-// spec support, so a coherent field fills a pepper pit while a one-sided
-// boundary cannot (a 0.05 below-onset pad lets pits join). Thin dark lines
-// between bright areas are the main A/B risk. Wide evidence gates keep
-// moderate grain from toggling corrections per frame; the lift is bounded at
-// 0.2 ramp units and needs ~6 of 8 pairs.
-#define SPEC_LOCK_RADIUS       6.0    // outer-ring reach, px (fixed; was the cf_spec_radius knob)
-#define SPEC_LOCK_RANGE_LO     0.025
-#define SPEC_LOCK_RANGE_HI     0.100
-#define SPEC_LOCK_SUPPORT_PAD  0.050
-#define SPEC_LOCK_CENTER_W     2.0
-#define SPEC_LOCK_OUTER_W      1.0
-#define SPEC_LOCK_MAX_NEIGH_W (8.0 * (1.0 + SPEC_LOCK_OUTER_W))
-#define SPEC_LOCK_MAX_PAIR_W  (4.0 * (1.0 + SPEC_LOCK_OUTER_W))
-#define SPEC_LOCK_BAND         0.005
-#define SPEC_LOCK_LIFT_MAX     0.200
-#define SPEC_LOCK_SUPPORT_Y    0.050
-#define SPEC_LOCK_CONF_LO      0.25
-#define SPEC_LOCK_CONF_HI      0.85
-#define SPEC_LOCK_MASS_LO      0.25
-#define SPEC_LOCK_MASS_HI      0.80
-#define SPEC_LOCK_LIFT_MASS_LO 0.45
-#define SPEC_LOCK_LIFT_MASS_HI 0.75
-#define SPEC_LOCK_LIFT_EDGE_LO 0.020
-#define SPEC_LOCK_LIFT_EDGE_HI 0.100
-#define SPEC_LOCK_HOT_LO       0.82
-#define SPEC_LOCK_HOT_HI       1.00
-// Impact weighting (cf_spec_floor): spec scales with coherent local evidence,
-// so a body (sheens, windows, 10-30 px flames) rides at 1.0 while a 2x2 star
-// sits at cf_spec_floor; tiny points gain little perceived brightness but
-// carry the least stable energy. Evidence is INNER-3x3 ONLY (the rotated
-// outer ring printed random dashing on thin streaks); one supported pair
-// (a >= 3 px line) saturates it. The lift joins via max() so a filled pit
-// keeps its body's weight.
-#define SPEC_IMPACT_MASS       0.25
-// Lift chroma match: a pair donates only if its saturation matches the center.
-#define SPEC_SAT_MATCH_LO      0.08
-#define SPEC_SAT_MATCH_HI      0.20
-// Spec sat-gate deadband: sat pulled toward the same-surface reference,
-// bounded at chroma-noise scale (+-LIM), so 4:2:0 noise stops modulating spec
-// while real chroma edges move at most LIM. The Oklab fast path keeps raw sat.
-#define SPEC_SAT_STAB_LIM      0.04
-// Texture-compressed drive (cf_spec_stab). The ramp maps 0.90..1.0 onto
-// 0..1, multiplying local contrast near onset ~10x: grain or mottle of
-// +-0.02-0.03 straddling the onset became tens-of-percent multiplier
-// differences (~3x rougher than the source in the 0.90-1.00 band). The lock
-// and lift cannot reach it (their evidence collapses at the straddle). So
-// the ramp reads a drive whose deviation d from a same-surface wide
-// reference is compressed at texture amplitude (slope TEX_SLOPE below
-// TEX_LO) and identity at edge amplitude. Load-bearing properties:
-// - Edge identity comes from the BILATERAL WINDOW, not the knee: taps beyond
-//   TEX_RANGE_HI are rejected, so on a glint, edge or deep pit the reference
-//   collapses toward the center (|d| <= ~0.053; pass_t tops out ~0.47).
-// - A map that compresses small |d| and is identity at large deviation must
-//   steepen somewhere in between; here that is at true edge amplitude
-//   (source deviation ~0.09-0.11, slope up to ~2.7, absolute shift
-//   < ~0.003). Mottle at 0.02-0.04 stays net-compressed.
-// - The correction is bounded in RAMP units (SPEC_TEX_RAMP_MAX), not drive
-//   units; this roof rules out cloud-shoulder artifacts. Downward correction
-//   fades out above TEX_CLIP_LO so genuine clip keeps its full plateau
-//   (rule 1).
-// - spec_tex_engage needs BOTH a compressed deviation AND donor mass: d ~ 0
-//   also happens when every tap is rejected (isolated glint, deep pit).
-// - Monotone in Y for a fixed reference; center dependence was swept over
-//   bimodal straddles without an inversion, and the roof bounds any residual.
-// - Tradeoff: thin DARK lines on a bright field (3-6 px, 0.02-0.05 below)
-//   read as coherent pits and lose some SPEC distinction (total output
-//   stays monotone). A/B line art over bright fields.
-// (Pass 1's Y_decision was rejected as the reference: it is raw above 0.95,
-// the worst band, and its asymmetric blur breaks affine gradients.)
-#define SPEC_TEX_LO         0.010   // fully compressed below (grain scale)
-#define SPEC_TEX_HI         0.100   // knee end. MUST STAY 0.10: |d| caps at ~0.053 so the upper
-                                    // half never fires, but a narrower knee breaks monotonicity
-                                    // (HI 0.05: 1302 of 2601 bimodal configs non-monotone, local
-                                    // slope -10; HI 0.10 sweeps clean).
-#define SPEC_TEX_SLOPE      0.15    // retained texture slope inside the knee (at knob 1)
-#define SPEC_TEX_SLOPE_MIN  0.05    // slope floor at knob 2 (never 0: no true flattening)
-#define SPEC_TEX_RAMP_MAX   0.20    // ramp-space roof on the correction (knob 1; 2x at knob 2)
-#define SPEC_TEX_CLIP_LO    0.995   // downward correction fades out above (rule 1)
-#define SPEC_TEX_CONF_LO    0.15    // engage donor-mass band (fraction of the 24-tap maximum)
-#define SPEC_TEX_CONF_HI    0.50
-#define SPEC_TEX_BORDER_FEATHER 8.0 // px of engage/drive fade inside the border guard
-#define SPEC_TEX_R1         2.0     // ring 1, DS texels (= 8 full-res px)
-#define SPEC_TEX_R2         5.0     // ring 2, DS texels (= 20 full-res px)
-#define SPEC_TEX_R3         10.0    // ring 3, DS texels (= 40 full-res px, large mottle)
-#define SPEC_TEX_SIDE_FRAC  0.5     // one-sided residual weight: when a pair dies because its
-                                    // FAR tap crossed an outline, the matching near tap still
-                                    // donates at this discount (the outline is never averaged
-                                    // in; on smooth gradients the residual cancels).
-// Overdrive (cf_spec_stab 1..2): mix and engage stay full; the retained slope
-// fades SLOPE -> SLOPE_MIN (never flat) and the roof scales to 2x. The knee
-// (LO/HI) is FIXED: it is monotonicity-constrained, not a strength lever.
-// The reference's own acceptance is scaled to the knee: taps must stay
-// accepted across the whole class being compressed, or |d| is under-measured.
-#define SPEC_TEX_RANGE_LO   0.035
-#define SPEC_TEX_RANGE_HI   0.120
-// Pair-agreement veto (dark haloing near dark edges): a moderate step
-// (0.05-0.10, cel shade or shadow edges) sits inside the acceptance fade,
-// dragged the reference down on the bright side and printed a -5..-9 % band
-// 30-50 px wide. A step pair DISAGREES across the center while grain pairs
-// agree (< ~0.02), so the symmetric term is weighted by agreement; the
-// vetoed excess goes through the one-sided residual. Cost: ring-3 pairs on
-// very steep smooth gradients (> ~0.001/px) lose the exact affine identity,
-// bounded by the knee and the roof.
-#define SPEC_TEX_AGREE_LO   0.030
-#define SPEC_TEX_AGREE_HI   0.080
-// Majority trim: a ~0.05 step is inside the disagreement real mottle needs,
-// but a step's dark taps are a coherent MINORITY, while texture spreads
-// around its own mean. Each tap is also weighted by closeness to a
-// pseudo-median of the 24 taps (med3 across rings, then an exact 8-element
-// sorting network). The anchor MUST be this Y-free pseudo-median: built only
-// from min/max of tap values, it makes the trim weights exactly independent
-// of the center luma. Center-anchored picks swept catastrophically
-// non-monotone (the pick snaps between clusters; local slope down to -500,
-// rule 1). Deep outlines cannot capture the median (a bounded minority 10+
-// px out); within ~8 px of an edge it degrades and the lock/lift take over.
-#define SPEC_TEX_TRIM_LO    0.012
-#define SPEC_TEX_TRIM_HI    0.035
 
 // (No clip diffusion: darkening small light cores against a dark field
 // attenuates source clipping, a rule-1 violation no tuning can fix.)
@@ -4282,7 +3539,7 @@ vec4 hook() {
 // the skin likeness (sigma 0.015, lightness counted fully) the read hopped
 // from block to block along soft warm gradients as the lightness passed each
 // block's level, and drew staircase contours around defocused shapes (owner,
-// 2026-11-23, testing cf_hl: "ragged edges on the background").
+// 2026-11-23, testing the highlight model: "ragged edges on the background").
 #define SKW_OWN_LOOK        1
 #define SKW_FIT             1       // skin weight = per-pixel fit linear in rgb (keep equal to SKW_FIT_POOL)
 #define PS_DEC_WIDE         1       // pale-skin gates read the wide decision chroma
@@ -4304,11 +3561,31 @@ vec4 hook() {
 // so below KNEE t = 0 and expansion is exactly 1.0. Must stay <= pass 1's
 // GRAIN_EARLY_EXIT, or stabilized decisions could cross KNEE.
 #define EARLY_EXIT_GAMMA    KNEE
-#define HL_W_MIN            0.90    // cf_hl: lowest diffuse white the top lift is measured from
-#define HL_S0               1.5     // cf_hl: the base curve's log-log slope the cap allows for
-#define HL_RAW_LUMA         1       // cf_hl: base from the plain luma, not pass 1's (keep equal to the base pass)
-#define HL_CORE             1       // cf_hl: core the base's small variations (0 = off)
+#define HL_W_MIN            0.90    // lowest diffuse white the top lift is measured from
+// Span of the top lift in log luminance from the lowest white to clip,
+// 2.4 ln(1 / HL_W_MIN) = 2.4 ln(10 / 9) = 0.2528652. cf_highlight is the lift
+// at clip over this full span; a higher scene white gets the same lift per
+// unit of span, so less in total. Keep equal to 2.4 ln(1 / HL_W_MIN).
+#define HL_SPAN_REF         0.2528652
+#define HL_RAW_LUMA         1       // base from the plain luma, not pass 1's (keep equal to the base pass)
+#define HL_CORE             1       // core the base's small variations (0 = off)
 #define HL_CORE_T           0.006   // coring threshold, gamma units
+// Top-lift amount by highlight size (passes 4g-4i): full cf_highlight on a
+// compact highlight (object coverage up to HL_SIZE_LO), none on a broad
+// near-white field (from HL_SIZE_HI). Set by measurement: these bounds take a
+// 60 px painted band at 1080p out of the lift (0.15-0.50 left it half lifted),
+// while glints and small lamps keep the full lift.
+#define HL_SIZE_LO          0.05
+#define HL_SIZE_HI          0.30
+// Shoulder: in a cooled bright field the curve is steeper (GAMMA_APL_BOOST)
+// and arrives at its peak hard; there it arrives softly instead:
+// t += HL_SHOULDER x cool_w x t^HL_SHOULDER_K (1 - t). Monotone for
+// HL_SHOULDER <= 1 (dt'/dt >= 1 - HL_SHOULDER x cool_w >= 0), peak unchanged.
+// Skin (exempt from the cooling) and every uncooled pixel keep the plain
+// curve. Without it a fade from white left a quarter of the picture outside
+// the range of its two ends while the cooling relaxed.
+#define HL_SHOULDER         1.0
+#define HL_SHOULDER_K       2.0
 
 // =============================================
 //  DEBUG
@@ -4318,10 +3595,10 @@ vec4 hook() {
 #define DEBUG_SHOW_ILLUM     (cf_debug == 2)   // Illumination field as grayscale
 #define DEBUG_SHOW_EXPANSION (cf_debug == 3)   // Expansion amount as heat map
 #define DEBUG_SHOW_DETAIL    (cf_debug == 4)   // Base expansion only (before scene terms): green = (expansion - 1) x 2
-#define DEBUG_SHOW_SPECULAR  (cf_debug == 5)   // Specular bonus: cyan = spec strength
+#define DEBUG_SHOW_TOPLIFT   (cf_debug == 5)   // Top lift: cyan = (lift - 1) x 4
 #define DEBUG_SHOW_PUMP      (cf_debug == 6)   // Light pump: red = scalar pump_env, green = applied gain, blue = cell mask
 #define DEBUG_SHOW_WP        (cf_debug == 7)   // Warm shift + pale skin
-#define DEBUG_SHOW_STATS     (cf_debug == 8)   // bright_frac, contrast, log_avg and spec-signal bars
+#define DEBUG_SHOW_STATS     (cf_debug == 8)   // bright_frac, contrast, log_avg and anchor bars
 
 // ---------------------------------------------------------------------------
 // Debug legend overlay — title + color key, bottom-left panel
@@ -4377,11 +3654,11 @@ float dbg_line(ivec2 p, uvec4 txt, int len) {
     #define DBG_TITLE_CH  8
     #define DBG_NROWS     1
     #define DBG_ROW_MAXCH 16
-#elif DEBUG_SHOW_SPECULAR
-    #define DBG_TITLE     uvec4(0x05413020u, 0x1204c543u, 0u, 0u)               // 5 SPECULAR
+#elif DEBUG_SHOW_TOPLIFT
+    #define DBG_TITLE     uvec4(0x103d4020u, 0x14189300u, 0u, 0u)               // 5 TOP LIFT
     #define DBG_TITLE_CH  10
     #define DBG_NROWS     1
-    #define DBG_ROW_MAXCH 18
+    #define DBG_ROW_MAXCH 15
 #elif DEBUG_SHOW_PUMP
     #define DBG_TITLE     uvec4(0x0724c021u, 0x15400508u, 0x0000040du, 0u)      // 6 LIGHT PUMP
     #define DBG_TITLE_CH  12
@@ -4401,7 +3678,7 @@ float dbg_line(ivec2 p, uvec4 txt, int len) {
     #define DBG_TITLE     uvec4(0x01513023u, 0x000004d4u, 0u, 0u)               // 8 STATS
     #define DBG_TITLE_CH  7
     #define DBG_NROWS     4
-    #define DBG_ROW_MAXCH 11
+    #define DBG_ROW_MAXCH 12
 #endif
 
 // Swatch color + packed label for key row i of the active view.
@@ -4416,9 +3693,9 @@ void dbg_row(int i, out vec3 col, out uvec4 txt, out int len) {
 #elif DEBUG_SHOW_DETAIL
     if (i == 0) { col = vec3(0.0, 1.0, 0.0);
         txt = uvec4(0x010a9a07u, 0x18140153u, 0x18a9c950u, 0x0000001du); len = 16; } // G=(BASE EXP-1)X2
-#elif DEBUG_SHOW_SPECULAR
+#elif DEBUG_SHOW_TOPLIFT
     if (i == 0) { col = vec3(0.0, 1.0, 1.0);
-        txt = uvec4(0x28381643u, 0x000c5413u, 0x0e152513u, 0x00008507u); len = 18; } // CYAN=SPEC STRENGTH
+        txt = uvec4(0x28381643u, 0x14189329u, 0x1f62a725u, 0u); len = 15; } // CYAN=(LIFT-1)X4
 #elif DEBUG_SHOW_PUMP
     if (i == 0) { col = vec3(1.0, 0.0, 0.0);
         txt = uvec4(0x010d3a12u, 0x0501204cu, 0x0000058eu, 0u); len = 12; }          // R=SCALAR ENV
@@ -4448,7 +3725,7 @@ void dbg_row(int i, out vec3 col, out uvec4 txt, out int len) {
     else if (i == 2) { col = vec3(0.0, 0.6, 0.0);
         txt = uvec4(0x010073ccu, 0x000001d6u, 0u, 0u); len = 7; }                    // LOG AVG
     else if (i == 3) { col = vec3(0.0, 0.6, 0.6);
-        txt = uvec4(0x000c5413u, 0x01387253u, 0x0000000cu, 0u); len = 11; }          // SPEC SIGNAL
+        txt = uvec4(0x0f203381u, 0x238e6012u, 0x00000725u, 0u); len = 12; }          // ANCHOR .88-1
 #endif
 }
 
@@ -4518,7 +3795,7 @@ vec3 gamma709_to_pq2020(vec3 rgb_gamma) {
 #define PQ_EXACT_HIGH   0.0030   // L normalized (≈30 nits): fully fast above
 // It is fitted only up to L ~0.20: past ~2000 nits per channel it runs away
 // (2500 nits -> ~4000, >= ~2900 -> 10000). Reachable at high cf_ref_white,
-// cf_strength or cf_spec, so channels above 1800 nits blend to the exact OETF.
+// cf_strength or cf_highlight, so channels above 1800 nits blend to the exact OETF.
 #define PQ_FAST_MAX_LO  0.18     // L normalized (1800 nits): exact blend starts
 #define PQ_FAST_MAX_HI  0.20     // L normalized (2000 nits): fully exact above
 
@@ -4599,207 +3876,6 @@ vec3 upsample_illum_rgb() {
 // MAIN PROCESSING
 // =============================================================================
 
-// Returns (luma reference, confidence, pair-supported spec mass, lift luma)
-// plus lift support, the saturation reference and the inner-3x3 impact
-// evidence. Inner pairs = the exact 3x3; the four outer pairs sit at 22.5 deg
-// and are hash-rotated per pixel (static; a FIXED outer geometry let drifting
-// content sweep whole regions in phase). Each pair uses its weaker bilateral
-// weight: one cross-edge tap rejects the direction, and yp + yn keeps an
-// affine center level exact.
-vec4 spec_local_reference(float center_y, float center_sat, float y_low,
-                          vec2 rot, out float lift_support, out float sat_ref,
-                          out float impact_evidence) {
-    float r = SPEC_LOCK_RADIUS;
-    float hca = rot.x, hsa = rot.y;
-    vec2 offsets[8] = vec2[8](
-        vec2(1.0, 0.0),
-        vec2(0.0, 1.0),
-        vec2(1.0, 1.0),
-        vec2(1.0,-1.0),
-        vec2( 0.92387953 * r, 0.38268343 * r),
-        vec2( 0.38268343 * r, 0.92387953 * r),
-        vec2(-0.38268343 * r, 0.92387953 * r),
-        vec2( 0.92387953 * r,-0.38268343 * r)
-    );
-    float y_sum = center_y * SPEC_LOCK_CENTER_W;
-    float y_weight = SPEC_LOCK_CENTER_W;
-    float sat_sum = center_sat * SPEC_LOCK_CENTER_W;
-    float accepted_mass = 0.0;
-    float supported_mass = 0.0;
-    float lift_excess = 0.0;
-    float lift_mass = 0.0;
-    // Inner-only twins feed ONLY the impact weight (deterministic geometry).
-    float supported_inner = 0.0;
-    float lift_inner = 0.0;
-    for (int i = 0; i < 8; i++) {
-        vec2 o = offsets[i];
-        if (i >= 4)
-            o = vec2(o.x * hca - o.y * hsa, o.x * hsa + o.y * hca);
-        vec3 cp = HOOKED_texOff( o).rgb;
-        vec3 cn = HOOKED_texOff(-o).rgb;
-        float yp = get_luma(cp);
-        float yn = get_luma(cn);
-        float sat_p = max(max(cp.r, cp.g), cp.b) - min(min(cp.r, cp.g), cp.b);
-        float sat_n = max(max(cn.r, cn.g), cn.b) - min(min(cn.r, cn.g), cn.b);
-        float wp = 1.0 - smoothstep(SPEC_LOCK_RANGE_LO,
-                                    SPEC_LOCK_RANGE_HI,
-                                    abs(yp - center_y));
-        float wn = 1.0 - smoothstep(SPEC_LOCK_RANGE_LO,
-                                    SPEC_LOCK_RANGE_HI,
-                                    abs(yn - center_y));
-        float ring_w = i >= 4 ? SPEC_LOCK_OUTER_W : 1.0;
-        float wp2 = wp * wp * ring_w;
-        float wn2 = wn * wn * ring_w;
-        float w = min(wp2, wn2);
-
-        // Soft support just above onset (a 0.05 span, so +-0.01 grain cannot
-        // swing it 40-100 %).
-        float sp = smoothstep(y_low, y_low + SPEC_LOCK_SUPPORT_Y, yp);
-        float sn = smoothstep(y_low, y_low + SPEC_LOCK_SUPPORT_Y, yn);
-
-        y_sum += (yp + yn) * w;
-        y_weight += 2.0 * w;
-        sat_sum += (sat_p + sat_n) * w;
-        accepted_mass += 2.0 * w;
-        supported_mass += (sp + sn) * w;
-        if (i < 4) supported_inner += (sp + sn) * w;
-        // STRONG PAIR-COHERENT LIFT: a pepper pit in a flat bright field sees
-        // matching values on both sides of every axis, while a real boundary
-        // makes antipodal taps disagree, so pair contrast gates donation.
-        // Conditional normalization supplies the bright neighbour level; the
-        // fixed support fraction stops one surviving pair from acting like a
-        // whole field. Donation also needs a saturation match.
-        float pair_y = 0.5 * (yp + yn);
-        float pair_match = 1.0 - smoothstep(SPEC_LOCK_LIFT_EDGE_LO,
-                                            SPEC_LOCK_LIFT_EDGE_HI,
-                                            abs(yp - yn));
-        float pair_spec = smoothstep(y_low, y_low + SPEC_LOCK_SUPPORT_Y,
-                                     pair_y);
-        float sat_match = 1.0 - smoothstep(SPEC_SAT_MATCH_LO,
-                                           SPEC_SAT_MATCH_HI,
-                                           abs(0.5 * (sat_p + sat_n) - center_sat));
-        float lift_w = pair_match * pair_spec * sat_match * ring_w;
-        lift_excess += clamp(pair_y - y_low, 0.0, 1.0 - y_low) * lift_w;
-        lift_mass += lift_w;
-        if (i < 4) lift_inner += lift_w;
-    }
-    float y_ref = min(y_sum / max(y_weight, 1e-6), 1.0);
-    float confidence = clamp(accepted_mass / SPEC_LOCK_MAX_NEIGH_W, 0.0, 1.0);
-    float support = clamp(supported_mass / SPEC_LOCK_MAX_NEIGH_W, 0.0, 1.0);
-    float lift_y = min(y_low + lift_excess / max(lift_mass, 1e-6), 1.0);
-    lift_support = clamp(lift_mass / SPEC_LOCK_MAX_PAIR_W, 0.0, 1.0);
-    sat_ref = sat_sum / max(y_weight, 1e-6);
-    // Inner maxima: 4 pairs x 2 taps (support) / 4 pairs x weight 1 (lift).
-    impact_evidence = max(clamp(supported_inner / 8.0, 0.0, 1.0),
-                          clamp(lift_inner / 4.0, 0.0, 1.0));
-
-    return vec4(y_ref, confidence, support, lift_y);
-}
-
-// Same-surface wide reference for the texture drive (see SPEC_TEX): 12
-// antipodal pairs of CELFLARE_DS taps (rings at 2 / 5 / 10 DS texels = 8 /
-// 20 / 40 px) plus a center anchor. Pair weight = the weaker of the two taps'
-// bilateral weights against the RAW center, so an affine field is an exact
-// identity; the surviving tap of a dead pair donates at SPEC_TEX_SIDE_FRAC.
-// Averaging 25 taps of the aliased DS box is deliberate filtering (the
-// point-sampling rule is about single-texel reads). Borders: the caller
-// skips the reference within 22 px (feathered), where clamp-to-edge collapses
-// a ring-1/2 pair; ring 3 drops any pair leaving the picture (weight 0).
-// Stages: bilateral acceptance, majority trim against the Y-free
-// pseudo-median, pair-agreement veto.
-float spec_texture_reference(float center_y, vec2 rot, out float donor_mass) {
-    // Ring 1 fixed (deterministic core); rings 2-3 phased 22.5 deg and
-    // hash-rotated like the lock's outer ring. Rotation noise lands in d and
-    // is knee-compressed.
-    const vec2 tex_pairs[12] = vec2[12](
-        vec2(SPEC_TEX_R1, 0.0), vec2(0.0, SPEC_TEX_R1),
-        vec2(SPEC_TEX_R1, SPEC_TEX_R1), vec2(SPEC_TEX_R1, -SPEC_TEX_R1),
-        vec2( 4.6194, 1.9134), vec2( 1.9134, 4.6194),   // SPEC_TEX_R2 at
-        vec2(-1.9134, 4.6194), vec2(-4.6194, 1.9134),   // 22.5/67.5/112.5/157.5 deg
-        vec2(SPEC_TEX_R3, 0.0), vec2(0.0, SPEC_TEX_R3), // ring 3 axes+diagonals
-        vec2(7.0711, 7.0711), vec2(7.0711, -7.0711));   // (7.0711*sqrt2 = R3)
-    float tex_hca = rot.x, tex_hsa = rot.y;
-    vec2 tex_lo = 0.5 * CELFLARE_DS_pt;
-    vec2 tex_hi = vec2(1.0) - tex_lo;
-    // Constant-indexed caches (FXC keeps them in registers). Invalid ring-3
-    // pairs reuse the ring-1 values: a full median population, still Y-free.
-    float ty[24];
-    float pval[12];
-    for (int i = 0; i < 12; i++) {
-        vec2 o = tex_pairs[i];
-        if (i >= 4)
-            o = vec2(o.x * tex_hca - o.y * tex_hsa,
-                     o.x * tex_hsa + o.y * tex_hca);
-        o *= CELFLARE_DS_pt;
-        vec2 pp = CELFLARE_DS_pos + o;
-        vec2 pn = CELFLARE_DS_pos - o;
-        bool ok = i < 8
-            || (all(greaterThanEqual(pp, tex_lo)) && all(lessThanEqual(pp, tex_hi))
-             && all(greaterThanEqual(pn, tex_lo)) && all(lessThanEqual(pn, tex_hi)));
-        pval[i] = ok ? 1.0 : 0.0;
-        if (ok) {
-            ty[2 * i]     = get_luma(CELFLARE_DS_tex(pp).rgb);
-            ty[2 * i + 1] = get_luma(CELFLARE_DS_tex(pn).rgb);
-        } else {
-            ty[2 * i]     = ty[2 * (i - 8)];
-            ty[2 * i + 1] = ty[2 * (i - 8) + 1];
-        }
-    }
-    // Pseudo-median: med3 across rings (k, k+8, k+16), then an exact
-    // 8-element sorting network. min/max only: exactly Y-free (SPEC_TEX_TRIM).
-    float tg[8];
-    for (int k = 0; k < 8; k++) {
-        float a = ty[k], b = ty[k + 8], c = ty[k + 16];
-        tg[k] = max(min(a, b), min(max(a, b), c));
-    }
-    #define SPEC_TEX_CSWAP(A, B) { float t_ = min(tg[A], tg[B]); tg[B] = max(tg[A], tg[B]); tg[A] = t_; }
-    SPEC_TEX_CSWAP(0, 1) SPEC_TEX_CSWAP(2, 3) SPEC_TEX_CSWAP(4, 5) SPEC_TEX_CSWAP(6, 7)
-    SPEC_TEX_CSWAP(0, 2) SPEC_TEX_CSWAP(1, 3) SPEC_TEX_CSWAP(4, 6) SPEC_TEX_CSWAP(5, 7)
-    SPEC_TEX_CSWAP(1, 2) SPEC_TEX_CSWAP(5, 6) SPEC_TEX_CSWAP(0, 4) SPEC_TEX_CSWAP(3, 7)
-    SPEC_TEX_CSWAP(1, 5) SPEC_TEX_CSWAP(2, 6)
-    SPEC_TEX_CSWAP(1, 4) SPEC_TEX_CSWAP(3, 6)
-    SPEC_TEX_CSWAP(2, 4) SPEC_TEX_CSWAP(3, 5)
-    SPEC_TEX_CSWAP(3, 4)
-    float tex_med = 0.5 * (tg[3] + tg[4]);
-    // Pair structure: bilateral vs center x majority trim vs the median.
-    float y_sum = center_y * SPEC_LOCK_CENTER_W;
-    float w_sum = SPEC_LOCK_CENTER_W;
-    for (int i = 0; i < 12; i++) {
-        float yp = ty[2 * i];
-        float yn = ty[2 * i + 1];
-        float wp = pval[i] * (1.0 - smoothstep(SPEC_TEX_RANGE_LO, SPEC_TEX_RANGE_HI,
-                                               abs(yp - center_y)));
-        float wn = pval[i] * (1.0 - smoothstep(SPEC_TEX_RANGE_LO, SPEC_TEX_RANGE_HI,
-                                               abs(yn - center_y)));
-        wp *= 1.0 - smoothstep(SPEC_TEX_TRIM_LO, SPEC_TEX_TRIM_HI,
-                               abs(yp - tex_med));
-        wn *= 1.0 - smoothstep(SPEC_TEX_TRIM_LO, SPEC_TEX_TRIM_HI,
-                               abs(yn - tex_med));
-        float wp2 = wp * wp;
-        float wn2 = wn * wn;
-        // Pair-agreement veto (see SPEC_TEX_AGREE).
-        float agree = 1.0 - smoothstep(SPEC_TEX_AGREE_LO, SPEC_TEX_AGREE_HI,
-                                       abs(yp - yn));
-        float w = min(wp2, wn2) * agree;
-        // One-sided residual (see SPEC_TEX_SIDE_FRAC): the evening reaches
-        // within one tap of an outline; agree-vetoed excess goes here too.
-        float w_res = (max(wp2, wn2) - w) * SPEC_TEX_SIDE_FRAC;
-        y_sum += (yp + yn) * w + ((wp2 > wn2) ? yp : yn) * w_res;
-        w_sum += 2.0 * w + w_res;
-    }
-    // Accepted donor weight, 0..24. |d| ~ 0 alone is ambiguous: a glint or
-    // deep pit rejects every tap and collapses the reference onto the center
-    // (d == 0). No donors = the compressor knows nothing here.
-    donor_mass = w_sum - SPEC_LOCK_CENTER_W;
-    return y_sum / w_sum;
-}
-
-// Soft-ramp read points (see SPEC_SOFT): offset in taps, Gaussian weight.
-const vec3 spec_soft_taps[9] = vec3[9](
-    vec3( 0.0,  0.0, 1.0),
-    vec3( 1.0,  0.0, 0.7), vec3(-1.0,  0.0, 0.7), vec3( 0.0,  1.0, 0.7), vec3( 0.0, -1.0, 0.7),
-    vec3( 1.0,  1.0, 0.5), vec3(-1.0,  1.0, 0.5), vec3( 1.0, -1.0, 0.5), vec3(-1.0, -1.0, 0.5));
-
 // ---------------------------------------------------------------------------
 // WORKGROUP STATE SNAPSHOT — NV Vulkan uncached SSBO reads
 // ---------------------------------------------------------------------------
@@ -4813,7 +3889,6 @@ const vec3 spec_soft_taps[9] = vec3[9](
 // before this pass started. Debug views read the buffer directly.
 // COMPUTE hooks write out_image themselves, so the pixel body is cf_shade()
 // and hook() owns the snapshot, the barrier and the guarded store.
-shared float sh_spec_signal;
 shared float sh_bright_frac;
 shared float sh_growth_mode;
 shared float sh_log_avg;
@@ -4857,11 +3932,6 @@ vec4 cf_shade() {
 #endif
     vec4 color = HOOKED_texOff(0);
     vec3 rgb_gamma = color.rgb;
-    float applied_spec_signal = sh_spec_signal;
-    // cf_spec_anchor replaces the frame gate with a per-pixel test; 0 selects
-    // the frame signal itself (bit-identical to before).
-    float spec_sig = (cf_spec_anchor > 0.0)
-                   ? mix(applied_spec_signal, 1.0, cf_spec_anchor) : applied_spec_signal;
 
     // -------------------------------------------------------------------------
     // DEBUG: legend panel (bottom-left) — title + color key for the active view
@@ -4922,8 +3992,8 @@ vec4 cf_shade() {
                 // Row 3: log_avg (green)
                 if (bar_x < smoothed_log_avg) dbg = vec3(0.0, 0.6, 0.0);
             } else {
-                // Row 4: spec_signal (cyan)
-                if (bar_x < applied_spec_signal) dbg = vec3(0.0, 0.6, 0.6);
+                // Row 4: the held diffuse-white anchor, 0.88 (none) to 1.0 (cyan)
+                if (bar_x < (spec_anchor_held - 0.88) * (1.0 / 0.12)) dbg = vec3(0.0, 0.6, 0.6);
             }
             // White outline + 25/50/75 tick marks for visual reference.
             const float thick = 0.0015;
@@ -4943,7 +4013,7 @@ vec4 cf_shade() {
     // PIXEL LUMA / PEAK CHANNEL
     // -------------------------------------------------------------------------
     float Y_gamma = get_luma(rgb_gamma);
-    // V_gamma feeds the base-ramp V credit; sat_gamma (V - min) the spec sat
+    // V_gamma feeds the base-ramp V credit; sat_gamma (V - min) the credit's
     // gate and the Oklab fast-path test.
     float V_gamma   = max(max(rgb_gamma.r, rgb_gamma.g), rgb_gamma.b);
     float min_gamma = min(min(rgb_gamma.r, rgb_gamma.g), rgb_gamma.b);
@@ -4959,9 +4029,9 @@ vec4 cf_shade() {
     #endif
 
     // Early exit: no base expansion is possible below the knee.
-    // Highlight base (cf_hl): B = a Y_dec + b from the 1/4-resolution fit.
+    // Highlight base: B = a Y_dec + b from the 1/4-resolution fit.
     float Yb_gamma = Y_gamma;
-    if (cf_hl > 0.5) {
+    {
         vec3 gfab = CELFLARE_GF_tex(CELFLARE_GF_pos).rgb;
     #if HL_RAW_LUMA
         Yb_gamma = clamp(gfab.x * Y_gamma + gfab.y, 0.0, 1.0);
@@ -4981,11 +4051,20 @@ vec4 cf_shade() {
         }
     #endif
     }
-    if (max(Y_gamma, (cf_hl > 0.5) ? Yb_gamma : 0.0) < EARLY_EXIT_GAMMA)
+    if (max(Y_gamma, Yb_gamma) < EARLY_EXIT_GAMMA)
         return vec4(gamma709_to_pq2020(color.rgb), 1.0);
 
     vec3 illum_rgb = upsample_illum_rgb();
     float Y_illum = get_luma(illum_rgb);
+    // Highlight size: the largest coverage in the white object this pixel
+    // belongs to (highlight size passes), read from the cells that hold
+    // near-white only; the pixel's own coverage where none does.
+    float hl_cov = CELFLARE_ILLUM_tex(CELFLARE_ILLUM_pos).a;
+    {
+        vec2 ob = CELFLARE_OBJ_tex(CELFLARE_OBJ_pos).rg;
+        float cov_o = ob.r / max(ob.g, 1e-4);
+        hl_cov = mix(hl_cov, max(hl_cov, cov_o), smoothstep(0.05, 0.30, ob.g));
+    }
 
     // -------------------------------------------------------------------------
     // GRAIN STABILIZATION
@@ -4995,12 +4074,12 @@ vec4 cf_shade() {
         // Alpha protocol: decision luma stored as Y * 0.5.
         Y_decision_gamma = color.a * 2.0;
     #endif
-    // The curve's argument: the smooth base with cf_hl, else the decision luma.
-    float Y_curve_gamma = (cf_hl > 0.5) ? Yb_gamma : Y_decision_gamma;
+    // The curve's argument: the smooth base.
+    float Y_curve_gamma = Yb_gamma;
 
     // Stabilized peak channel: the luma stabilizer's correction moved onto V
     // (cancels achromatic grain; chroma noise stays). Used only by the
-    // base-ramp V credit; V never drives spec.
+    // base-ramp V credit.
     float V_stable = V_gamma + (Y_decision_gamma - Y_gamma);
 
     // -------------------------------------------------------------------------
@@ -5043,9 +4122,9 @@ vec4 cf_shade() {
     // 4b), so those keep the normal curve too:
     // the exemption is for pale warm tones, and the cooling keeps working on
     // white, grey, blue and green fields.
-    // Only the cooling is exempted. The spec bonus and the pump keep their
-    // own gates: exempting skin hues there bought under 1 % steadiness and
-    // would thin pale fire and sunset cores.
+    // Only the cooling is exempted. The top lift and the pump keep their
+    // own gates: exempting skin hues there (from the old specular bonus)
+    // bought under 1 % steadiness and would thin pale fire and sunset cores.
     float cool_w0 = cool_w;   // un-exempted weight: what a neutral pixel here gets
     float skin_ex = 0.0;      // share of the cooling this pixel was let off
     // Decision chroma: the same-surface chroma of this pixel (pass 4c), for
@@ -5195,21 +4274,11 @@ vec4 cf_shade() {
     #endif
     float t = max(base_drive - KNEE, 0.0) / (1.0 - KNEE);
     t = pow(min(t, 1.0), local_gamma);  // clamp for upscaler super-whites
-    // cf_shoulder: a one-sided cubic bump t^2(1-t) that softens the TOP-END
-    // derivative for already-harsh or hard-clipped highlights. Slope at t=1 is
-    // (1 - cf_shoulder): 0 = steepest near-clip differentiation, 1 (default)
-    // = arrives at peak with zero slope. It peaks at t=2/3 (Y ~0.81-0.88) with
-    // quadratic contact at the knee, so faces are untouched and the
-    // inflection stays at Y >= 0.82 at cf_curve 1. Worst corner (cf_shoulder 1
-    // + cf_curve 0.6): Y ~0.66, the band edge. cf_curve's MINIMUM 0.6 IS this
-    // guard; do not lower it (a symmetric bump put it at Y ~0.47, mid-face).
-    // Monotonicity: d/dt [t + s t^2 (1-t)] = 1 + s(2t - 3t^2) >= 1 - s >= 0,
-    // so cf_shoulder's MAXIMUM 1.0 IS the proof bound; do not widen it. The
-    // bump is 0 at t=1 (peak unchanged).
-    t += cf_shoulder * t * t * (1.0 - t);
+    // Shoulder in cooled bright fields (see HL_SHOULDER).
+    t += HL_SHOULDER * cool_w * pow(t, HL_SHOULDER_K) * (1.0 - t);
     float expansion = 1.0 + (local_peak - 1.0) * t * INTENSITY;
-    // Expansion a COOLED white (t = 1, where the shoulder term is 0) gets at
-    // this spot; carried through the scene steps for the exemption's guard.
+    // Expansion a COOLED white (t = 1) gets at this spot; carried through the
+    // scene steps for the exemption's guard.
     float e_white = 1.0 + (local_peak - 1.0) * INTENSITY;
 
     #if DEBUG_SHOW_DETAIL
@@ -5279,320 +4348,36 @@ vec4 cf_shade() {
     }
 
     // -------------------------------------------------------------------------
-    // HIGHLIGHT TOP LIFT (cf_hl) — replaces the specular bonus
+    // HIGHLIGHT TOP LIFT
     // -------------------------------------------------------------------------
     // Above the scene's diffuse white W (the held anchor, at least HL_W_MIN),
     // on the smooth base: lift = exp(h u^1.5), u = position between W and
-    // clip in log luminance. h is capped so the lift adds at most
-    // cf_hl_cap - HL_S0 to the log-log slope (u^1.5 climbs at most 1.5x its
-    // mean), so a soft gradient can never turn into a cliff; it shrinks to
-    // nothing as W nears clip. cf_strength rides along (0 = no-op).
-    if (cf_hl > 0.5) {
+    // clip in log luminance, h = ln(cf_highlight) x span / HL_SPAN_REF with
+    // span = 2.4 ln(1 / W). h is proportional to the span, so the steepest
+    // added log-log slope (1.5 h / span at clip) is the same in every scene
+    // and the lift shrinks to nothing as W nears clip: a soft gradient or a
+    // flat clipped area never gets the whole factor over a few code values.
+    // cf_strength rides along (0 = no-op).
+    float hl_lift;
+    {
         float hl_xw = 2.4 * log(max(sh_spec_anchor, HL_W_MIN));
         float hl_u = clamp((2.4 * log(max(Yb_gamma, 1e-4)) - hl_xw) / max(-hl_xw, 1e-4), 0.0, 1.0);
-        float hl_h = min(log(cf_hl_top), (cf_hl_cap - HL_S0) * (-hl_xw) * (1.0 / 1.5));
-        expansion *= exp(max(hl_h, 0.0) * hl_u * sqrt(hl_u) * cf_strength);
+        float hl_h = log(cf_highlight) * (-hl_xw) * (1.0 / HL_SPAN_REF);
+        // compact highlights only (see HL_SIZE_*)
+        hl_h *= 1.0 - smoothstep(HL_SIZE_LO, HL_SIZE_HI, hl_cov);
+        hl_lift = exp(max(hl_h, 0.0) * hl_u * sqrt(hl_u) * cf_strength);
+        expansion *= hl_lift;
     }
 
-    // -------------------------------------------------------------------------
-    // SPECULAR BONUS — scene-gated, per-pixel ramp
-    // -------------------------------------------------------------------------
-    // applied_spec_signal = pass 8's smoothed spec signal. Added after APL and
-    // dynamic intensity, so those dampeners do not touch it.
-    float spec_strength = 0.0;
-    if (cf_hl <= 0.5) {   // cf_hl replaces the bonus with the top lift: skip its work
-        // Scene key only: dark SCENES get more pop, no edge bias in a region.
-        float spec_peak = mix(SPEC_PEAK_DARK, SPEC_PEAK_BRIGHT, apl_t);
-        float spec_gamma = mix(SPEC_GAMMA_DARK, SPEC_GAMMA_BRIGHT, apl_t);
-        // Drive: raw Y ONLY. Pass 1's stabilization drew cloud shoulders on
-        // this steep ramp; the lock below constrains outliers but never
-        // replaces this driver. No V driver here (see the SPECULAR BONUS
-        // notes): dim saturated emissives keep their SDR level by design.
-        float spec_y_low = SPEC_Y_LOW;
-        // Static per-pixel ring rotation shared by both local references.
-        vec2 spec_rot = vec2(1.0, 0.0);
-        if (Y_gamma > spec_y_low - SPEC_LOCK_SUPPORT_PAD) {
-            vec2 rot_px = HOOKED_pos * HOOKED_size;
-            float rot_ang = fract(sin(dot(rot_px, vec2(12.9898, 78.233))) * 43758.5453) * 6.2832;
-            spec_rot = vec2(cos(rot_ang), sin(rot_ang));
-        }
-        // Texture-compressed drive (see SPEC_TEX). Own border skip: rotated
-        // ring 2 reaches 5 texels + 0.5 = 22 px, feathered over 8 px (a hard
-        // cut would print a rectangle inside the frame). Compression may pull
-        // a pit just below onset into the ramp (the lift's direction). The
-        // lock/lift keep reading raw Y_gamma.
-        float y_spec_drive = Y_gamma;
-        float spec_tex_engage = 0.0;
-        vec2 tex_px = HOOKED_pos * HOOKED_size;
-        float tex_guard = SPEC_TEX_R2 * 4.0 + 2.0;
-        float tex_border_w = clamp((min(min(tex_px.x, tex_px.y),
-                                        min(HOOKED_size.x - tex_px.x,
-                                            HOOKED_size.y - tex_px.y))
-                                    - tex_guard) * (1.0 / SPEC_TEX_BORDER_FEATHER),
-                                   0.0, 1.0);
-        if (cf_spec_stab > 0.0
-            && cf_spec > 0.0
-            && cf_strength > 0.0
-            && spec_sig > 1e-5
-            && Y_gamma > spec_y_low - SPEC_LOCK_SUPPORT_PAD
-            && tex_border_w > 0.0)
-        {
-            float donor_mass;
-            float y_texref = spec_texture_reference(Y_gamma, spec_rot, donor_mass);
-            float d = Y_gamma - y_texref;
-            float pass_t = smoothstep(SPEC_TEX_LO, SPEC_TEX_HI, abs(d));
-            // cf_spec_stab 0..1 scales the mix; 1..2 lowers the retained slope.
-            float tex_amt = min(cf_spec_stab, 1.0);
-            float tex_over = clamp(cf_spec_stab - 1.0, 0.0, 1.0);
-            float tex_slope = max(SPEC_TEX_SLOPE * (1.0 - tex_over),
-                                  SPEC_TEX_SLOPE_MIN);
-            float y_comp = y_texref
-                         + d * (tex_slope + (1.0 - tex_slope) * pass_t);
-            y_spec_drive = mix(Y_gamma, y_comp, tex_amt * tex_border_w);
-            // Engage = the compressor OWNS this pixel (it then takes over from
-            // the lock/lift, whose half-applied evidence became the main
-            // residual roughness): deviation in the compressed class AND real
-            // donor mass. The donor term is load-bearing: a glint or deep pit
-            // rejects every tap and gives d == 0, and keying on |d| alone
-            // disabled the catchlight floor and the deep-pit lift. No donors =
-            // engage 0 = lock, lift and impact weight unchanged.
-            float tex_conf = smoothstep(SPEC_TEX_CONF_LO, SPEC_TEX_CONF_HI,
-                                        donor_mass * (1.0 / 24.0));
-            spec_tex_engage = tex_amt * (1.0 - pass_t) * tex_conf
-                            * tex_border_w;
-        }
-        // Ramp-space roof: the compressed drive moves the ramp at most +-roof.
-        // No hot-core release here on purpose (it protected exactly the
-        // near-clip grain spikes that are the crunch). A clipped core's
-        // interior is identity (its taps are clipped too); only the rim of a
-        // sub-footprint core gets a bounded, monotone tip trim (A/B: candle
-        // flames, star fields, catchlights). cf_spec_stab 0 = exact identity.
-        float raw_ramp_r = pow(smoothstep(spec_y_low, 1.0, Y_gamma), spec_gamma);
-        float tex_roof = SPEC_TEX_RAMP_MAX
-                       * (1.0 + clamp(cf_spec_stab - 1.0, 0.0, 1.0));
-        float tex_ramp_corr = clamp(pow(smoothstep(spec_y_low, 1.0, y_spec_drive),
-                                        spec_gamma) - raw_ramp_r,
-                                    -tex_roof, tex_roof);
-        // Genuine clip is never attenuated (rule 1): downward correction fades
-        // out over the last half code value, so a super-white or clipped
-        // center keeps its full plateau ramp.
-        if (tex_ramp_corr < 0.0)
-            tex_ramp_corr *= 1.0 - smoothstep(SPEC_TEX_CLIP_LO, 1.0, Y_gamma);
-        float ordinary_r = raw_ramp_r + tex_ramp_corr;
-        // The lift cap is relative to the UNMODIFIED ramp: capture the RAW
-        // ramp here (the corrected one lowered the ceiling by up to RAMP_MAX).
-        float raw_ordinary_r = raw_ramp_r;
-
-        // LOCAL RANGE LOCK (see SPEC_LOCK_*). The gather also feeds the impact
-        // weight and sat deadband, so it runs for clipped centers too; only
-        // the lock/lift test ordinary_r < HOT_HI. Frame borders fall back to
-        // raw: clamp-to-edge collapses pairs within SPEC_LOCK_RADIUS.
-        float impact_w = 1.0;
-        float spec_sat = sat_gamma;
-        vec2 spec_px = HOOKED_pos * HOOKED_size;
-        float spec_guard = SPEC_LOCK_RADIUS + 1.0;
-        bool spec_in_frame = spec_px.x >= spec_guard
-                          && spec_px.y >= spec_guard
-                          && spec_px.x < HOOKED_size.x - spec_guard
-                          && spec_px.y < HOOKED_size.y - spec_guard;
-        if (cf_spec_stab > 0.0
-            && cf_spec > 0.0
-            && cf_strength > 0.0
-            && spec_sig > 1e-5
-            && Y_gamma > spec_y_low - SPEC_LOCK_SUPPORT_PAD
-            && spec_in_frame)
-        {
-            float lift_support;
-            float sat_ref;
-            float impact_evidence;
-            vec4 local = spec_local_reference(Y_gamma, sat_gamma, spec_y_low, spec_rot,
-                                              lift_support, sat_ref,
-                                              impact_evidence);
-
-            // Impact weight: saturates inside any coherent body (gradient into
-            // a core untouched); it can only attenuate, never donate.
-            impact_w = mix(cf_spec_floor, 1.0,
-                           smoothstep(0.0, SPEC_IMPACT_MASS, impact_evidence));
-            // Compressed texture is same-surface, so impact-evidence noise
-            // there is spurious; a glint (engage 0) keeps its floor.
-            impact_w = mix(impact_w, 1.0, spec_tex_engage);
-
-            // Bounded sat deadband for the spec gate only.
-            spec_sat = sat_gamma + clamp(sat_ref - sat_gamma,
-                                         -SPEC_SAT_STAB_LIM, SPEC_SAT_STAB_LIM);
-
-            if (ordinary_r < SPEC_LOCK_HOT_HI) {
-            float ref_r = pow(smoothstep(spec_y_low, 1.0, local.x), spec_gamma);
-            float locked_r = ref_r
-                           + clamp(ordinary_r - ref_r,
-                                   -SPEC_LOCK_BAND, SPEC_LOCK_BAND);
-            locked_r = clamp(locked_r, 0.0, 1.0);
-
-            float confidence = smoothstep(SPEC_LOCK_CONF_LO,
-                                          SPEC_LOCK_CONF_HI, local.y);
-            float support = smoothstep(SPEC_LOCK_MASS_LO,
-                                       SPEC_LOCK_MASS_HI, local.z);
-            // Protect the hot core only from DOWNWARD correction (a fading
-            // lift could cut a non-monotone notch below a clipped field).
-            float hot_release = 1.0;
-            if (locked_r < ordinary_r)
-                hot_release -= smoothstep(SPEC_LOCK_HOT_LO,
-                                          SPEC_LOCK_HOT_HI, ordinary_r);
-            ordinary_r = mix(ordinary_r, locked_r,
-                             min(cf_spec_stab, 1.0) * confidence * support * hot_release
-                             * (1.0 - spec_tex_engage));
-
-            // STRONG ADJACENT LIFT: only raises, never beyond a donor; bounded
-            // at 0.2 ramp units above the raw ramp; lift_center spans the full
-            // SUPPORT_PAD so the fill is continuous at entry.
-            float lift_r = pow(smoothstep(spec_y_low, 1.0, local.w), spec_gamma);
-            float lift_floor = max(lift_r - SPEC_LOCK_BAND, 0.0);
-            float lift_target = max(ordinary_r,
-                                    min(lift_floor,
-                                        raw_ordinary_r + SPEC_LOCK_LIFT_MAX));
-            float lift_evidence = smoothstep(SPEC_LOCK_LIFT_MASS_LO,
-                                             SPEC_LOCK_LIFT_MASS_HI,
-                                             lift_support);
-            float lift_center = smoothstep(spec_y_low - SPEC_LOCK_SUPPORT_PAD,
-                                           spec_y_low, Y_gamma);
-            ordinary_r = mix(ordinary_r, lift_target,
-                             min(cf_spec_stab, 1.0) * lift_evidence * lift_center
-                             * (1.0 - spec_tex_engage));
-            }
-        }
-        // Super-white is raw center evidence, added after the lock (no
-        // neighbour can donate or average it away).
-        float center_r = ordinary_r
-                       + max(Y_gamma - 1.0, 0.0) * SPEC_OVERSHOOT_GAIN;
-        center_r = min(center_r, SPEC_RAMP_CEIL);
-        float spec_ramp = center_r;
-        // Soft ramp: pixels down to SPEC_SOFT_REACH under the onset take part.
-        bool spec_soft_on = cf_spec_soft > 0.0 && cf_spec > 0.0 && cf_strength > 0.0
-                         && spec_sig > 1e-5
-                         && Y_gamma > spec_y_low - SPEC_SOFT_REACH;
-        // The pixel's shares for the field's ramps (free, anchored, anchor present).
-        vec3 soft_q = vec3(1.0, 1.0, 0.0);
-        // Highlight qualification (see SPEC_ANCHOR_*).
-        if (cf_spec_anchor > 0.0 && (spec_ramp > 0.0 || spec_soft_on)) {
-            float cov = CELFLARE_ILLUM_tex(CELFLARE_ILLUM_pos).a;
-            // Coverage as the object's own white pixels see it (passes 4g-4h).
-            vec2 ob = CELFLARE_OBJ_tex(CELFLARE_OBJ_pos).rg;
-            float cov_o = sqrt(sqrt(ob.g / max(ob.r, 1e-6)));
-            cov = mix(cov, cov_o, SPEC_OBJ_COV * smoothstep(SPEC_OBJ_M_LO, SPEC_OBJ_M_HI, ob.r));
-            float compact = 1.0 - smoothstep(SPEC_COV_LO, SPEC_COV_HI, cov);
-            // Emitter cue: share of saturated full-value colour in the
-            // neighbourhood, read from the smooth field of passes 4d-4f (a
-            // ring-tap count here stepped at every colour boundary). Not
-            // where that colour fills the wide neighbourhood (passes 4i-4k).
-            float glow = CELFLARE_OBJ_tex(CELFLARE_OBJ_pos).b;
-            float field = CELFLARE_EMWIDE_tex(CELFLARE_EMWIDE_pos).r;
-            float emit = smoothstep(0.12, 0.35, glow)
-                       * (1.0 - smoothstep(0.55, 0.85, cov))
-                       * (1.0 - smoothstep(EMIT_FIELD_LO, EMIT_FIELD_HI, field));
-            float qual = max(compact, emit);
-            float anc = sh_spec_anchor;
-            float r0 = pow(smoothstep(spec_y_low, 1.0, anc + SPEC_ANCHOR_MARGIN), spec_gamma);
-            float have = smoothstep(SPEC_ANCHOR_NONE + 0.005, SPEC_ANCHOR_NONE + 0.025, anc)
-                       * (1.0 - smoothstep(SPEC_ANCHOR_CLIP_LO, SPEC_ANCHOR_CLIP_HI, anc));
-            float ramp_anc = clamp((spec_ramp - r0) / max(1.0 - r0, SPEC_ANCHOR_MIN_SPAN), 0.0, SPEC_RAMP_CEIL);
-            // Level top (cf_spec_top). The bonus did most of its climbing over
-            // source luma 0.94-0.98, the gentle top of a soft highlight, and
-            // turned an 11 % source step there into 63 %. With cf_spec_top
-            // below 1 each ramp is complete where the raw ramp reaches its
-            // value at that luma, and is bent (u + k u (1 - u)) so it arrives
-            // with zero slope; its own zero slope at the onset is kept, and
-            // it is monotone (slope 1 + k (1 - 2u) >= 0). Super-white overshoot
-            // rides on top unchanged. cf_spec_top 1 = exact identity.
-            float ramp_free = spec_ramp;
-            if (cf_spec_top < 1.0) {
-                float top_r = max(pow(smoothstep(spec_y_low, 1.0, cf_spec_top), spec_gamma), 0.05);
-                float top_k = 1.0 - smoothstep(0.985, 1.0, cf_spec_top);
-                float uf = min(spec_ramp / top_r, 1.0);
-                ramp_free = uf + top_k * uf * (1.0 - uf) + max(spec_ramp - 1.0, 0.0);
-                // The anchored ramp is levelled in its own terms. It is 0 at the
-                // diffuse white and reaches only a_peak at clip (small by design
-                // when the diffuse white is near clip, see SPEC_ANCHOR_MIN_SPAN);
-                // normalising it by the raw ramp's top value inflated that peak
-                // about 2.7x and squeezed the rise into a few code values: cloud
-                // tops just above the diffuse white got a +34 % step and a flat
-                // top. Here its peak is kept, the rise is complete where the ramp
-                // reaches its value at the top luma, shortened by at most
-                // SPEC_TOP_STEEP_MAX, and it starts with zero slope at the anchor.
-                float a_span = max(1.0 - r0, SPEC_ANCHOR_MIN_SPAN);
-                float a_peak = (1.0 - r0) / a_span;
-                float a_lvl  = clamp((top_r - r0) / a_span, a_peak / SPEC_TOP_STEEP_MAX, a_peak);
-                float ua = clamp(ramp_anc / max(a_lvl, 1e-4), 0.0, 1.0);
-                float a_lev = a_peak * ua * ua * (3.0 - 2.0 * ua) + max(ramp_anc - a_peak, 0.0);
-                ramp_anc = mix(ramp_anc, a_lev, top_k);
-            }
-            float ramp_new = mix(ramp_free * mix(SPEC_NOANCHOR_BROAD, 1.0, qual),
-                                 ramp_anc * mix(SPEC_ANCHOR_BROAD, 1.0, qual), have);
-            soft_q = vec3(mix(SPEC_NOANCHOR_BROAD, 1.0, qual),
-                          mix(SPEC_ANCHOR_BROAD, 1.0, qual), have);
-            // cf_spec_gain: the qualified specular's own peak (measured: 2 with
-            // cf_spec 1.4 puts glints and lamps at 300-380 nits over a 150-165
-            // nit diffuse white; 3 at 360-480).
-            spec_ramp = mix(spec_ramp, ramp_new * cf_spec_gain, cf_spec_anchor);
-        }
-        if (spec_soft_on) {
-            vec2 soft_cs = CELFLARE_SOFT_size;
-            vec2 soft_step = SPEC_SOFT_TAP * max(soft_cs.x * (1.0 / 960.0), soft_cs.y * (1.0 / 540.0))
-                           * CELFLARE_SOFT_pt;
-            vec2 soft_acc = vec2(0.0);
-            float soft_w = 0.0;
-            float soft_hard = 0.0;
-            for (int i = 0; i < 9; i++) {
-                vec3 tp = spec_soft_taps[i];
-                vec4 sf = CELFLARE_SOFT_tex(CELFLARE_SOFT_pos + tp.xy * soft_step);
-                float dk = (sf.a - Y_gamma) * (1.0 / SPEC_SOFT_RANGE);
-                float wk = max(1.0 - dk * dk, 0.0);
-                wk *= wk * tp.z;
-                soft_acc += sf.rg * wk;
-                soft_w += wk;
-                if (i == 0) soft_hard = sf.b;
-            }
-            // The field's ramps in the pixel's shape (linear, so the sums
-            // can be combined): raw without the anchor mode, else free and
-            // anchored at the pixel's shares. They carry their own
-            // saturation gate; the pixel's own is applied below to the
-            // whole ramp, so the field part is divided by it here (it is
-            // 0.2 at least).
-            float soft_sum = (cf_spec_anchor < 0.5) ? soft_acc.r
-                           : mix(soft_acc.r * soft_q.x, soft_acc.g * soft_q.y, soft_q.z)
-                             * cf_spec_gain;
-            float soft_gate = 1.0 - smoothstep(SPEC_SAT_LOW, SPEC_SAT_HIGH, spec_sat)
-                                  * mix(SPEC_SAT_ATTEN_DARK, SPEC_SAT_ATTEN_BRIGHT, apl_t);
-            float soft_r = (spec_ramp * SPEC_SOFT_CENTER_W + soft_sum / soft_gate)
-                         / (SPEC_SOFT_CENTER_W + soft_w);
-            spec_ramp = mix(spec_ramp, soft_r,
-                            cf_spec_soft
-                            * smoothstep(spec_y_low - SPEC_SOFT_REACH,
-                                         spec_y_low - SPEC_SOFT_REACH + 0.03, Y_gamma)
-                            * (1.0 - smoothstep(SPEC_SOFT_HARD_LO, SPEC_SOFT_HARD_HI, soft_hard)));
-        }
-        // cf_strength rides along so strength 0 is a true no-op (spec is
-        // additive); scaling here keeps the dark:bright ratio unchanged.
-        spec_strength = spec_peak * spec_ramp * spec_sig
-                      * cf_spec * cf_strength;
-
-        // Saturation gate on spec_sat (bounded deadband), engaged through clip.
-        float sat_atten = mix(SPEC_SAT_ATTEN_DARK, SPEC_SAT_ATTEN_BRIGHT, apl_t);
-        spec_strength *= 1.0 - smoothstep(SPEC_SAT_LOW, SPEC_SAT_HIGH, spec_sat) * sat_atten;
-
-        // Impact weight last, so debug view 5 shows what actually applies.
-        spec_strength *= impact_w;
-
-        expansion += spec_strength;
-    }
-
-    #if DEBUG_SHOW_SPECULAR
+    #if DEBUG_SHOW_TOPLIFT
     {
-        return vec4(gamma709_to_pq2020(vec3(0.0, spec_strength, spec_strength)), 1.0);
+        float lift_dbg = (hl_lift - 1.0) * 4.0;
+        return vec4(gamma709_to_pq2020(vec3(0.0, lift_dbg, lift_dbg)), 1.0);
     }
     #endif
 
     // -------------------------------------------------------------------------
-    // LIGHT PUMP — augment sudden sustained brightening (post-spec)
+    // LIGHT PUMP — augment sudden sustained brightening (after the top lift)
     // -------------------------------------------------------------------------
     // Exposure-like gain on the finished expansion, weighted by pixel
     // brightness so shadows hold; capped by PUMP_GAIN_CEIL.
@@ -5624,7 +4409,7 @@ vec4 cf_shade() {
         float pump_local = sh_pump_env * pump_mask;
         #endif
         // Down-gated where growth mode already restores expansion, so pump +
-        // growth + spec do not stack a peak past the display's ceiling (the
+        // growth + top lift do not stack a peak past the display's ceiling (the
         // pump is monotone, so gradation is never at risk). cf_strength rides
         // along (strength 0 = no-op); PUMP_GAIN_CEIL is a roof, not scaled.
         float pump_str = PUMP_STRENGTH * cf_pump * cf_strength
@@ -5771,9 +4556,9 @@ vec4 cf_shade() {
             float ps_bright_in = Y_decision;
             #endif
             #if HL_RAW_LUMA
-            // cf_hl: the gate reads the smooth base instead (grain-free like the
+            // The gate reads the smooth base instead (grain-free like the
             // median, without pass 1's pull toward a brighter neighbour).
-            if (cf_hl > 0.5) ps_bright_in = eotf_gamma(Yb_gamma);
+            ps_bright_in = eotf_gamma(Yb_gamma);
             #endif
             #if DEC_CHROMA_PS
             #if PS_DEC_WIDE && DEC_OWN_LOOK
@@ -5872,7 +4657,6 @@ vec4 cf_shade() {
 void hook() {
     // Snapshot first, before any data-dependent return (see above).
     if (gl_LocalInvocationIndex == 0u) {
-        sh_spec_signal   = smoothed_spec_signal;
         sh_bright_frac   = smoothed_bright_frac;
         sh_growth_mode   = smoothed_growth_mode;
         // APL axis: the held scene key when cf_key_hold is on (see pass 8);

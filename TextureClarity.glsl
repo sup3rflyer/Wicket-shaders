@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Ágúst Ari
 // Licensed under GPL-3.0 — see LICENSE
 
-// User tuning: the five tc_* params below (DYNAMIC — glsl-shader-opts
+// User tuning: the tc_* params below (DYNAMIC — glsl-shader-opts
 // changes apply on the next frame, no recompile). Defaults = the shipped
 // tune. Everything below the param block is internal.
 // shampv shader API (plain comments to libplacebo):
@@ -49,6 +49,27 @@
 //!MAXIMUM 1.0
 1.0
 
+//!PARAM tc_range
+//!DESC Luma range of the video (choice). 1 = limited, 16-235 (nearly all video: discs, broadcast, streaming, the AnimeJaNai upscaler output): the near-black / near-white window and the grain-floor bands sit at signal levels · 0 = full range, 0-255 (screen captures, yuvj): also the picture of the file before this switch.
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+1.0
+
+//!PARAM tc_pq
+//!DESC PQ source (native HDR10, Dolby Vision base layer). 1 = every level test, the texture and grain tests and the size of the change work on the luma an SDR picture of the same light would have (BT.1886 2.4, white = tc_ref_white), so HDR is sharpened like the same picture in SDR; the near-white fade runs from about 0.68 to 0.88 x tc_ref_white in light (137-180 nits at 203) and nothing brighter is touched · 0 = the plane as it is (all SDR; SDR retagged as PQ for CelFlare must stay 0; HLG stays 0).
+//!TYPE DYNAMIC float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.0
+
+//!PARAM tc_ref_white
+//!DESC With tc_pq: the nit level of the source's diffuse white, which plays SDR white. 203 = BT.2408 (where HDR masters place diffuse white). Lower = the window closes lower and the same nits read brighter.
+//!TYPE DYNAMIC float
+//!MINIMUM 80.0
+//!MAXIMUM 480.0
+203.0
+
 //!HOOK LUMA
 //!BIND HOOKED
 //!SAVE TC_GRAIN_E
@@ -62,6 +83,36 @@
 // y: mean luma of the 16 pixels.
 #define GE_SCALE 10000.0
 
+// Range and transfer of the luma plane (tc_range, tc_pq). Levels are compared as SIGNAL: on limited range
+// code 16/255 is black and 235/255 is white (the hook sees the plane as decoded, not normalised). With
+// tc_pq each PQ plane value is carried to the code an SDR picture of the same light would have (BT.1886
+// gamma 2.4, white = tc_ref_white nits), in the same plane range, so every threshold, the coring and the
+// cap keep their SDR meaning in light; above white it continues past 1 (no clip). Differences are not
+// rescaled by the range. The texture test, coring, cap, edge gate and detail tests were tuned by eye in
+// the player, on limited-range planes, so they already mean plane units. The line-guard thresholds
+// (LINE_GUARD_LO / HI) were set on a bench that fed full-range signal, so in the player they act at a
+// signal gradient about 16 % (255 / 219) larger than scored; that was so before tc_range and still is.
+// Each hook is its own unit, so this block is repeated where it is needed.
+const float TC_LIM_BLACK = 16.0 / 255.0;
+const float TC_LIM_SPAN = 219.0 / 255.0;
+float tc_black() { return tc_range > 0.5 ? TC_LIM_BLACK : 0.0; }
+float tc_span() { return tc_range > 0.5 ? TC_LIM_SPAN : 1.0; }
+float tc_level(float v) { return tc_range > 0.5 ? (v - TC_LIM_BLACK) * (1.0 / TC_LIM_SPAN) : v; }
+// ST 2084 constants: m1 0.1593017578125, m2 78.84375, c1 0.8359375, c2 18.8515625, c3 18.6875.
+float tc_to_sdr(float v) {
+    float e = clamp((v - tc_black()) / tc_span(), 0.0, 1.0);
+    float q = pow(e, 1.0 / 78.84375);
+    float r = max(q - 0.8359375, 0.0) / (18.8515625 - 18.6875 * q);
+    float s = pow(10000.0 / max(tc_ref_white, 1.0), 1.0 / 2.4) * pow(r, 1.0 / (2.4 * 0.1593017578125));
+    return tc_black() + s * tc_span();
+}
+float tc_from_sdr(float v) {
+    float s = max((v - tc_black()) / tc_span(), 0.0);
+    float y = pow(max(tc_ref_white, 1.0) / 10000.0, 0.1593017578125) * pow(s, 2.4 * 0.1593017578125);
+    float e = pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+    return tc_black() + e * tc_span();
+}
+
 vec4 hook() {
     if (tc_grain_bypass <= 0.0)
         return vec4(0.0);
@@ -73,6 +124,34 @@ vec4 hook() {
     for (int j = 0; j < 4; j++)
         for (int i = 0; i < 4; i++)
             g[j * 4 + i] = HOOKED_tex(cell + vec2(float(i) - 1.5, float(j) - 1.5) * HOOKED_pt).x;
+    // tc_pq: the energy and the mean luma of the cell on the SDR-equivalent luma. Its own copy and its
+    // own return, so the plain path below is the same code as before the switch.
+    if (tc_pq > 0.5) {
+        float h[16];
+        h[0] = tc_to_sdr(g[0]);
+        h[1] = tc_to_sdr(g[1]);
+        h[2] = tc_to_sdr(g[2]);
+        h[3] = tc_to_sdr(g[3]);
+        h[4] = tc_to_sdr(g[4]);
+        h[5] = tc_to_sdr(g[5]);
+        h[6] = tc_to_sdr(g[6]);
+        h[7] = tc_to_sdr(g[7]);
+        h[8] = tc_to_sdr(g[8]);
+        h[9] = tc_to_sdr(g[9]);
+        h[10] = tc_to_sdr(g[10]);
+        h[11] = tc_to_sdr(g[11]);
+        h[12] = tc_to_sdr(g[12]);
+        h[13] = tc_to_sdr(g[13]);
+        h[14] = tc_to_sdr(g[14]);
+        h[15] = tc_to_sdr(g[15]);
+#define GE_TQ(I) (h[I] - (4.0 * h[I] + 2.0 * (h[I - 1] + h[I + 1] + h[I - 4] + h[I + 4]) + h[I - 5] + h[I - 3] + h[I + 3] + h[I + 5]) * (1.0 / 16.0))
+        float q0 = GE_TQ(5);
+        float q1 = GE_TQ(6);
+        float q2 = GE_TQ(9);
+        float q3 = GE_TQ(10);
+        float lq = h[0] + h[1] + h[2] + h[3] + h[4] + h[5] + h[6] + h[7] + h[8] + h[9] + h[10] + h[11] + h[12] + h[13] + h[14] + h[15];
+        return vec4((q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3) * (0.25 * GE_SCALE), lq * (1.0 / 16.0), 0.0, 1.0);
+    }
 #define GE_T(I) (g[I] - (4.0 * g[I] + 2.0 * (g[I - 1] + g[I + 1] + g[I - 4] + g[I + 4]) + g[I - 5] + g[I - 3] + g[I + 3] + g[I + 5]) * (1.0 / 16.0))
     float t0 = GE_T(5);
     float t1 = GE_T(6);
@@ -99,6 +178,7 @@ vec4 hook() {
 // GF_Y_LO-GF_Y_HI are left out (crushed blacks, letterbox and clipped whites hold no grain). Per luma band
 // (GF_BINS), a histogram of log2(energy); the band's floor is its GF_PCT percentile, stored as RMS. A band
 // with fewer than GF_MIN_COUNT blocks gets 0 (no bypass at that brightness).
+// The band limits and the bands are signal levels (tc_level, tc_range).
 // Every barrier sits at top level: FXC X3663 needs barriers in uniform control flow.
 #define GF_GX 96
 #define GF_GY 54
@@ -110,6 +190,22 @@ vec4 hook() {
 #define GF_MIN_COUNT 12u
 #define GF_Y_LO 0.05
 #define GF_Y_HI 0.95
+
+// Range and transfer of the luma plane (tc_range, tc_pq). Levels are compared as SIGNAL: on limited range
+// code 16/255 is black and 235/255 is white (the hook sees the plane as decoded, not normalised). With
+// tc_pq each PQ plane value is carried to the code an SDR picture of the same light would have (BT.1886
+// gamma 2.4, white = tc_ref_white nits), in the same plane range, so every threshold, the coring and the
+// cap keep their SDR meaning in light; above white it continues past 1 (no clip). Differences are not
+// rescaled by the range. The texture test, coring, cap, edge gate and detail tests were tuned by eye in
+// the player, on limited-range planes, so they already mean plane units. The line-guard thresholds
+// (LINE_GUARD_LO / HI) were set on a bench that fed full-range signal, so in the player they act at a
+// signal gradient about 16 % (255 / 219) larger than scored; that was so before tc_range and still is.
+// Each hook is its own unit, so this block is repeated where it is needed.
+const float TC_LIM_BLACK = 16.0 / 255.0;
+const float TC_LIM_SPAN = 219.0 / 255.0;
+float tc_black() { return tc_range > 0.5 ? TC_LIM_BLACK : 0.0; }
+float tc_span() { return tc_range > 0.5 ? TC_LIM_SPAN : 1.0; }
+float tc_level(float v) { return tc_range > 0.5 ? (v - TC_LIM_BLACK) * (1.0 / TC_LIM_SPAN) : v; }
 
 shared uint gf_hist[GF_BINS * GF_HB];
 
@@ -125,6 +221,8 @@ void hook() {
         vec2 v = TC_GRAIN_E_tex((2.0 * ab + 1.0) / cells).xy;
         float e = v.x * (1.0 / 10000.0);
         float l = v.y;
+        if (tc_range > 0.5)
+            l = tc_level(l);
         if (l >= GF_Y_LO && l <= GF_Y_HI) {
             int bin = clamp(int(l * float(GF_BINS)), 0, GF_BINS - 1);
             int hb = clamp(int((log2(max(e, 1e-30)) - GF_LOG_MIN) * (float(GF_HB) / GF_LOG_SPAN)), 0, GF_HB - 1);
@@ -169,8 +267,8 @@ const float grain_transition_width = 0.50;
 // Texture discrimination
 const float texture_transition_width = 0.018;
 
-// Black/white area safeguards: the sharpening fades in over luma 0.05-0.12 and
-// out over 0.85-0.95. (Was 0.15-0.25 and 0.35-0.55: that window held 21-65 % of
+// Black/white area safeguards: the sharpening fades in over signal 0.05-0.12 and
+// out over 0.85-0.95 (signal levels: on limited range 0 = code 16, 1 = code 235; tc_range). (Was 0.15-0.25 and 0.35-0.55: that window held 21-65 % of
 // the texture in a set of 34 masters, and nothing outside it was ever touched.
 // Scored band by band against the masters, what the shader adds agrees with
 // the master's detail equally from near-black to near-white.) Below 0.05 sit
@@ -199,6 +297,36 @@ const float DETAIL_LOW = 0.003;
 const float GB_LO = 1.500;
 const float GB_HI = 6.000;
 #define GB_PASS(R) smoothstep(GB_LO, GB_HI, R)
+
+// Range and transfer of the luma plane (tc_range, tc_pq). Levels are compared as SIGNAL: on limited range
+// code 16/255 is black and 235/255 is white (the hook sees the plane as decoded, not normalised). With
+// tc_pq each PQ plane value is carried to the code an SDR picture of the same light would have (BT.1886
+// gamma 2.4, white = tc_ref_white nits), in the same plane range, so every threshold, the coring and the
+// cap keep their SDR meaning in light; above white it continues past 1 (no clip). Differences are not
+// rescaled by the range. The texture test, coring, cap, edge gate and detail tests were tuned by eye in
+// the player, on limited-range planes, so they already mean plane units. The line-guard thresholds
+// (LINE_GUARD_LO / HI) were set on a bench that fed full-range signal, so in the player they act at a
+// signal gradient about 16 % (255 / 219) larger than scored; that was so before tc_range and still is.
+// Each hook is its own unit, so this block is repeated where it is needed.
+const float TC_LIM_BLACK = 16.0 / 255.0;
+const float TC_LIM_SPAN = 219.0 / 255.0;
+float tc_black() { return tc_range > 0.5 ? TC_LIM_BLACK : 0.0; }
+float tc_span() { return tc_range > 0.5 ? TC_LIM_SPAN : 1.0; }
+float tc_level(float v) { return tc_range > 0.5 ? (v - TC_LIM_BLACK) * (1.0 / TC_LIM_SPAN) : v; }
+// ST 2084 constants: m1 0.1593017578125, m2 78.84375, c1 0.8359375, c2 18.8515625, c3 18.6875.
+float tc_to_sdr(float v) {
+    float e = clamp((v - tc_black()) / tc_span(), 0.0, 1.0);
+    float q = pow(e, 1.0 / 78.84375);
+    float r = max(q - 0.8359375, 0.0) / (18.8515625 - 18.6875 * q);
+    float s = pow(10000.0 / max(tc_ref_white, 1.0), 1.0 / 2.4) * pow(r, 1.0 / (2.4 * 0.1593017578125));
+    return tc_black() + s * tc_span();
+}
+float tc_from_sdr(float v) {
+    float s = max((v - tc_black()) / tc_span(), 0.0);
+    float y = pow(max(tc_ref_white, 1.0) / 10000.0, 0.1593017578125) * pow(s, 2.4 * 0.1593017578125);
+    float e = pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+    return tc_black() + e * tc_span();
+}
 const float GE_SCALE_INV = 1.0 / 10000.0;
 const float DETAIL_HIGH = 0.013;
 
@@ -218,6 +346,36 @@ vec4 hook() {
         for (int x = -2; x <= 2; x++) {
             grid[(y + 2) * 5 + (x + 2)] = HOOKED_texOff(vec2(x, y)).x;
         }
+    }
+    // tc_pq: everything below works on the SDR-equivalent luma; the change is carried back at
+    // the end (constant indices: see the line guard's note on D3D11)
+    float p_raw = grid[12];
+    if (tc_pq > 0.5) {
+        grid[0] = tc_to_sdr(grid[0]);
+        grid[1] = tc_to_sdr(grid[1]);
+        grid[2] = tc_to_sdr(grid[2]);
+        grid[3] = tc_to_sdr(grid[3]);
+        grid[4] = tc_to_sdr(grid[4]);
+        grid[5] = tc_to_sdr(grid[5]);
+        grid[6] = tc_to_sdr(grid[6]);
+        grid[7] = tc_to_sdr(grid[7]);
+        grid[8] = tc_to_sdr(grid[8]);
+        grid[9] = tc_to_sdr(grid[9]);
+        grid[10] = tc_to_sdr(grid[10]);
+        grid[11] = tc_to_sdr(grid[11]);
+        grid[12] = tc_to_sdr(grid[12]);
+        grid[13] = tc_to_sdr(grid[13]);
+        grid[14] = tc_to_sdr(grid[14]);
+        grid[15] = tc_to_sdr(grid[15]);
+        grid[16] = tc_to_sdr(grid[16]);
+        grid[17] = tc_to_sdr(grid[17]);
+        grid[18] = tc_to_sdr(grid[18]);
+        grid[19] = tc_to_sdr(grid[19]);
+        grid[20] = tc_to_sdr(grid[20]);
+        grid[21] = tc_to_sdr(grid[21]);
+        grid[22] = tc_to_sdr(grid[22]);
+        grid[23] = tc_to_sdr(grid[23]);
+        grid[24] = tc_to_sdr(grid[24]);
     }
 
     float p_x = grid[12];
@@ -361,6 +519,8 @@ vec4 hook() {
     // linear between them, flat beyond the end ones). A band without enough blocks has floor 0: no bypass.
     if (tc_grain_bypass > 0.0) {
         float fb = clamp(window_mean * 8.0 - 0.5, 0.0, 7.0);
+        if (tc_range > 0.5)
+            fb = clamp(tc_level(window_mean) * 8.0 - 0.5, 0.0, 7.0);
         float f0i = floor(fb);
         float f0 = TC_GRAIN_FLOOR_tex(vec2((f0i + 0.5) / 8.0, 0.5)).x;
         float f1 = TC_GRAIN_FLOOR_tex(vec2((min(f0i + 1.0, 7.0) + 0.5) / 8.0, 0.5)).x;
@@ -395,6 +555,11 @@ vec4 hook() {
     // Black/white luminance masks
     float mask = smoothstep(black_threshold, black_threshold + black_falloff, p.x) *
                  (1.0 - smoothstep(white_threshold - white_falloff, white_threshold, p.x));
+    if (tc_range > 0.5) {
+        float lv = tc_level(p.x);
+        mask = smoothstep(black_threshold, black_threshold + black_falloff, lv) *
+               (1.0 - smoothstep(white_threshold - white_falloff, white_threshold, lv));
+    }
 
     sharpen_amount *= mask;
 
@@ -402,6 +567,9 @@ vec4 hook() {
     // ones approach tc_max_delta smoothly (the hard clip left a third of the
     // touched pixels of a grainy picture sitting exactly on the cap).
     float result = p.x + tc_max_delta * tanh(clamp(sharpen_amount / tc_max_delta, -10.0, 10.0));
+    // tc_pq: the same change in light, carried back to the PQ plane (exactly 0 where nothing moved)
+    if (tc_pq > 0.5)
+        result = p_raw + (tc_from_sdr(result) - tc_from_sdr(p.x));
 
     return vec4(result, 0.0, 0.0, 1.0);
 }

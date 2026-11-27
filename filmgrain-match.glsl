@@ -130,16 +130,15 @@
 //                    widens the plausibility band and raises the learned-
 //                    amount ceilings (the title level may reach 3.24 x its
 //                    square x the clean level). Since 5B it no longer scales
-//                    the stillness test: the titles that test starved
-//                    (Utena, Gunbuster) are credited at 1, and 2 moves them
-//                    by only 5-7% (replay, 2026-09-30).
+//                    the stillness test: heavy-grain cel titles that test
+//                    starved are credited at 1, and 2 moves them by only 5-7%.
 //   grain_floor      the engine's built-in MINIMUM added grain -- what a title
 //                    with no grain evidence (a clean title) gets -- as a level:
 //                    1 = as calibrated (default, exact), 0.5 = half, 0 = no
 //                    added grain on clean titles, 1.5 = +50%, 2 = double.
 //                    Titles the engine recognises as grainy already add more
-//                    (~1.7-7x the clean amount once learned: Kuroneko 1.7,
-//                    Cyber City 4.4, Utena 7.1). Raising only lifts titles
+//                    (~1.7-7x the clean amount once learned, from light film
+//                    transfers to heavy cel stock). Raising only lifts titles
 //                    below the new
 //                    level (so above ~1.7 it reaches those titles too);
 //                    lowering only reduces titles at the minimum and eases out
@@ -201,9 +200,11 @@
 //                    0.2-0.3 aggressively confine grain to low luminance.
 //   grain_source_trc the SOURCE transfer the LUMA observer reads: 0 = SDR
 //                    gamma (every SDR source, and SDR retagged for CelFlare),
-//                    1 = PQ (native HDR10 / PQ sources). libplacebo does not
-//                    tell hooks the source transfer, so the profile that routes
-//                    native-HDR sources sets it. At 1 the observer bridges each
+//                    1 = PQ (native HDR10 / PQ sources), 2 = auto: read from
+//                    the source's tagged transfer via linearize() (PQ ->
+//                    bridge, SDR and HLG -> gamma). Auto sees only the tag, so
+//                    a chain that retags SDR sources as PQ (CelFlare) pins 0.
+//                    At 1 (or auto on a PQ source) the observer bridges each
 //                    PQ luma sample to the SDR-equivalent code at
 //                    grain_ref_white before any statistic, so native HDR is
 //                    measured in the domain the whole model is calibrated in
@@ -267,7 +268,7 @@
 //@shampv pause-param grain_pause
 //@shampv epoch-param state_epoch
 //@shampv toggle match_grain grain_hdr grain_headroom debug_match grain_pause
-//@shampv choice grain_source_trc gamma pq
+//@shampv choice grain_source_trc gamma pq auto
 //@shampv step grain_gain 0.05
 //@shampv step density_combine 0.05
 //@shampv step grain_floor 0.05
@@ -408,10 +409,10 @@
 203.0
 
 //!PARAM grain_source_trc
-//!DESC Source transfer the observer reads (choice). 0 = gamma (all SDR, incl. SDR retagged for CelFlare) · 1 = PQ native HDR (HDR10/HDR10+, DV P7/P8 base layer): measure through a bridge to SDR-equivalent codes at grain_ref_white. HLG and DV P5 are not PQ luma: leave 0.
+//!DESC Source transfer the observer reads (choice). 0 = gamma (all SDR, incl. SDR retagged for CelFlare) · 1 = PQ native HDR (HDR10/HDR10+, DV P7/P8 base layer): measure through a bridge to SDR-equivalent codes at grain_ref_white · 2 = auto from the source's tagged transfer (PQ -> bridge; SDR and HLG -> gamma). A chain that retags SDR as PQ at the source (CelFlare) must pin 0. HLG and DV P5 are not PQ luma: leave 0.
 //!TYPE DYNAMIC float
 //!MINIMUM 0.0
-//!MAXIMUM 1.0
+//!MAXIMUM 2.0
 0.0
 
 //!BUFFER GRAIN_STATE
@@ -516,7 +517,7 @@
 // mean moved more than this since the previous frame is left out of this
 // frame's grain statistics. The mean averages grain away (~3x), so the test
 // sees content motion, not the grain's own frame-to-frame swing -- the old
-// single-point test tripped on coarse grain at 2 sigma (Utena, Cyber City)
+// single-point test tripped on coarse cel grain at 2 sigma
 // and read heavy grain low when used per cell.
 #define MP_STILL_MEAN          0.018
 #define MP_HP_TO_SOURCE        1.7888544
@@ -549,8 +550,8 @@
 // soft-reject it from BOTH the per-bin master update and shot refinement,
 // upstream of every lane, so implausible evidence cannot enter the
 // persistent posterior at all. Calibrated ABOVE the heaviest catalogued
-// legitimate grain — Golden Spurtle Super35 reads sigma 0.0026-0.0035 in
-// this domain (harness, 2026-07-17) and must pass at full weight; in-band
+// legitimate grain — heavy Super35 film stock reads sigma 0.0026-0.0035 in
+// this domain and must pass at full weight; in-band
 // grain twins are bounded by the rate/breadth/reversibility layers instead,
 // a level test cannot catch them. The absolute master ceiling backstops
 // sustained band-edge evidence.
@@ -571,12 +572,12 @@
 #define MP_BLACKOUT_LATCH_MAX  4.0
 #define MP_GEOM_X_BOOTSTRAP    24.0
 #define MP_GEOM_Y_BOOTSTRAP    12.0
-// Release of a too-large committed bar (5A, 2026-09-30). Dark and fade-in
+// Release of a too-large committed bar. Dark and fade-in
 // frames make picture rows next to a bar read as matte, and before this path
-// only a hard cut could undo such a commit (audit A: The Thin Red Line held a
-// 0.198 bar over a true 0.119 for 74 s after its dark opening, Utena 0.1455 on
-// 4:3 content for 13 s after a black fade, Gunbuster 14 px per side through a
-// sub-cell refine error). Picture inside a bar is strong evidence: dark picture
+// only a hard cut could undo such a commit (e.g. a wide-aspect film holding a
+// 0.198 bar over a true 0.119 for 74 s after a dark opening, 4:3 content
+// holding 0.1455 for 13 s after a black fade, or a 14 px per-side overshoot
+// from a sub-cell refine error). Picture inside a bar is strong evidence: dark picture
 // reads as matte on every dark frame, while a matte reads as picture only when
 // bright content sits in the bar (hardsubs, logos, credits crossing the bars).
 // So a CLEAN candidate (symmetric, picture beside both bars -- one-bar
@@ -590,8 +591,9 @@
 // S4 evidence veto -- global-translation (pan/shake) gate. A translating
 // texture is a per-frame grain twin: it decorrelates band0 while the
 // absolute stillness threshold stays blind on dark content and q_random's
-// innovation/spatial ratio lands in the grain band (measured: Odyssey
-// 160-330 s, m_motion 0.0 throughout the shake, eff 2.64x staircase). A
+// innovation/spatial ratio lands in the grain band (measured on dark
+// handheld-shake footage: m_motion 0.0 throughout the shake, eff 2.64x
+// staircase). A
 // grid-level single-step Lucas-Kanade translation estimate is the tell:
 // grain decorrelates across grid neighbours so its g*d products average
 // to ~0 over the lattice, while a coherent camera translation correlates
@@ -600,10 +602,9 @@
 // The veto only REDUCES learning authority (rise lanes); down-reads stay
 // live because translation decorrelation can only INFLATE sigma -- a
 // sub-master read under motion remains a valid one-sided bound. PAN_LO/HI
-// are in picture-lattice samples/frame and are calibrated on the PC harness
-// decode at MP_PICTURE_DENSITY
-// (row 51): they must sit above the static-grain floor read on ground
-// truth (Golden Spurtle) so legitimate grain never freezes.
+// are in picture-lattice samples/frame and are calibrated at MP_PICTURE_DENSITY
+// so they sit above the static-grain floor read on heavy film-stock ground
+// truth and legitimate grain never freezes.
 #define MP_LK_SCALE            2.0e5
 #define MP_LK_CLAMP            1.0e6
 #define MP_PAN_LO              0.35
@@ -700,14 +701,29 @@ float measure_bridge(float v) {
     return min(MEASURE_BLACK + sdr * (MEASURE_WHITE - MEASURE_BLACK), 1.0);
 }
 
+// Does the observer read PQ luma? grain_source_trc 0 = gamma, 1 = PQ, 2 =
+// auto: the source's TAGGED transfer, read through libplacebo's linearize()
+// (a LUMA hook sees the source's tags). linearize(0.5) is 0.20-0.30 on SDR
+// (BT.1886, sRGB) and 0.40-0.60 on PQ (HDR10, Dolby Vision base layers;
+// headless probe 2026-09-30); HLG reads near SDR and correctly stays
+// unbridged. libplacebo bakes the transfer into linearize(), so the test is a
+// constant and every bridge branch stays uniform (see measure_bridge). A
+// chain that retags SDR sources as PQ at the source (the CelFlare setup) must
+// pin 0: the tag is all auto can see.
+bool source_pq() {
+    if (grain_source_trc > 1.5)
+        return linearize(vec4(0.5, 0.5, 0.5, 1.0)).r > 0.35;
+    return grain_source_trc >= 0.5;
+}
+
 // PICTURE-RELATIVE SAMPLE FOOTPRINT (2026-09-29). The lattice points fall between
 // pixels, so each tap is a hardware bilinear blend of the neighbouring raster
 // pixels -- a footprint fixed in PIXELS. On the 1080-line rasters every evidence
 // constant was calibrated on, that is one footprint; on a 2160-line raster (native
 // 4K, or a 2x upscale such as AnimeJaNai ahead of this hook) the same blend covers
-// a quarter of the picture area, so grain reads stronger (live chain: Utena x2.16,
-// The Thin Red Line x2.00; a pixel-duplicated 2x twin x1.22, a lanczos 2x twin
-// x1.61) and grainy titles fall out of the plausibility band. Taller rasters
+// a quarter of the picture area, so grain reads stronger (2x live upscale:
+// ~2.0-2.2x on grainy film/cel sources; pixel-duplicated 2x twin x1.22,
+// lanczos 2x twin x1.61) and grainy titles fall out of the plausibility band. Taller rasters
 // therefore sample what a 1080-line raster of the same picture would give: the
 // bilinear of a virtual 1080-line raster whose cells are box averages. At an
 // integer 2x each cell centre sits on a real pixel corner, so one hardware tap per
@@ -920,10 +936,10 @@ void lean_observe() {
     // (m_measured restarts it) and the shot, through the forced boundary
     // (prev_ready is false this frame), which also commits the carried
     // presentation at once. Authority x 0.25, not 0.5: at 0.5 an end-card grain
-    // look-alike carried +58% (5B replay +70%) into the next episode's start
-    // (Dandadan e02); at 0.25 nothing. With the derived title level the carried
-    // start is partial (Utena e02 starts at ~4.5 units, 6.8 converged; a cold
-    // start takes ~1.5 min to pass it).
+    // look-alike carried +58-70% into the next episode's start on a clean
+    // series; at 0.25 nothing. With the derived title level the carried start
+    // is partial (a heavy-grain series starts at ~4.5 units vs 6.8 converged;
+    // a cold start takes ~1.5 min to pass it).
     if (lid == 0u && s_new_file != 0u) {
         m_state_epoch = state_epoch;
         // The boundary is forced through m_prev_ready, not only this frame's
@@ -1001,7 +1017,7 @@ void lean_observe() {
         vec2 probe_uv = (vec2(float(gx), float(gy)) + 0.5)
                       / vec2(float(MP_GRID_W), float(MP_GRID_H));
         float c = measure_luma(probe_uv);
-        if (grain_source_trc >= 0.5)
+        if (source_pq())
             c = measure_bridge(c);
         s_probe[k] = c;
         if (c > MP_BLACKOUT_CODE_MAX)
@@ -1230,7 +1246,7 @@ void lean_observe() {
             enabled = true;
         }
         float refine_v = enabled ? measure_luma(uv) : 1.0;
-        if (enabled && grain_source_trc >= 0.5)
+        if (enabled && source_pq())
             refine_v = measure_bridge(refine_v);
         s_refine_probe[lid] = refine_v;
     }
@@ -1626,7 +1642,7 @@ void lean_observe() {
         float xp6 = grain_sample(uv + dx6, fp_vsize, fp_taps);
         float ym6 = grain_sample(uv - dy6, fp_vsize, fp_taps);
         float yp6 = grain_sample(uv + dy6, fp_vsize, fp_taps);
-        if (grain_source_trc >= 0.5) {
+        if (source_pq()) {
             c = measure_bridge(c);
             xm1 = measure_bridge(xm1); xp1 = measure_bridge(xp1);
             ym1 = measure_bridge(ym1); yp1 = measure_bridge(yp1);
@@ -1676,7 +1692,7 @@ void lean_observe() {
             float lk_xm = grain_sample(uv - vec2(lk_step.x, 0.0), fp_vsize, fp_taps);
             float lk_yp = grain_sample(uv + vec2(0.0, lk_step.y), fp_vsize, fp_taps);
             float lk_ym = grain_sample(uv - vec2(0.0, lk_step.y), fp_vsize, fp_taps);
-            if (grain_source_trc >= 0.5) {
+            if (source_pq()) {
                 lk_xp = measure_bridge(lk_xp); lk_xm = measure_bridge(lk_xm);
                 lk_yp = measure_bridge(lk_yp); lk_ym = measure_bridge(lk_ym);
             }
@@ -1933,9 +1949,8 @@ void lean_observe() {
         // Master evidence from bins far ABOVE it is exposure-suspect: bright
         // pixels inside a dark scene (lamps, rim light) carry the dark
         // scene's capture character and book it into a tone bin that
-        // genuinely bright scenes later render (M3 field trace, Aldnoah E01
-        // 2026-08-20: bin 6 climbed to 2.5x prior during a stretch with no
-        // daylight). This guard is a PARTIAL bound on the extreme tail only:
+        // genuinely bright scenes later render (field trace: bin 6 climbed to
+        // 2.5x prior during a stretch with no daylight). This guard is a PARTIAL bound on the extreme tail only:
         // the measured climber sat ~1.5 bins above its scenes' centroids —
         // at this ramp's lower edge, where the guard is inert — and the
         // field A/B trimmed ~25% of the excess. The edges await
@@ -1966,11 +1981,11 @@ void lean_observe() {
         bool learn_ok = s_history_ready != 0u && !hard_cut;
         // Evidence quality: a frame whose flat cells mostly moved counts less,
         // in BOTH directions. Encoders thin grain in motion (within one shot,
-        // YUA reads 17-23% lower on moving frames), and the old frame-level
-        // gate preferred static evidence. Symmetric on purpose: weighting only
-        // the downward rate shifted the tracker's quantile instead (its lift
-        // survived shuffling the still share); this weight's lift does not
-        // (3-15% under shuffling). YUA 2.41 -> 2.84 units, TRL 1.48 -> 1.69.
+        // grainy animation reads 17-23% lower on moving frames), and the old
+        // frame-level gate preferred static evidence. Symmetric on purpose:
+        // weighting only the downward rate shifted the tracker's quantile
+        // instead (its lift survived shuffling the still share); this weight's
+        // lift does not (3-15% under shuffling).
         float still_w = smoothstep(0.80, 0.97, still_share);
         for (int b = 0; b < MP_TONE_BINS; b++) {
             float sigma0 = sigma_band[b];
@@ -1996,11 +2011,10 @@ void lean_observe() {
             if (reliability_raw > 0.0) {
                 // Sensitivity normalization deflates hot shots only. Dividing
                 // by gain < 1 INFLATES the learned target, and an over-learned
-                // master reads exactly as gain < 1 at the next cut -- the
-                // runaway measured on the Odyssey benchmark (master bins up
-                // 3x, title pinned at its cap in ~2 min). A genuinely quiet
-                // shot now learns conservatively low at the slow rate instead
-                // -- recoverable, unlike the ratchet.
+                // master reads exactly as gain < 1 at the next cut -- causing
+                // runaway master bins (up 3x, title pinned at its cap in ~2
+                // min). A genuinely quiet shot now learns conservatively low
+                // at the slow rate instead -- recoverable, unlike the ratchet.
                 float pobs_title = pobs / clamp(m_shot_gain, 1.0, 4.0);
                 float clipped = clamp(pobs_title, 0.25 * m_master_p[b],
                                       4.0 * m_master_p[b]);
@@ -2011,8 +2025,8 @@ void lean_observe() {
                 // level, its conservative acquisition-grain assumption, so a
                 // master never learns below it. The log-spaced histograms make
                 // clean titles' low noise measurable; without this floor their
-                // masters would drain below the clean level the way the old
-                // clean lane drained My Gift (1.22 -> 0.55 units). A master
+                // masters would drain below the clean level (e.g. 1.22 -> 0.55
+                // units on clean digital video). A master
                 // still walks back down to the prior after an upward misread.
                 float m_shape = prior_tone_shape(b);
                 clipped = max(clipped, m_shape * m_shape * prior_base_p);
@@ -2033,7 +2047,7 @@ void lean_observe() {
                 // level 16x faster while the shot's first 3 units of evidence
                 // are being spent. Speed then follows the number of shots that
                 // show grain, not frames, so a one-shot noise effect cannot
-                // move a bin far (My Gift's 2 s look-alike at 14 min: 1.39
+                // move a bin far (a 2 s look-alike on a clean title: 1.39
                 // units for 0.9 min, vs 1.80 for 5.5 min with a per-bin 8x
                 // gain). The meter counts the frame's evidence (with q_amp and
                 // the pan veto), while the bins spend their own reliability:
@@ -2048,7 +2062,7 @@ void lean_observe() {
                 // In the fast lane the stored level may not run ahead of what
                 // the bin PRESENTS by more than 2x: authority opens slowly, so
                 // an unbounded fast rise stayed invisible and then appeared at
-                // once when local_q opened (5B review: Gunbuster x2.2 in one
+                // once when local_q opened (heavy-grain source: x2.2 in one
                 // cut, x3 within a minute; now x1.7 / x1.7). A stored level
                 // already above the cap is pulled down toward it.
                 if (acq > 1.0 && clipped > m_master_p[b]) {
@@ -2111,22 +2125,19 @@ void lean_observe() {
         // the motivating title, and an ungated per-bin key re-inflated
         // exactly those bins to the ceiling in the 2026-08-21 trace),
         // so it cannot inflate b1/b2 — while every measured grainy
-        // class shows dark-bin evidence (lain 12x, cybercity 12x,
-        // ladies 4x, edgerunners 4x prior vs aldnoah 1.4x, clean 1.0x).
+        // class shows dark-bin evidence (heavy cel ~12x, mid-grain ~4x prior
+        // vs light-grain ~1.4x, clean 1.0x).
         float ev_gate = 0.0;
         for (int gb = 1; gb <= 2; gb++) {
             float gshape = prior_tone_shape(gb);
             float gratio = m_master_p[gb]
                          / max(gshape * gshape * prior_base_p, 1.0e-12);
             // Certification is binary-ish at 3.0x, but the ceiling GRANT
-            // keeps ramping: the author's sitting (2026-08-22) found
-            // mid-anchor titles (~4x: Ladies vs Butlers 3.95, Edgerunners
-            // 4.09) borderline overgrained at the full legacy ceiling
-            // while heavy anchors (Lain/CyberCity ~12x) read right, so
-            // the 3-8x band earns a partial ceiling and only proven
-            // heavy grain collects it all. The floor is the taste
-            // constant: 0.75 sat as still-hot on LvB (2026-08-22
-            // re-sit); 0.2 is the author's deeper pick.
+            // keeps ramping: mid-grain titles (~4x prior) read borderline
+            // overgrained at the full legacy ceiling while heavy-grain
+            // sources (~12x) read right, so the 3-8x band earns a partial
+            // ceiling and only proven heavy grain collects it all. The floor
+            // is the taste constant (0.2 keeps moderate sources restrained).
             ev_gate = max(ev_gate,
                           smoothstep(0.10, 0.35, m_master_w[gb])
                         * smoothstep(1.6, 3.0, gratio)
@@ -3018,8 +3029,8 @@ void hook() {
 #define MEASURE_WHITE_OUT (235.0 / 255.0)
 // grain_floor's unit, FROZEN on purpose: the summed added power over the
 // rendered tone bins 2-7 (restore_gain 1) of a clean title at the defaults --
-// 0.67 x the no-evidence reset level (My Gift / Dandadan settle at 0.81-0.83
-// in sigma), from the 2026-09-30 survey. A literal, not derived from PASS 1's
+// 0.67 x the no-evidence reset level (clean digital titles settle at 0.81-0.83
+// in sigma). A literal, not derived from PASS 1's
 // prior constants: retuning those later must not silently rescale every
 // profile's grain_floor. Do not retune.
 #define FLOOR_UNIT_SUM 7.059e-7

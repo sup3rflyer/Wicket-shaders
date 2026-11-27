@@ -1096,7 +1096,7 @@ void hook() {
 // established-level gate lacks. A bright feature TRANSLATING across the grid
 // under a camera pan/tilt (a facial specular, a lamp) reads FRESH in each new
 // cell (out-brightens its stale-established neighbours), so the additive mask
-// lights it up (Judas Overlord E05 field reports). A translation has a rising
+// lights it up. A translation has a rising
 // LEADING edge and a falling TRAILING edge; a real localized event (candle,
 // spell, growing fire/explosion) rises with static-or-rising neighbours — no
 // matched trailing fall. So: a rising cell whose ring-1 neighbourhood holds a
@@ -1114,7 +1114,7 @@ void hook() {
 // fresh_ease∈[0,1] on the OPENING term → pure onset under-pump, rules 0-3 intact
 // (can't flatten a gradient or squash an open pump). Residual (directionality
 // deferred): two ring-1-adjacent fires with a flare/death of matched magnitude
-// read as a translation dipole — validate Symphogear G S02E04 OP first.
+// read as a translation dipole — validate on rapid-flicker fire sequences first.
 // 0 = off (bit-exact prior behaviour).
 #define PUMP_TRANS_SUPPRESS   1
 #define PUMP_TRANS_RING       1      // fall-scan half-width, documented range {1,2} (the anchored-window clamp below hardcodes 9−TW/16−TW → widening past 4 needs those bounds updated). 1 (3×3) measured best: catches the sharp in-frame facial-specular translation; ring-2 both dilutes the face debit (finds a mismatched further faller) AND barely helps the broad bar-lamp glow (a REVEAL from off-frame has no in-frame trailing fall — that is the border-seed's domain, not this test's).
@@ -2860,8 +2860,8 @@ void hook() {
 // lever. Mask fractional coords are smoothstep-eased (C1) to kill bilinear
 // seams.
 // v5.17 (2026-07-12): DEFAULT REVERTED TO SUBTRACTIVE after field reports on
-// camera motion (Judas Overlord E05: a spot lit up on a talking face during a
-// tilt-up; the bar-lamp scene flickered on a pan). The additive door removed
+// camera motion (a spot lit up on a talking face during a tilt-up; a bar-lamp
+// scene flickered on a pan). The additive door removed
 // the scalar's two motion-safety properties — (a) requiring net-new GLOBAL
 // light, (b) temporal smoothing via pump_env — and a bright feature (facial
 // specular, a lamp) TRANSLATING across cells under a moving camera reads
